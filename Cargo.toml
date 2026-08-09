@@ -1,0 +1,20 @@
+[package]
+name = "qwen3-5-397b-in-rust"
+version = "0.1.0"
+edition = "2024"
+# NOTE: candle (+ CUDA backend) gets added once we reach the streaming
+# engine and kernels. This first slice -- GGUF indexing + config reading --
+# is deliberately dependency-light so it builds and tests anywhere,
+# including machines with no GPU at all. That mirrors the article's own
+# ordering: "read the checkpoint" and "refuse to guess" come before any
+# kernel exists.
+
+[dependencies]
+memmap2 = "0.9"     # mmap the GGUF file instead of reading it into RAM
+byteorder = "1.5"   # explicit little-endian reads for the header
+anyhow = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "=3.10.1"   # used to build synthetic GGUF fixtures for tests
+
