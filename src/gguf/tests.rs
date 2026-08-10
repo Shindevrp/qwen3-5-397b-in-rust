@@ -6,6 +6,7 @@ use crate::gguf::error::GgufError;
 use crate::gguf::value::{Value, ValueType};
 use crate::gguf::writer::{GgufBuilder, TensorSpec};
 use crate::gguf::{GGmlType, Gguf};
+use crate::model::config::Qwen3_5Config;
 
 fn write_temp(bytes: Vec<u8>) -> NamedTempFile {
     let f = NamedTempFile::new().unwrap();
@@ -220,4 +221,96 @@ fn metadata_type_mismatch_is_reported() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn qwen35_config_loads_and_validates() {
+    let f32_data = sample_bytes(4096 * 4);
+
+    let gguf_bytes = GgufBuilder::new()
+        .metadata("general.architecture", Value::String("qwen3_5moe".into()))
+        .metadata("general.name", Value::String("Qwen3.5-397B-A17B".into()))
+        .metadata("qwen3_5moe.block_count", Value::U32(60))
+        .metadata("qwen3_5moe.embedding_length", Value::U32(4096))
+        .metadata("qwen3_5moe.attention.head_count", Value::U32(32))
+        .metadata("qwen3_5moe.attention.head_count_kv", Value::U32(2))
+        .metadata("qwen3_5moe.attention.key_length", Value::U32(256))
+        .metadata(
+            "qwen3_5moe.attention.layer_norm_rms_epsilon",
+            Value::F32(1e-6),
+        )
+        .metadata("qwen3_5moe.expert_count", Value::U32(512))
+        .metadata("qwen3_5moe.expert_used_count", Value::U32(10))
+        .metadata("qwen3_5moe.expert_feed_forward_length", Value::U32(1024))
+        .metadata(
+            "qwen3_5moe.expert_shared_feed_forward_length",
+            Value::U32(1024),
+        )
+        .metadata("qwen3_5moe.rope.dimension_count", Value::U32(64))
+        .metadata("qwen3_5moe.rope.freq_base", Value::F32(10_000_000.0))
+        .metadata("qwen3_5moe.context_length", Value::U32(262_144))
+        .metadata("qwen3_5moe.ssm.state_size", Value::U32(128))
+        .metadata("qwen3_5moe.ssm.group_count", Value::U32(16))
+        .metadata("qwen3_5moe.ssm.time_step_rank", Value::U32(64))
+        .metadata("qwen3_5moe.ssm.conv_kernel", Value::U32(4))
+        .metadata("qwen3_5moe.ssm.inner_size", Value::U32(8192))
+        .tensor(TensorSpec {
+            name: "token_embd.weight".into(),
+            ggml_type: GGmlType::F32,
+            dims: vec![4096, 248320],
+            data: sample_bytes(4096 * 248320),
+        })
+        .tensor(TensorSpec {
+            name: "output_norm.weight".into(),
+            ggml_type: GGmlType::F32,
+            dims: vec![4096],
+            data: f32_data,
+        })
+        .tensor(TensorSpec {
+            name: "output.weight".into(),
+            ggml_type: GGmlType::F32,
+            dims: vec![4096, 248320],
+            data: sample_bytes(4096 * 248320),
+        })
+        .build();
+
+    let f = write_temp(gguf_bytes);
+    let gguf = Gguf::open(f.path()).unwrap();
+
+    let cfg = Qwen3_5Config::from_metadata(&gguf.metadata).unwrap();
+    assert_eq!(cfg.block_count, 60);
+    assert_eq!(cfg.embedding_length, 4096);
+    assert_eq!(cfg.attention_head_count, 32);
+    assert_eq!(cfg.attention_head_count_kv, 2);
+    assert_eq!(cfg.attention_key_length, 256);
+    assert_eq!(cfg.expert_count, 512);
+    assert_eq!(cfg.expert_used_count, 10);
+    assert_eq!(cfg.key_dim, 128 * 16);
+    assert_eq!(cfg.value_dim, 128 * 64);
+    assert_eq!(cfg.conv_dim, (128 * 16) * 2 + 128 * 64);
+    assert_eq!(cfg.ba_dim, 64 * 2);
+    assert_eq!(cfg.full_attn_q_fused_dim, 256 * 32 * 2);
+}
+
+#[test]
+fn qwen35_config_rejects_wrong_arch() {
+    let gguf_bytes = GgufBuilder::new()
+        .metadata("general.architecture", Value::String("llama".into()))
+        .metadata("qwen3_5moe.block_count", Value::U32(60))
+        .build();
+    let f = write_temp(gguf_bytes);
+    let gguf = Gguf::open(f.path()).unwrap();
+    let err = Qwen3_5Config::from_metadata(&gguf.metadata).unwrap_err();
+    assert!(matches!(err, GgufError::TypeMismatch { key, .. } if key == "general.architecture"));
+}
+
+#[test]
+fn qwen35_config_rejects_missing_key() {
+    let gguf_bytes = GgufBuilder::new()
+        .metadata("general.architecture", Value::String("qwen3_5moe".into()))
+        .build();
+    let f = write_temp(gguf_bytes);
+    let gguf = Gguf::open(f.path()).unwrap();
+    let err = Qwen3_5Config::from_metadata(&gguf.metadata).unwrap_err();
+    assert!(matches!(err, GgufError::MissingKey { .. }));
 }
