@@ -183,13 +183,13 @@ impl GGmlType {
 pub struct TensorMeta {
     pub name: String,
     pub ggml_type: GGmlType,
-    pub dims: Vec<u32>,
+    pub dims: Vec<u64>,
     pub offset: u64,
 }
 
 impl TensorMeta {
     pub fn n_elements(&self) -> u64 {
-        self.dims.iter().map(|&d| u64::from(d)).product()
+        self.dims.iter().product()
     }
 
     pub fn is_quantized(&self) -> bool {

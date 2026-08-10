@@ -137,11 +137,27 @@ fn main() -> anyhow::Result<()> {
             "  ssm_inner_size:                     {:?}",
             cfg.ssm_inner_size
         );
+        println!(
+            "  full_attention_interval:            {}",
+            cfg.full_attention_interval
+        );
+        println!(
+            "  rope_sections:                      {:?}",
+            cfg.rope_sections
+        );
         println!();
         println!("Derived dims:");
         println!("  key_dim (state * group):            {}", cfg.key_dim);
         println!("  value_dim (state * time_step):      {}", cfg.value_dim);
         println!("  conv_dim (2*key + value):           {}", cfg.conv_dim);
+        println!(
+            "  head_k_dim (state):                 {}",
+            cfg.head_k_dim
+        );
+        println!(
+            "  head_v_dim (inner/time_step):       {}",
+            cfg.head_v_dim
+        );
         println!("  ba_dim (2 * time_step):             {}", cfg.ba_dim);
         println!(
             "  full_attn_q_fused_dim:              {}",

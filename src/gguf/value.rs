@@ -126,7 +126,12 @@ impl Value {
 
     pub fn as_u32(&self) -> Result<u32, GgufError> {
         match self {
+            Value::U8(v) => Ok(u32::from(*v)),
+            Value::U16(v) => Ok(u32::from(*v)),
             Value::U32(v) => Ok(*v),
+            Value::I8(v) if *v >= 0 => Ok(*v as u32),
+            Value::I16(v) if *v >= 0 => Ok(*v as u32),
+            Value::I32(v) if *v >= 0 => Ok(*v as u32),
             other => Err(GgufError::ValueTypeMismatch {
                 actual: other.type_name(),
                 expected: "uint32",
@@ -136,7 +141,12 @@ impl Value {
 
     pub fn as_i32(&self) -> Result<i32, GgufError> {
         match self {
+            Value::I8(v) => Ok(i32::from(*v)),
+            Value::I16(v) => Ok(i32::from(*v)),
             Value::I32(v) => Ok(*v),
+            Value::U8(v) => Ok(i32::from(*v)),
+            Value::U16(v) => Ok(i32::from(*v)),
+            Value::U32(v) if *v <= i32::MAX as u32 => Ok(*v as i32),
             other => Err(GgufError::ValueTypeMismatch {
                 actual: other.type_name(),
                 expected: "int32",
@@ -190,6 +200,22 @@ impl Value {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
                     out.push(item.as_str()?);
+                }
+                Ok(out)
+            }
+            other => Err(GgufError::ValueTypeMismatch {
+                actual: other.type_name(),
+                expected: "array",
+            }),
+        }
+    }
+
+    pub fn as_i32_array(&self) -> Result<Vec<i32>, GgufError> {
+        match self {
+            Value::Array { items, .. } => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(item.as_i32()?);
                 }
                 Ok(out)
             }

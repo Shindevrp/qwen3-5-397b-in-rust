@@ -45,8 +45,8 @@ impl Gguf {
 
         let header = r.read_header()?;
         let (metadata, alignment) = r.read_metadata(header.metadata_kv_count)?;
-        r.align(alignment);
         let tensors = r.read_tensor_index(header.tensor_count)?;
+        r.align(alignment);
         let data_offset = r.pos;
 
         let by_name = tensors
@@ -71,7 +71,8 @@ impl Gguf {
     }
 
     pub fn data_slice(&self, tensor: &TensorMeta) -> &[u8] {
-        &self.mmap[tensor.offset as usize..]
+        let start = self.data_offset + tensor.offset as usize;
+        self.mmap.get(start..).unwrap_or(&[])
     }
 
     pub fn len(&self) -> usize {
@@ -275,7 +276,7 @@ impl<'a> Reader<'a> {
             }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
-                dims.push(self.read_u32()?);
+                dims.push(self.read_u64()?);
             }
             let type_raw = self.read_u32()?;
             let offset = self.read_u64()?;

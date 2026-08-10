@@ -135,10 +135,11 @@ fn roundtrip_custom_alignment() {
     let gguf = Gguf::open(f.path()).unwrap();
 
     assert_eq!(gguf.alignment, 64);
+    assert_eq!(gguf.tensors[0].offset, 0);
     for t in &gguf.tensors {
         assert_eq!(t.offset % 64, 0);
     }
-    assert!((gguf.data_offset as u64) <= gguf.tensors[0].offset);
+    assert!(gguf.data_offset.is_multiple_of(64));
 }
 
 #[test]
@@ -254,6 +255,19 @@ fn qwen35_config_loads_and_validates() {
         .metadata("qwen3_5moe.ssm.time_step_rank", Value::U32(64))
         .metadata("qwen3_5moe.ssm.conv_kernel", Value::U32(4))
         .metadata("qwen3_5moe.ssm.inner_size", Value::U32(8192))
+        .metadata("qwen3_5moe.full_attention_interval", Value::U32(4))
+        .metadata(
+            "qwen3_5moe.rope.dimension_sections",
+            Value::Array {
+                elem_type: ValueType::I32,
+                items: vec![
+                    Value::I32(11),
+                    Value::I32(11),
+                    Value::I32(10),
+                    Value::I32(0),
+                ],
+            },
+        )
         .tensor(TensorSpec {
             name: "token_embd.weight".into(),
             ggml_type: GGmlType::F32,

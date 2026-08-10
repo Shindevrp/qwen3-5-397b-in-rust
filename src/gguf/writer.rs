@@ -7,13 +7,13 @@ use crate::gguf::value::{Value, ValueType};
 pub struct TensorSpec {
     pub name: String,
     pub ggml_type: GGmlType,
-    pub dims: Vec<u32>,
+    pub dims: Vec<u64>,
     pub data: Vec<u8>,
 }
 
 impl TensorSpec {
     fn index_entry_len(&self) -> u64 {
-        8 + self.name.len() as u64 + 4 + 4 * self.dims.len() as u64 + 4 + 8
+        8 + self.name.len() as u64 + 4 + 8 * self.dims.len() as u64 + 4 + 8
     }
 }
 
@@ -71,14 +71,10 @@ impl GgufBuilder {
             write_value(&mut out, value);
         }
 
-        align(&mut out, self.alignment);
-        let index_start = out.len();
+        let index_end = out.len() + self.tensors.iter().map(|t| t.index_entry_len() as usize).sum::<usize>();
+        let data_start = align_up(index_end as u64, self.alignment);
 
-        let mut data_pos = index_start as u64;
-        for t in &self.tensors {
-            data_pos += t.index_entry_len();
-        }
-
+        let mut data_pos = 0u64;
         let mut offsets = Vec::with_capacity(self.tensors.len());
         for t in &self.tensors {
             data_pos = align_up(data_pos, self.alignment);
@@ -90,14 +86,14 @@ impl GgufBuilder {
             write_str(&mut out, &t.name);
             out.write_u32::<LittleEndian>(t.dims.len() as u32).unwrap();
             for &d in &t.dims {
-                out.write_u32::<LittleEndian>(d).unwrap();
+                out.write_u64::<LittleEndian>(d).unwrap();
             }
             out.write_u32::<LittleEndian>(t.ggml_type.as_raw()).unwrap();
             out.write_u64::<LittleEndian>(*offset).unwrap();
         }
 
         for (t, offset) in self.tensors.iter().zip(&offsets) {
-            while (out.len() as u64) < *offset {
+            while (out.len() as u64) < data_start + *offset {
                 out.push(0);
             }
             out.extend_from_slice(&t.data);
@@ -151,12 +147,6 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::U64(x) => out.write_u64::<LittleEndian>(*x).unwrap(),
         Value::I64(x) => out.write_i64::<LittleEndian>(*x).unwrap(),
         Value::F64(x) => out.write_f64::<LittleEndian>(*x).unwrap(),
-    }
-}
-
-fn align(out: &mut Vec<u8>, alignment: u64) {
-    while !(out.len() as u64).is_multiple_of(alignment) {
-        out.push(0);
     }
 }
 

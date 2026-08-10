@@ -72,6 +72,12 @@ impl Metadata {
         v.as_str_array().map_err(|_| self.mismatch(key, v, "array"))
     }
 
+    pub fn get_i32_array(&self, key: &str) -> Result<Vec<i32>, GgufError> {
+        let v = self.require(key)?;
+        v.as_i32_array()
+            .map_err(|_| self.mismatch(key, v, "int32 array"))
+    }
+
     fn require(&self, key: &str) -> Result<&Value, GgufError> {
         self.get(key)
             .ok_or_else(|| GgufError::MissingKey(key.to_string()))
