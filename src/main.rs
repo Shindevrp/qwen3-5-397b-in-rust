@@ -1,24 +1,66 @@
 mod gguf;
 mod model;
+mod tokenizer;
 
 use gguf::{Gguf, Value};
 use model::config::{Qwen3_5Config, validate_tensors};
+use tokenizer::QwenTokenizer;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: qwen3-5-397b-in-rust <model.gguf> [--metadata] [--tensor <name>] [--config]"
+            "usage: qwen3-5-397b-in-rust <model.gguf|tokenizer.json> [--metadata] [--tensor <name>] [--config] [--tokenize <text>] [--detokenize <ids>] [--tokenizer <path>]"
         );
         std::process::exit(2);
     }
     let path = std::path::Path::new(&args[1]);
     let dump_metadata = args.iter().any(|a| a == "--metadata");
     let dump_config = args.iter().any(|a| a == "--config");
+    let tokenize = args
+        .iter()
+        .position(|a| a == "--tokenize")
+        .map(|i| args[i + 1].clone());
+    let detokenize = args
+        .iter()
+        .position(|a| a == "--detokenize")
+        .map(|i| args[i + 1].clone());
+    let tokenizer_path = args
+        .iter()
+        .position(|a| a == "--tokenizer")
+        .map(|i| args[i + 1].clone());
     let lookup = args
         .iter()
         .position(|a| a == "--tensor")
         .map(|i| args[i + 1].clone());
+
+    let is_tokenizer = path.extension().and_then(|s| s.to_str()) == Some("json");
+
+    if is_tokenizer || tokenize.is_some() || detokenize.is_some() {
+        let tok_path = tokenizer_path.unwrap_or_else(|| path.to_string_lossy().to_string());
+        let tok = QwenTokenizer::from_file(&tok_path)?;
+        println!("vocab size: {}", tok.vocab_size());
+
+        if let Some(text) = tokenize {
+            let ids = tok.encode(&text, true)?;
+            println!(
+                "tokens: {}",
+                ids.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        if let Some(ids_str) = detokenize {
+            let ids: Vec<u32> = ids_str
+                .split_whitespace()
+                .map(|s| s.parse().unwrap())
+                .collect();
+            let text = tok.decode(&ids, true)?;
+            println!("text: {text}");
+        }
+        return Ok(());
+    }
 
     let gguf = Gguf::open(path)?;
 
