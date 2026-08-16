@@ -25,6 +25,10 @@ impl Metadata {
         self.map.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.map.iter()
     }

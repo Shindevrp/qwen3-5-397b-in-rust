@@ -1,16 +1,14 @@
-mod gguf;
-mod model;
-mod tokenizer;
-
-use gguf::{Gguf, Value};
-use model::config::{Qwen3_5Config, validate_tensors};
-use tokenizer::QwenTokenizer;
+use qwen3_5_397b_in_rust::gguf::{Gguf, Value};
+use qwen3_5_397b_in_rust::model::config::{Qwen3_5Config, validate_tensors};
+use qwen3_5_397b_in_rust::model::loader::ModelLoader;
+use qwen3_5_397b_in_rust::model::quant;
+use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: qwen3-5-397b-in-rust <model.gguf|tokenizer.json> [--metadata] [--tensor <name>] [--config] [--tokenize <text>] [--detokenize <ids>] [--tokenizer <path>]"
+            "usage: qwen3-5-397b-in-rust <model.gguf|tokenizer.json> [--metadata] [--tensor <name>] [--config] [--tokenize <text>] [--detokenize <ids>] [--tokenizer <path>] [--dequant <name>] [--load <name>] [<count>]"
         );
         std::process::exit(2);
     }
@@ -33,6 +31,21 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .position(|a| a == "--tensor")
         .map(|i| args[i + 1].clone());
+    let dequant = args
+        .iter()
+        .position(|a| a == "--dequant")
+        .map(|i| (args[i + 1].clone(), i));
+    let load = args
+        .iter()
+        .position(|a| a == "--load")
+        .map(|i| args[i + 1].clone());
+    // Optional trailing positional: how many values to print.
+    let dequant_count = args
+        .iter()
+        .position(|a| a == "--dequant" || a == "--load")
+        .and_then(|i| args.get(i + 2))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(16);
 
     let is_tokenizer = path.extension().and_then(|s| s.to_str()) == Some("json");
 
@@ -225,6 +238,56 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        if let Some((name, _)) = dequant {
+            println!();
+            let t = gguf
+                .tensor(&name)
+                .ok_or_else(|| anyhow::anyhow!("tensor \"{name}\" not found"))?;
+            let data = gguf.data_slice(t);
+            println!(
+                "dequant \"{name}\": type={} dims={:?} elems={} bytes={}",
+                t.ggml_type.name(),
+                t.dims,
+                t.n_elements(),
+                data.len()
+            );
+            let values = quant::dequantize(t.ggml_type, data, t.n_elements())?;
+            let shown = values.len().min(dequant_count);
+            let parts: Vec<String> = values[..shown]
+                .iter()
+                .map(|v| format!("{v:.6}"))
+                .collect();
+            println!("values[0..{shown}]: {}", parts.join(" "));
+        }
+
+        if let Some(name) = load {
+            println!();
+            let loader = ModelLoader::open(path)?;
+            let meta = loader
+                .tensor_meta(&name)
+                .ok_or_else(|| anyhow::anyhow!("tensor \"{name}\" not found"))?;
+            let split_no = loader
+                .shard_of(&name)
+                .map(|i| loader.shards[i].split_no);
+            println!(
+                "load \"{name}\": type={} dims={:?} elems={} shards={} split_no={:?} total_tensors={}",
+                meta.ggml_type.name(),
+                meta.dims,
+                meta.n_elements(),
+                loader.shards.len(),
+                split_no,
+                loader.tensor_count()
+            );
+            println!("config: layers={} experts={} used={}", loader.cfg.block_count, loader.cfg.expert_count, loader.cfg.expert_used_count);
+            let values = loader.dequant(&name)?;
+            let shown = values.len().min(dequant_count);
+            let parts: Vec<String> = values[..shown]
+                .iter()
+                .map(|v| format!("{v:.6}"))
+                .collect();
+            println!("values[0..{shown}]: {}", parts.join(" "));
         }
     }
 

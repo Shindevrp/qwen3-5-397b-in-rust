@@ -78,6 +78,10 @@ impl Gguf {
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
 }
 
 struct Reader<'a> {
