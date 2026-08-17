@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -72,6 +72,22 @@ fn main() {
                 let out = gemm(ty, &w, n_in, n_out, n_batch, &x).expect("gemm");
                 assert_eq!(out.len(), n_out * n_batch);
                 write_txt(&dir.join(format!("rust_gemm_{}.txt", f[1])), &out);
+            }
+            "attn" => {
+                let id = f[1];
+                let n_heads: usize = f[2].parse().unwrap();
+                let n_kv_heads: usize = f[3].parse().unwrap();
+                let head_dim: usize = f[4].parse().unwrap();
+                let n_q: usize = f[5].parse().unwrap();
+                let n_kv: usize = f[6].parse().unwrap();
+                let causal: bool = f[7].parse::<u8>().unwrap() != 0;
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let q = read_f32_file(&dir.join(format!("attn_{id}_q.bin")), n_q * n_heads * head_dim);
+                let k = read_f32_file(&dir.join(format!("attn_{id}_k.bin")), n_kv * n_kv_heads * head_dim);
+                let v = read_f32_file(&dir.join(format!("attn_{id}_v.bin")), n_kv * n_kv_heads * head_dim);
+                let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, n_kv, scale, causal);
+                assert_eq!(out.len(), n_q * n_heads * head_dim);
+                write_txt(&dir.join(format!("rust_attn_{id}.txt")), &out);
             }
             "rope" => {
                 let id = f[1];

@@ -449,6 +449,110 @@ pub fn gemm(
     Ok(out)
 }
 
+// ---- Softmax + Attention ---------------------------------------------------
+
+/// In-place softmax over each row.  `x` has `n_rows * n_cols` elements;
+/// `n_cols` is the number of elements per row that are softmaxed together.
+pub fn softmax_in_place(x: &mut [f32], n_cols: usize) {
+    assert!(x.len().is_multiple_of(n_cols));
+    for row in x.chunks_exact_mut(n_cols) {
+        let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for v in row.iter_mut() {
+            *v = (*v - max_val).exp();
+            sum += *v;
+        }
+        let inv = 1.0 / sum;
+        for v in row.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+/// Scaled dot-product attention with optional causal mask.
+///
+/// **Layout** (ggml row-major): `ne[0] = head_dim, ne[1] = tokens, ne[2] = heads`.
+///
+/// - `q`: `[n_q × n_heads × head_dim]`  — query tokens.
+/// - `k`: `[n_kv × n_kv_heads × head_dim]`  — key cache (or full keys).
+/// - `v`: `[n_kv × n_kv_heads × head_dim]`  — value cache.
+/// - Returns `[n_q × n_heads × head_dim]`  — one float per (token, head, dim).
+///
+/// Each query token `qt` attends to key tokens `0..=min(qt, n_kv-1)` when
+/// `causal` is true, or `0..n_kv` otherwise (for decode, n_kv == pos+1 and
+/// the entire cache is valid).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attention_forward(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    n_kv: usize,
+    scale: f32,
+    causal: bool,
+) -> Vec<f32> {
+    assert!(n_heads.is_multiple_of(n_kv_heads), "n_heads must be a multiple of n_kv_heads");
+    let gqa = n_heads / n_kv_heads;
+    let q_stride = head_dim; // stride between heads within one query token
+    let kv_head_stride = head_dim; // stride between tokens for one kv head
+    let kv_tok_stride = head_dim * n_kv_heads; // stride between kv tokens
+
+    let mut out = vec![0.0f32; n_q * n_heads * head_dim];
+    // scores buffer: n_kv elements per (qt, qh) pair
+    let mut scores = vec![0.0f32; n_kv];
+
+    for qt in 0..n_q {
+        let q_base = qt * n_heads * head_dim;
+        let o_base = qt * n_heads * head_dim;
+        for qh in 0..n_heads {
+            let kv_h = qh / gqa;
+            let qh_base = q_base + qh * q_stride;
+            let oh_base = o_base + qh * head_dim;
+            let kv_h_base = kv_h * kv_head_stride;
+
+            // Upper bound of positions this query can attend to.
+            let max_kv = if causal {
+                // For prefill (n_q > 1): qt is the query position, so we can
+                // attend to key positions 0..=qt (clamped to n_kv).
+                // For decode (n_q == 1, autoregressive): attend to all n_kv.
+                if n_q > 1 { qt.min(n_kv - 1) } else { n_kv - 1 }
+            } else {
+                n_kv - 1
+            };
+
+            // QK^T / sqrt(d)
+            for t in 0..=max_kv {
+                let k_base = kv_h_base + t * kv_tok_stride;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[qh_base + d] * k[k_base + d];
+                }
+                scores[t] = dot * scale;
+            }
+            // Mask future positions to -inf
+            for t in (max_kv + 1)..n_kv {
+                scores[t] = f32::NEG_INFINITY;
+            }
+
+            softmax_in_place(&mut scores[..n_kv], n_kv);
+
+            // scores × V
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for t in 0..n_kv {
+                    let v_base = kv_h_base + t * kv_tok_stride;
+                    acc += scores[t] * v[v_base + d];
+                }
+                out[oh_base + d] = acc;
+            }
+        }
+    }
+    out
+}
+
 // ---- IMRoPE (rope_multi) -------------------------------------------------
 
 /// Rotary scaling parameters for `ggml_rope_ext` / `ggml_rope_multi`.
@@ -837,6 +941,122 @@ mod tests {
                     n_in,
                 );
                 assert_close(out[r * n_batch + b], expect);
+            }
+        }
+    }
+
+    #[test]
+    fn softmax_known_values() {
+        // Uniform input → equal probs
+        let mut x = vec![1.0f32; 4];
+        softmax_in_place(&mut x, 4);
+        for v in &x {
+            assert!((v - 0.25).abs() < 1e-6);
+        }
+        // Known distribution: [1.0, 2.0, 3.0]
+        let mut x2 = vec![1.0f32, 2.0, 3.0];
+        softmax_in_place(&mut x2, 3);
+        let sum: f32 = x2.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(x2[2] > x2[1]);
+        assert!(x2[1] > x2[0]);
+    }
+
+    #[test]
+    fn attention_causal_matches_numpy() {
+        // Small test: head_dim=8, n_heads=2, n_kv_heads=2 (no GQA), n_q=4, n_kv=4
+        let hd = 8;
+        let n_heads = 2;
+        let n_kv_heads = 2;
+        let n_q = 4;
+        let n_kv = 4;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // Craft deterministic Q, K, V
+        let q: Vec<f32> = (0..n_q * n_heads * hd)
+            .map(|i| ((i as f32 * 0.1).sin() * 2.0 - 1.0))
+            .collect();
+        let k: Vec<f32> = (0..n_kv * n_kv_heads * hd)
+            .map(|i| ((i as f32 * 0.15 + 5.0).cos() * 1.5))
+            .collect();
+        let v: Vec<f32> = (0..n_kv * n_kv_heads * hd)
+            .map(|i| (i as f32 * 0.2 + 10.0).sin())
+            .collect();
+
+        let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, hd, n_q, n_kv, scale, true);
+
+        // Reference: naive numpy-style
+        let causal = true;
+        for qt in 0..n_q {
+            for qh in 0..n_heads {
+                let mut scores = vec![0.0f32; n_kv];
+                for t in 0..n_kv {
+                    if causal && t > qt {
+                        scores[t] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..hd {
+                            dot += q[qt * n_heads * hd + qh * hd + d]
+                                * k[t * n_kv_heads * hd + qh * hd + d];
+                        }
+                        scores[t] = dot * scale;
+                    }
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                let sum_e: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / sum_e).collect();
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for t in 0..n_kv {
+                        acc += probs[t] * v[t * n_kv_heads * hd + qh * hd + d];
+                    }
+                    let idx = qt * n_heads * hd + qh * hd + d;
+                    assert_close(out[idx], acc);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_gqa() {
+        // GQA: n_heads=4, n_kv_heads=2, hd=8, n_q=2, n_kv=3
+        let hd = 8;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let n_q = 2;
+        let n_kv = 3;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        let q: Vec<f32> = (0..n_q * n_heads * hd).map(|i| (i as f32 * 0.3).sin()).collect();
+        let k: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|i| (i as f32 * 0.5 + 1.0).cos()).collect();
+        let v: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|i| (i as f32 * 0.2 + 2.0).sin()).collect();
+
+        let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, hd, n_q, n_kv, scale, false);
+
+        // Verify: qh 0 and qh 1 use kv_h 0; qh 2 and qh 3 use kv_h 1
+        // So out[0,0,:] should equal out[0,1,:] (same KV, same Q? no, different Q rows)
+        // But out[:,0,:] and out[:,1,:] use same K/V cache
+        for qh in 0..n_heads {
+            let kv_h = qh / 2; // gqa = 4/2 = 2
+            for qt in 0..n_q {
+                let mut scores = vec![0.0f32; n_kv];
+                for t in 0..n_kv {
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += q[qt * n_heads * hd + qh * hd + d]
+                            * k[t * n_kv_heads * hd + kv_h * hd + d];
+                    }
+                    scores[t] = dot * scale;
+                }
+                softmax_in_place(&mut scores, n_kv);
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for t in 0..n_kv {
+                        acc += scores[t] * v[t * n_kv_heads * hd + kv_h * hd + d];
+                    }
+                    assert_close(out[qt * n_heads * hd + qh * hd + d], acc);
+                }
             }
         }
     }
