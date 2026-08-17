@@ -373,6 +373,82 @@ pub fn gemv(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Res
     Ok(out)
 }
 
+/// Batched matrix-vector product: `out[row * n_batch + b] = dot(w_row, x[b])`.
+///
+/// `x` has `n_in * n_batch` floats laid out as `n_batch` contiguous vectors.
+/// Output is `n_out * n_batch` floats, row-major by weight row.
+pub fn gemm(
+    ty: GGmlType,
+    w: &[u8],
+    n_in: usize,
+    n_out: usize,
+    n_batch: usize,
+    x: &[f32],
+) -> Result<Vec<f32>, QuantError> {
+    assert_eq!(
+        x.len(),
+        n_in * n_batch,
+        "x must have n_in × n_batch = {n_in}×{n_batch} = {} floats",
+        n_in * n_batch,
+    );
+    let row_bytes = crate::model::quant::tensor_size(ty, n_in as u64)? as usize;
+    assert!(w.len() >= n_out * row_bytes);
+    let mut out = vec![0.0f32; n_out * n_batch];
+    match ty {
+        GGmlType::F32 => {
+            for b in 0..n_batch {
+                let xb = &x[b * n_in..(b + 1) * n_in];
+                for r in 0..n_out {
+                    let row = &w[r * row_bytes..(r + 1) * row_bytes];
+                    let mut sum = 0.0f32;
+                    for (i, c) in row.chunks_exact(4).enumerate() {
+                        sum += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xb[i];
+                    }
+                    out[r * n_batch + b] = sum;
+                }
+            }
+        }
+        GGmlType::Q8_0 => {
+            for b in 0..n_batch {
+                let act = quantize_row_q8_0(&x[b * n_in..(b + 1) * n_in]);
+                for r in 0..n_out {
+                    out[r * n_batch + b] =
+                        vec_dot_q8_0_q8_0(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act);
+                }
+            }
+        }
+        GGmlType::Q4_K => {
+            for b in 0..n_batch {
+                let act = quantize_row_q8_k(&x[b * n_in..(b + 1) * n_in]);
+                for r in 0..n_out {
+                    out[r * n_batch + b] =
+                        vec_dot_q4_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act);
+                }
+            }
+        }
+        GGmlType::Q5_K => {
+            for b in 0..n_batch {
+                let act = quantize_row_q8_k(&x[b * n_in..(b + 1) * n_in]);
+                for r in 0..n_out {
+                    out[r * n_batch + b] =
+                        vec_dot_q5_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act);
+                }
+            }
+        }
+        GGmlType::Q6_K => {
+            for b in 0..n_batch {
+                let act = quantize_row_q8_k(&x[b * n_in..(b + 1) * n_in]);
+                for r in 0..n_out {
+                    out[r * n_batch + b] =
+                        vec_dot_q6_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act);
+                }
+            }
+        }
+        other => return Err(QuantError::UnsupportedType(other.name())),
+    }
+    Ok(out)
+}
+
 // ---- IMRoPE (rope_multi) -------------------------------------------------
 
 /// Rotary scaling parameters for `ggml_rope_ext` / `ggml_rope_multi`.
@@ -721,6 +797,47 @@ mod tests {
         for (r, v) in out.iter().enumerate() {
             let expect = naive_quantized_dot(GGmlType::Q8_0, &w[r * row_bytes..(r + 1) * row_bytes], GGmlType::Q8_0, &xq, n_in);
             assert_close(*v, expect);
+        }
+    }
+
+    #[test]
+    fn gemm_matches_naive() {
+        let n_in = QK_K;
+        let n_out = 4;
+        let n_batch = 3;
+        // craft n_out rows of Q8_0 weights
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut w = Vec::new();
+        for _ in 0..n_out {
+            let row: Vec<f32> = (0..n_in).map(|_| ((next() as f32) - 1000.0) * 0.001).collect();
+            w.extend_from_slice(&quantize_row_q8_0(&row));
+        }
+        let mut x = Vec::new();
+        for b in 0..n_batch {
+            for i in 0..n_in {
+                x.push(((b as f32 * 100.0 + i as f32) * 0.03).sin());
+            }
+        }
+        let out = gemm(GGmlType::Q8_0, &w, n_in, n_out, n_batch, &x).unwrap();
+        assert_eq!(out.len(), n_out * n_batch);
+        let row_bytes = crate::model::quant::tensor_size(GGmlType::Q8_0, n_in as u64).unwrap() as usize;
+        for b in 0..n_batch {
+            let xb = &x[b * n_in..(b + 1) * n_in];
+            let xq = quantize_row_q8_0(xb);
+            for r in 0..n_out {
+                let expect = naive_quantized_dot(
+                    GGmlType::Q8_0,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    GGmlType::Q8_0,
+                    &xq,
+                    n_in,
+                );
+                assert_close(out[r * n_batch + b], expect);
+            }
         }
     }
 

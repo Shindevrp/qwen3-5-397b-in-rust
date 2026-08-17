@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{gemv, rms_norm, rope_multi_imrope, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -61,6 +61,17 @@ fn main() {
                 let out = gemv(ty, &w, n_in, n_out, &x).expect("gemv");
                 assert_eq!(out.len(), n_out);
                 write_txt(&dir.join(format!("rust_gemv_{}.txt", f[1])), &out);
+            }
+            "gemm" => {
+                let ty = ty_from_name(f[1]);
+                let n_in: usize = f[2].parse().unwrap();
+                let n_out: usize = f[3].parse().unwrap();
+                let n_batch: usize = f[4].parse().unwrap();
+                let w = fs::read(dir.join(format!("gemm_{}_w.bin", f[1]))).expect("read weight file");
+                let x = read_f32_file(&dir.join(f[5]), n_in * n_batch);
+                let out = gemm(ty, &w, n_in, n_out, n_batch, &x).expect("gemm");
+                assert_eq!(out.len(), n_out * n_batch);
+                write_txt(&dir.join(format!("rust_gemm_{}.txt", f[1])), &out);
             }
             "rope" => {
                 let id = f[1];
