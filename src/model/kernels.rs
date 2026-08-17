@@ -553,6 +553,104 @@ pub fn attention_forward(
     out
 }
 
+// ---- Delta-net linear attention (autoregressive) --------------------------
+
+/// Delta-net autoregressive linear attention (GDA mode).
+///
+/// Layout: per-head vectors are contiguous: `q[hi * S_k .. (hi+1) * S_k]`.
+///
+/// Steps:
+/// 1. L2-normalize q, k
+/// 2. Scale q by `1/sqrt(S_v)`
+/// 3. `beta = sigmoid(beta)`
+/// 4. `state *= exp(g)` (per-head scalar gate, GDA)
+/// 5. `k_state = state^T @ k`
+/// 6. `v_diff = v - k_state`
+/// 7. `state += outer(v_diff, k * beta)`
+/// 8. `output = state^T @ q`
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_autoregressive(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    s_k: usize,
+    s_v: usize,
+    n_heads: usize,
+    eps: f32,
+) -> Vec<f32> {
+    assert_eq!(q.len(), s_k * n_heads);
+    assert_eq!(k.len(), s_k * n_heads);
+    assert_eq!(v.len(), s_v * n_heads);
+    assert_eq!(g.len(), n_heads);
+    assert_eq!(beta.len(), n_heads);
+    assert_eq!(state.len(), s_v * s_v * n_heads);
+    let scale = 1.0 / (s_v as f32).sqrt();
+    let mut out = vec![0.0f32; s_v * n_heads];
+
+    for hi in 0..n_heads {
+        let q_base = hi * s_k;
+        let v_base = hi * s_v;
+        let st_base = hi * s_v * s_v;
+
+        // L2-normalize q
+        let q_slice = &q[q_base..q_base + s_k];
+        let q_norm_sq: f32 = q_slice.iter().map(|x| x * x).sum();
+        let q_factor = scale / (q_norm_sq.sqrt() + eps);
+
+        // L2-normalize k
+        let k_slice = &k[q_base..q_base + s_k];
+        let k_norm_sq: f32 = k_slice.iter().map(|x| x * x).sum();
+        let k_factor = 1.0 / (k_norm_sq.sqrt() + eps);
+
+        // Sigmoid beta
+        let b = 1.0 / (1.0 + (-beta[hi]).exp());
+
+        // State decay: state *= exp(g)
+        let decay = g[hi].exp();
+        for val in state[st_base..st_base + s_v * s_v].iter_mut() {
+            *val *= decay;
+        }
+
+        // k_state = state^T @ k_norm  → [S_v]
+        // state^T[i,j] = state[j,i] = state[st_base + i * s_v + j]
+        let mut k_state = vec![0.0f32; s_v];
+        for i in 0..s_v {
+            let mut acc = 0.0f32;
+            for j in 0..s_k {
+                acc += state[st_base + i * s_v + j] * k_slice[j];
+            }
+            k_state[i] = acc * k_factor;
+        }
+
+        // v_diff = v - k_state
+        let mut v_diff = vec![0.0f32; s_v];
+        for i in 0..s_v {
+            v_diff[i] = v[v_base + i] - k_state[i];
+        }
+
+        // State update: state += outer(v_diff, k_norm * beta)
+        for i in 0..s_v {
+            for j in 0..s_k {
+                state[st_base + i * s_v + j] += v_diff[i] * k_slice[j] * k_factor * b;
+            }
+        }
+
+        // output = state^T @ q_norm  → [S_v]
+        let q_norm_factor = q_factor; // already includes scale
+        for i in 0..s_v {
+            let mut acc = 0.0f32;
+            for j in 0..s_k {
+                acc += state[st_base + i * s_v + j] * q_slice[j];
+            }
+            out[v_base + i] = acc * q_norm_factor;
+        }
+    }
+    out
+}
+
 // ---- IMRoPE (rope_multi) -------------------------------------------------
 
 /// Rotary scaling parameters for `ggml_rope_ext` / `ggml_rope_multi`.
@@ -974,10 +1072,10 @@ mod tests {
 
         // Craft deterministic Q, K, V
         let q: Vec<f32> = (0..n_q * n_heads * hd)
-            .map(|i| ((i as f32 * 0.1).sin() * 2.0 - 1.0))
+            .map(|i| (i as f32 * 0.1).sin() * 2.0 - 1.0)
             .collect();
         let k: Vec<f32> = (0..n_kv * n_kv_heads * hd)
-            .map(|i| ((i as f32 * 0.15 + 5.0).cos() * 1.5))
+            .map(|i| (i as f32 * 0.15 + 5.0).cos() * 1.5)
             .collect();
         let v: Vec<f32> = (0..n_kv * n_kv_heads * hd)
             .map(|i| (i as f32 * 0.2 + 10.0).sin())
@@ -1058,6 +1156,124 @@ mod tests {
                     assert_close(out[qt * n_heads * hd + qh * hd + d], acc);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn delta_net_matches_naive() {
+        let s_k = 16;
+        let s_v = 16;
+        let n_heads = 2;
+        let eps = 1e-6f32;
+
+        let mut state = vec![0.0f32; s_v * s_v * n_heads];
+
+        // Run two tokens to exercise state accumulation
+        let mut out_all = Vec::new();
+        for step in 0..2 {
+            let q: Vec<f32> = (0..s_k * n_heads)
+                .map(|i| (i as f32 * 0.3 + step as f32 * 7.0).sin())
+                .collect();
+            let k: Vec<f32> = (0..s_k * n_heads)
+                .map(|i| (i as f32 * 0.5 + step as f32 * 3.0 + 1.0).cos())
+                .collect();
+            let v: Vec<f32> = (0..s_v * n_heads)
+                .map(|i| (i as f32 * 0.2 + step as f32 * 5.0 + 2.0).sin())
+                .collect();
+            let g: Vec<f32> = vec![-0.1, -0.3];
+            let beta: Vec<f32> = vec![0.5, 0.8];
+
+            let out = delta_net_autoregressive(
+                &q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps,
+            );
+            out_all.push(out);
+        }
+
+        // Naive reference: same computation
+        let mut state_ref = vec![0.0f32; s_v * s_v * n_heads];
+        let mut out_ref_all = Vec::new();
+        for step in 0..2 {
+            let q: Vec<f32> = (0..s_k * n_heads)
+                .map(|i| (i as f32 * 0.3 + step as f32 * 7.0).sin())
+                .collect();
+            let k: Vec<f32> = (0..s_k * n_heads)
+                .map(|i| (i as f32 * 0.5 + step as f32 * 3.0 + 1.0).cos())
+                .collect();
+            let v: Vec<f32> = (0..s_v * n_heads)
+                .map(|i| (i as f32 * 0.2 + step as f32 * 5.0 + 2.0).sin())
+                .collect();
+            let g_vals = [-0.1f32, -0.3f32];
+            let beta_vals = [0.5f32, 0.8f32];
+            let scale = 1.0 / (s_v as f32).sqrt();
+
+            let mut out_h = vec![0.0f32; s_v * n_heads];
+            for hi in 0..n_heads {
+                // L2 normalize q
+                let qh = &q[hi * s_k..(hi + 1) * s_k];
+                let qn: f32 = qh.iter().map(|x| x * x).sum();
+                let qf = scale / (qn.sqrt() + eps);
+                // L2 normalize k
+                let kh = &k[hi * s_k..(hi + 1) * s_k];
+                let kn: f32 = kh.iter().map(|x| x * x).sum();
+                let kf = 1.0 / (kn.sqrt() + eps);
+                // sigmoid beta
+                let b = 1.0 / (1.0 + (-beta_vals[hi]).exp());
+                // decay
+                let decay = g_vals[hi].exp();
+                let sb = hi * s_v * s_v;
+                for val in state_ref[sb..sb + s_v * s_v].iter_mut() {
+                    *val *= decay;
+                }
+                // k_state = state^T @ (k * kf)
+                let mut kst = vec![0.0f32; s_v];
+                for i in 0..s_v {
+                    for j in 0..s_k {
+                        kst[i] += state_ref[sb + i * s_v + j] * kh[j];
+                    }
+                    kst[i] *= kf;
+                }
+                // v_diff
+                let vh = &v[hi * s_v..(hi + 1) * s_v];
+                let mut vd = vec![0.0f32; s_v];
+                for i in 0..s_v {
+                    vd[i] = vh[i] - kst[i];
+                }
+                // state += outer(vd, kh * kf * b)
+                for i in 0..s_v {
+                    for j in 0..s_k {
+                        state_ref[sb + i * s_v + j] += vd[i] * kh[j] * kf * b;
+                    }
+                }
+                // output = state^T @ (qh * qf)
+                for i in 0..s_v {
+                    for j in 0..s_k {
+                        out_h[hi * s_v + i] += state_ref[sb + i * s_v + j] * qh[j];
+                    }
+                    out_h[hi * s_v + i] *= qf;
+                }
+            }
+            out_ref_all.push(out_h);
+        }
+
+        // Compare state and outputs
+        for (step, (got, expect)) in out_all.iter().zip(out_ref_all.iter()).enumerate() {
+            for (i, (a, b)) in got.iter().zip(expect.iter()).enumerate() {
+                let tol = 1e-3 * b.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "step={step} i={i}: got {a} expect {b} diff {}",
+                    (a - b).abs()
+                );
+            }
+        }
+        // State must also match
+        for (i, (a, b)) in state.iter().zip(state_ref.iter()).enumerate() {
+            let tol = 1e-3 * b.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "state[{i}]: got {a} expect {b} diff {}",
+                (a - b).abs()
+            );
         }
     }
 

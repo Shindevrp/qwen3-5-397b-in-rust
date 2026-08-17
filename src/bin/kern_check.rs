@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, delta_net_autoregressive, gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -88,6 +88,25 @@ fn main() {
                 let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, n_kv, scale, causal);
                 assert_eq!(out.len(), n_q * n_heads * head_dim);
                 write_txt(&dir.join(format!("rust_attn_{id}.txt")), &out);
+            }
+            "delta" => {
+                let id: usize = f[1].parse().unwrap();
+                let s_k: usize = f[2].parse().unwrap();
+                let s_v: usize = f[3].parse().unwrap();
+                let n_heads: usize = f[4].parse().unwrap();
+                let n_steps: usize = f[5].parse().unwrap();
+                let eps = 1e-6f32;
+                let mut state = vec![0.0f32; s_v * s_v * n_heads];
+                for step in 0..n_steps {
+                    let q = read_f32_file(&dir.join(format!("dn_{id}_s{step}_q.bin")), s_k * n_heads);
+                    let k = read_f32_file(&dir.join(format!("dn_{id}_s{step}_k.bin")), s_k * n_heads);
+                    let v = read_f32_file(&dir.join(format!("dn_{id}_s{step}_v.bin")), s_v * n_heads);
+                    let g = read_f32_file(&dir.join(format!("dn_{id}_s{step}_g.bin")), n_heads);
+                    let beta = read_f32_file(&dir.join(format!("dn_{id}_s{step}_beta.bin")), n_heads);
+                    let out = delta_net_autoregressive(&q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps);
+                    assert_eq!(out.len(), s_v * n_heads);
+                    write_txt(&dir.join(format!("rust_dn_{id}_s{step}.txt")), &out);
+                }
             }
             "rope" => {
                 let id = f[1];
