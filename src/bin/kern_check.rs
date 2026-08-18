@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, gemm, gemv, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -184,6 +184,21 @@ fn main() {
                 assert_eq!(state_out.len(), channels * pad);
                 write_txt(&dir.join(format!("rust_conv_{id}_out.txt")), &out);
                 write_txt(&dir.join(format!("rust_conv_{id}_st.txt")), &state_out);
+            }
+            "moe" => {
+                let id = f[1];
+                let n_embd: usize = f[2].parse().unwrap();
+                let n_ff: usize = f[3].parse().unwrap();
+                let n_expert: usize = f[4].parse().unwrap();
+                let n_expert_used: usize = f[5].parse().unwrap();
+                let n_tokens: usize = f[6].parse().unwrap();
+                let inp = read_f32_file(&dir.join(format!("moe_{id}_inp.bin")), n_tokens * n_embd);
+                let rw = read_f32_file(&dir.join(format!("moe_{id}_rw.bin")), n_expert * n_embd);
+                let guw = read_f32_file(&dir.join(format!("moe_{id}_guw.bin")), n_expert * 2 * n_ff * n_embd);
+                let dw = read_f32_file(&dir.join(format!("moe_{id}_dw.bin")), n_expert * n_embd * n_ff);
+                let out = moe_ffn(&inp, &rw, &guw, &dw, n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+                assert_eq!(out.len(), n_tokens * n_embd);
+                write_txt(&dir.join(format!("rust_moe_{id}.txt")), &out);
             }
             other => panic!("spec line {}: unknown directive {other}", lineno + 1),
         }

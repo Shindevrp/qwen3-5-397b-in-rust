@@ -918,6 +918,116 @@ pub fn conv1d_silu(
     (output, state_out)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3b – MoE FFN (router + top-k + expert SwiGLU + weighted sum)
+// ---------------------------------------------------------------------------
+
+/// Mixture-of-Experts Feed-Forward Network.
+///
+/// All tensors use row-major layout `[rows, cols]` for clarity.
+///
+/// Inputs:
+/// - `input`: `[n_tokens, n_embd]`
+/// - `router_w`: `[n_expert, n_embd]` — router projection weights
+/// - `gate_up_w`: `[n_expert, 2 * n_ff, n_embd]` — fused gate+up projection per expert
+/// - `down_w`: `[n_expert, n_embd, n_ff]` — down projection per expert
+///
+/// Returns `[n_tokens, n_embd]`.
+///
+/// This is a scalar f32 port of `build_moe_ffn` from llama-graph.cpp for
+/// Qwen3.5 MoE (softmax gating, SwiGLU activation, weight normalization).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ffn(
+    input: &[f32],
+    router_w: &[f32],
+    gate_up_w: &[f32],
+    down_w: &[f32],
+    n_embd: usize,
+    n_ff: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+    n_tokens: usize,
+) -> Vec<f32> {
+    assert_eq!(input.len(), n_tokens * n_embd);
+    assert_eq!(router_w.len(), n_expert * n_embd);
+    assert_eq!(gate_up_w.len(), n_expert * 2 * n_ff * n_embd);
+    assert_eq!(down_w.len(), n_expert * n_embd * n_ff);
+    assert!(n_expert_used <= n_expert);
+
+    let mut output = vec![0.0f32; n_tokens * n_embd];
+
+    // Per-token: router logits → softmax → top-k → expert FFN → weighted sum
+    for t in 0..n_tokens {
+        let x = &input[t * n_embd..(t + 1) * n_embd];
+
+        // 1. Router logits: logits[e] = sum_i router_w[e, i] * x[i]
+        let mut logits = vec![0.0f32; n_expert];
+        for e in 0..n_expert {
+            let mut acc = 0.0f32;
+            for i in 0..n_embd {
+                acc += router_w[e * n_embd + i] * x[i];
+            }
+            logits[e] = acc;
+        }
+
+        // 2. Softmax (f64 for stability)
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
+        let sum_exp: f64 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|&e| (e / sum_exp) as f32).collect();
+
+        // 3. Top-k selection (sort by descending prob)
+        let mut idx: Vec<usize> = (0..n_expert).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(n_expert_used);
+
+        // 4. Extract weights for selected experts, normalize
+        let mut sel_weights: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+        let w_sum: f32 = sel_weights.iter().sum();
+        let w_sum = w_sum.max(1e-6f32); // avoid div by zero
+        for w in &mut sel_weights {
+            *w /= w_sum;
+        }
+
+        // 5. For each selected expert: gate_up → SwiGLU → down → accumulate
+        for (slot, &e) in idx.iter().enumerate() {
+            let w_e = sel_weights[slot];
+
+            // gate_up = gate_up_w[e] @ x  → [2 * n_ff]
+            let gw_base = e * 2 * n_ff * n_embd;
+            let mut gate_up = vec![0.0f32; 2 * n_ff];
+            for f in 0..2 * n_ff {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += gate_up_w[gw_base + f * n_embd + i] * x[i];
+                }
+                gate_up[f] = acc;
+            }
+
+            // SwiGLU: silu(gate) * up
+            let mut ff_out = vec![0.0f32; n_ff];
+            for f in 0..n_ff {
+                let g = gate_up[f];
+                let u = gate_up[n_ff + f];
+                let s = 1.0f32 / (1.0f32 + (-g).exp());
+                ff_out[f] = g * s * u;
+            }
+
+            // down = down_w[e] @ ff_out  → [n_embd], accumulate weighted
+            let dw_base = e * n_embd * n_ff;
+            for j in 0..n_embd {
+                let mut acc = 0.0f32;
+                for f in 0..n_ff {
+                    acc += down_w[dw_base + j * n_ff + f] * ff_out[f];
+                }
+                output[t * n_embd + j] += acc * w_e;
+            }
+        }
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1632,5 +1742,127 @@ mod tests {
         // New state = [input[0], input[1]] = [0.1, 0.2]
         assert!((state_out[0] - 0.1).abs() < 1e-6);
         assert!((state_out[1] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn moe_ffn_basic() {
+        // Tiny MoE: 2 experts, top-1, embd=4, ff=3, 1 token
+        let n_embd = 4;
+        let n_ff = 3;
+        let n_expert = 2;
+        let n_expert_used = 1;
+        let n_tokens = 1;
+
+        let input = vec![1.0f32, 0.5, -0.3, 0.8]; // [1, 4]
+
+        // Router: expert 0 should win
+        let router_w = vec![
+            1.0, 0.0, 0.0, 0.0, // expert 0: picks dim 0
+            0.0, 0.0, 0.0, 1.0, // expert 1: picks dim 3
+        ];
+
+        // Gate-up weights: [n_expert, 2*n_ff, n_embd]
+        // Use identity-ish so we can reason about outputs
+        let mut gate_up_w = vec![0.0f32; n_expert * 2 * n_ff * n_embd];
+        // Expert 0: gate row 0 = [1,0,0,0], up row 0 = [0,1,0,0], etc.
+        for e in 0..n_expert {
+            for f in 0..n_ff {
+                gate_up_w[e * 2 * n_ff * n_embd + f * n_embd + f % n_embd] = 1.0;
+                gate_up_w[e * 2 * n_ff * n_embd + (n_ff + f) * n_embd + (f + 1) % n_embd] = 0.5;
+            }
+        }
+
+        // Down weights: [n_expert, n_embd, n_ff]
+        let mut down_w = vec![0.0f32; n_expert * n_embd * n_ff];
+        for e in 0..n_expert {
+            for j in 0..n_embd {
+                down_w[e * n_embd * n_ff + j * n_ff + j % n_ff] = 1.0;
+            }
+        }
+
+        let out = moe_ffn(&input, &router_w, &gate_up_w, &down_w,
+                           n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+        assert_eq!(out.len(), n_tokens * n_embd);
+
+        // Output should be non-zero (the FFN produced something)
+        let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 1e-6, "MoE FFN output is zero: norm = {norm}");
+    }
+
+    #[test]
+    fn moe_ffn_matches_numpy() {
+        // Larger test: 4 experts, top-2, embd=8, ff=6, 3 tokens
+        let n_embd = 8;
+        let n_ff = 6;
+        let n_expert = 4;
+        let n_expert_used = 2;
+        let n_tokens = 3;
+        let rng = |i: usize| (i as f32 * 0.17 + 3.1).sin() * 0.5;
+
+        let input: Vec<f32> = (0..n_tokens * n_embd).map(rng).collect();
+        let router_w: Vec<f32> = (0..n_expert * n_embd).map(rng).collect();
+        let gate_up_w: Vec<f32> = (0..n_expert * 2 * n_ff * n_embd).map(rng).collect();
+        let down_w: Vec<f32> = (0..n_expert * n_embd * n_ff).map(rng).collect();
+
+        let out = moe_ffn(&input, &router_w, &gate_up_w, &down_w,
+                           n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+
+        // Independent numpy-style reference
+        let mut expected = vec![0.0f32; n_tokens * n_embd];
+        for t in 0..n_tokens {
+            let x = &input[t * n_embd..(t + 1) * n_embd];
+            // Router logits
+            let mut logits = vec![0.0f64; n_expert];
+            for e in 0..n_expert {
+                let mut acc = 0.0f64;
+                for i in 0..n_embd {
+                    acc += router_w[e * n_embd + i] as f64 * x[i] as f64;
+                }
+                logits[e] = acc;
+            }
+            // Softmax
+            let max_l = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+            let sum_exp: f64 = exps.iter().sum();
+            let probs: Vec<f64> = exps.iter().map(|&e| e / sum_exp).collect();
+            // Top-2
+            let mut idx: Vec<usize> = (0..n_expert).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            idx.truncate(n_expert_used);
+            let w_sum: f64 = idx.iter().map(|&e| probs[e]).sum();
+            for &e in &idx {
+                let w_e = probs[e] / w_sum;
+                let gw_base = e * 2 * n_ff * n_embd;
+                let mut gate_up = vec![0.0f64; 2 * n_ff];
+                for f in 0..2 * n_ff {
+                    let mut acc = 0.0f64;
+                    for i in 0..n_embd {
+                        acc += gate_up_w[gw_base + f * n_embd + i] as f64 * x[i] as f64;
+                    }
+                    gate_up[f] = acc;
+                }
+                let mut ff_out = vec![0.0f64; n_ff];
+                for f in 0..n_ff {
+                    let g = gate_up[f];
+                    let u = gate_up[n_ff + f];
+                    let s = 1.0 / (1.0 + (-g).exp());
+                    ff_out[f] = g * s * u;
+                }
+                let dw_base = e * n_embd * n_ff;
+                for j in 0..n_embd {
+                    let mut acc = 0.0f64;
+                    for f in 0..n_ff {
+                        acc += down_w[dw_base + j * n_ff + f] as f64 * ff_out[f];
+                    }
+                    expected[t * n_embd + j] += (acc * w_e) as f32;
+                }
+            }
+        }
+
+        for i in 0..out.len() {
+            let denom = expected[i].abs().max(1e-6);
+            let rel = (out[i] - expected[i]).abs() / denom;
+            assert!(rel < 1e-5, "moe_ffn[{i}]: rust={} expected={} rel={rel}", out[i], expected[i]);
+        }
     }
 }
