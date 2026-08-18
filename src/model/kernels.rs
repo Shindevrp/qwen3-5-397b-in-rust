@@ -1028,6 +1028,281 @@ pub fn moe_ffn(
     output
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3c – Full single-layer forward pass (full-attention + dense FFN)
+// ---------------------------------------------------------------------------
+
+/// Full single-layer forward pass for a Qwen3.5 full-attention layer with
+/// dense SwiGLU FFN. All tensors are row-major.
+///
+/// Layout convention (row-major, matching numpy):
+/// - input: `[n_tokens, n_embd]`
+/// - Weight matrices: `[out_features, in_features]` (like PyTorch)
+/// - Q/K/V norms: per-head, `[head_size]`
+///
+/// Operation order:
+/// ```text
+/// normed = rms_norm(input, attn_norm_w)
+/// Q_full = normed @ wq^T           → [n_tokens, 2*n_heads*head_size]
+/// K      = normed @ wk^T           → [n_tokens, n_kv_heads*head_size]
+/// V      = normed @ wv^T           → [n_tokens, n_kv_heads*head_size]
+/// Q, gate = split(Q_full)          → each [n_tokens, n_heads*head_size]
+/// Q = rms_norm_per_head(Q)         per-head norm
+/// K = rms_norm_per_head(K)         per-head norm
+/// Q, K = rope(Q, K, pos)           partial IMRoPE
+/// attn_out = attention(Q, K, V)    GQA with causal mask
+/// attn_out = attn_out * sigmoid(gate)   gated attention
+/// attn_out = attn_out @ wo^T       output projection
+/// residual1 = input + attn_out
+/// normed2 = rms_norm(residual1, post_norm_w)
+/// ffn_out = dense_swiglu_ffn(normed2, ffn_gate, ffn_up, ffn_down)
+/// output = residual1 + ffn_out
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn full_layer_forward(
+    input: &[f32],           // [n_tokens * n_embd]
+    // Attention norm
+    attn_norm_w: &[f32],     // [n_embd]
+    // QKV projections: weights are [out, in] row-major
+    wq: &[f32],              // [2*n_heads*head_size, n_embd]
+    wk: &[f32],              // [n_kv_heads*head_size, n_embd]
+    wv: &[f32],              // [n_kv_heads*head_size, n_embd]
+    wo: &[f32],              // [n_embd, n_heads*head_size]
+    // Q/K norm weights (per-head)
+    q_norm_w: &[f32],        // [head_size]
+    k_norm_w: &[f32],        // [head_size]
+    // RoPE positions
+    pos: [i32; 4],
+    rope_cfg: &RopeConfig,
+    // Post-attention norm
+    post_norm_w: &[f32],     // [n_embd]
+    // Dense FFN weights: SwiGLU (gate, up, down)
+    ffn_gate_w: &[f32],      // [n_ff, n_embd]
+    ffn_up_w: &[f32],        // [n_ff, n_embd]
+    ffn_down_w: &[f32],      // [n_embd, n_ff]
+    // Dimensions
+    n_embd: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_size: usize,
+    n_ff: usize,
+    n_tokens: usize,
+    eps: f32,
+    rope_sections: [i32; 4],
+) -> Vec<f32> {
+    let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
+
+    // 1. Attention norm (per-token)
+    let mut normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&input[t * n_embd..(t + 1) * n_embd], attn_norm_w, eps);
+        normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 2. QKV projections
+    // Q_full = normed @ wq^T → [n_tokens, 2*n_heads*head_size]
+    let q_full = {
+        let n_out = 2 * n_heads * head_size;
+        let mut out = vec![0.0f32; n_tokens * n_out];
+        for t in 0..n_tokens {
+            for o in 0..n_out {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += normed[t * n_embd + i] * wq[o * n_embd + i];
+                }
+                out[t * n_out + o] = acc;
+            }
+        }
+        out
+    };
+
+    // K = normed @ wk^T → [n_tokens, n_kv_heads*head_size]
+    let k_cur = {
+        let n_out = n_kv_heads * head_size;
+        let mut out = vec![0.0f32; n_tokens * n_out];
+        for t in 0..n_tokens {
+            for o in 0..n_out {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += normed[t * n_embd + i] * wk[o * n_embd + i];
+                }
+                out[t * n_out + o] = acc;
+            }
+        }
+        out
+    };
+
+    // V = normed @ wv^T → [n_tokens, n_kv_heads*head_size]
+    let v_cur = {
+        let n_out = n_kv_heads * head_size;
+        let mut out = vec![0.0f32; n_tokens * n_out];
+        for t in 0..n_tokens {
+            for o in 0..n_out {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += normed[t * n_embd + i] * wv[o * n_embd + i];
+                }
+                out[t * n_out + o] = acc;
+            }
+        }
+        out
+    };
+
+    // 3. Split Q_full into Q and gate
+    let q_size = n_heads * head_size;
+    let mut q_flat = vec![0.0f32; n_tokens * q_size];
+    let mut gate_flat = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            q_flat[t * q_size + i] = q_full[t * (2 * q_size) + i];
+            gate_flat[t * q_size + i] = q_full[t * (2 * q_size) + q_size + i];
+        }
+    }
+
+    // 4. QK norm (per-head)
+    let mut q_normed = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(&q_flat[t * q_size..(t + 1) * q_size], q_norm_w, head_size, eps);
+        q_normed[t * q_size..(t + 1) * q_size].copy_from_slice(&h_out);
+    }
+    let mut k_normed = vec![0.0f32; n_tokens * n_kv_heads * head_size];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(&k_cur[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size], k_norm_w, head_size, eps);
+        k_normed[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size].copy_from_slice(&h_out);
+    }
+
+    // 5. RoPE on Q and K
+    let mut q_rope = vec![0.0f32; n_tokens * q_size];
+    let mut k_rope = vec![0.0f32; n_tokens * n_kv_heads * head_size];
+    for t in 0..n_tokens {
+        // Q: [n_heads, head_size] → apply rope per head
+        for h in 0..n_heads {
+            let base = t * q_size + h * head_size;
+            let slice = &q_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            q_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+        // K: [n_kv_heads, head_size] → apply rope per head
+        for h in 0..n_kv_heads {
+            let base = t * n_kv_heads * head_size + h * head_size;
+            let slice = &k_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            k_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+    }
+
+    // 6. GQA attention
+    let scale = 1.0f32 / (head_size as f32).sqrt();
+    let attn_out = attention_forward(
+        &q_rope, &k_rope, &v_cur,
+        n_heads, n_kv_heads, head_size,
+        n_tokens, n_tokens, scale, true,
+    );
+
+    // 7. Gate sigmoid + multiply
+    let mut gated = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            let g = gate_flat[t * q_size + i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            gated[t * q_size + i] = attn_out[t * q_size + i] * s;
+        }
+    }
+
+    // 8. Output projection: gated @ wo^T → [n_tokens, n_embd]
+    let attn_residual = {
+        let mut out = vec![0.0f32; n_tokens * n_embd];
+        for t in 0..n_tokens {
+            for j in 0..n_embd {
+                let mut acc = 0.0f32;
+                for i in 0..q_size {
+                    acc += gated[t * q_size + i] * wo[j * q_size + i];
+                }
+                out[t * n_embd + j] = acc;
+            }
+        }
+        out
+    };
+
+    // 9. Residual connection
+    let mut residual1 = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        residual1[i] = input[i] + attn_residual[i];
+    }
+
+    // 10. Post-attention norm (per-token)
+    let mut post_normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&residual1[t * n_embd..(t + 1) * n_embd], post_norm_w, eps);
+        post_normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 11. Dense SwiGLU FFN: gate, up → silu(gate)*up → down
+    // gate = post_normed @ ffn_gate_w^T → [n_tokens, n_ff]
+    let ffn_gate = {
+        let mut out = vec![0.0f32; n_tokens * n_ff];
+        for t in 0..n_tokens {
+            for f in 0..n_ff {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += post_normed[t * n_embd + i] * ffn_gate_w[f * n_embd + i];
+                }
+                out[t * n_ff + f] = acc;
+            }
+        }
+        out
+    };
+    // up = post_normed @ ffn_up_w^T → [n_tokens, n_ff]
+    let ffn_up = {
+        let mut out = vec![0.0f32; n_tokens * n_ff];
+        for t in 0..n_tokens {
+            for f in 0..n_ff {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += post_normed[t * n_embd + i] * ffn_up_w[f * n_embd + i];
+                }
+                out[t * n_ff + f] = acc;
+            }
+        }
+        out
+    };
+    // SwiGLU
+    let ffn_act = {
+        let mut out = vec![0.0f32; n_tokens * n_ff];
+        for i in 0..n_tokens * n_ff {
+            let g = ffn_gate[i];
+            let u = ffn_up[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            out[i] = g * s * u;
+        }
+        out
+    };
+    // down = ffn_act @ ffn_down_w^T → [n_tokens, n_embd]
+    let ffn_out = {
+        let mut out = vec![0.0f32; n_tokens * n_embd];
+        for t in 0..n_tokens {
+            for j in 0..n_embd {
+                let mut acc = 0.0f32;
+                for f in 0..n_ff {
+                    acc += ffn_act[t * n_ff + f] * ffn_down_w[j * n_ff + f];
+                }
+                out[t * n_embd + j] = acc;
+            }
+        }
+        out
+    };
+
+    // 12. Final residual
+    let mut output = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        output[i] = residual1[i] + ffn_out[i];
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

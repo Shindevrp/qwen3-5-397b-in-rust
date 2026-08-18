@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, full_layer_forward, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -199,6 +199,47 @@ fn main() {
                 let out = moe_ffn(&inp, &rw, &guw, &dw, n_embd, n_ff, n_expert, n_expert_used, n_tokens);
                 assert_eq!(out.len(), n_tokens * n_embd);
                 write_txt(&dir.join(format!("rust_moe_{id}.txt")), &out);
+            }
+            "full_layer" => {
+                let id = f[1];
+                let n_embd: usize = f[2].parse().unwrap();
+                let n_heads: usize = f[3].parse().unwrap();
+                let n_kv_heads: usize = f[4].parse().unwrap();
+                let head_size: usize = f[5].parse().unwrap();
+                let n_ff: usize = f[6].parse().unwrap();
+                let n_tokens: usize = f[7].parse().unwrap();
+                let sections: [i32; 4] = {
+                    let parts: Vec<i32> = f[8].split(',').map(|s| s.parse().unwrap()).collect();
+                    [parts[0], parts[1], parts[2], parts[3]]
+                };
+                let inp = read_f32_file(&dir.join(format!("full_layer_{id}_inp.bin")), n_tokens * n_embd);
+                let anw = read_f32_file(&dir.join(format!("full_layer_{id}_anw.bin")), n_embd);
+                let wq = read_f32_file(&dir.join(format!("full_layer_{id}_wq.bin")), 2 * n_heads * head_size * n_embd);
+                let wk = read_f32_file(&dir.join(format!("full_layer_{id}_wk.bin")), n_kv_heads * head_size * n_embd);
+                let wv = read_f32_file(&dir.join(format!("full_layer_{id}_wv.bin")), n_kv_heads * head_size * n_embd);
+                let wo = read_f32_file(&dir.join(format!("full_layer_{id}_wo.bin")), n_embd * n_heads * head_size);
+                let qnw = read_f32_file(&dir.join(format!("full_layer_{id}_qnw.bin")), head_size);
+                let knw = read_f32_file(&dir.join(format!("full_layer_{id}_knw.bin")), head_size);
+                let pnw = read_f32_file(&dir.join(format!("full_layer_{id}_pnw.bin")), n_embd);
+                let fgw = read_f32_file(&dir.join(format!("full_layer_{id}_fgw.bin")), n_ff * n_embd);
+                let fuw = read_f32_file(&dir.join(format!("full_layer_{id}_fuw.bin")), n_ff * n_embd);
+                let fdw = read_f32_file(&dir.join(format!("full_layer_{id}_fdw.bin")), n_embd * n_ff);
+                let rope_cfg = RopeConfig {
+                    freq_base: 1e7,
+                    freq_scale: 1.0,
+                    ext_factor: 0.0,
+                    attn_factor: 1.0,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                };
+                let out = full_layer_forward(
+                    &inp, &anw, &wq, &wk, &wv, &wo, &qnw, &knw,
+                    [5, 0, 0, 0], &rope_cfg, &pnw, &fgw, &fuw, &fdw,
+                    n_embd, n_heads, n_kv_heads, head_size, n_ff, n_tokens,
+                    1e-6, sections,
+                );
+                assert_eq!(out.len(), n_tokens * n_embd);
+                write_txt(&dir.join(format!("rust_full_layer_{id}.txt")), &out);
             }
             other => panic!("spec line {}: unknown directive {other}", lineno + 1),
         }
