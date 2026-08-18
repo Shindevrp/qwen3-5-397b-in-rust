@@ -1303,6 +1303,119 @@ pub fn full_layer_forward(
     output
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3d – End-to-end forward pass (embed → layers → LM head → argmax)
+// ---------------------------------------------------------------------------
+
+/// Token embedding lookup: `embeddings[token_id]`.
+/// `embd_weight` is `[n_vocab, n_embd]` row-major.
+pub fn embed_tokens(token_id: u32, embd_weight: &[f32], n_embd: usize) -> Vec<f32> {
+    let start = token_id as usize * n_embd;
+    embd_weight[start..start + n_embd].to_vec()
+}
+
+/// Final layer norm + LM head projection + argmax.
+///
+/// `hidden` is `[n_embd]`, `output_norm_w` is `[n_embd]`,
+/// `output_weight` is `[n_vocab, n_embd]` row-major.
+/// Returns the token ID with the highest logit.
+pub fn lm_head_argmax(
+    hidden: &[f32],
+    output_norm_w: &[f32],
+    output_weight: &[f32],
+    n_embd: usize,
+    n_vocab: usize,
+    eps: f32,
+) -> u32 {
+    let normed = rms_norm(hidden, output_norm_w, eps);
+    let mut best_logit = f32::NEG_INFINITY;
+    let mut best_id = 0u32;
+    for v in 0..n_vocab {
+        let mut acc = 0.0f32;
+        for i in 0..n_embd {
+            acc += normed[i] * output_weight[v * n_embd + i];
+        }
+        if acc > best_logit {
+            best_logit = acc;
+            best_id = v as u32;
+        }
+    }
+    best_id
+}
+
+/// All weights needed for a single full-attention layer.
+pub struct FullAttnLayerWeights<'a> {
+    pub attn_norm_w: &'a [f32],
+    pub wq: &'a [f32],
+    pub wk: &'a [f32],
+    pub wv: &'a [f32],
+    pub wo: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub post_norm_w: &'a [f32],
+    pub ffn_gate_w: &'a [f32],
+    pub ffn_up_w: &'a [f32],
+    pub ffn_down_w: &'a [f32],
+}
+
+/// End-to-end forward pass for a single token through a stack of
+/// full-attention layers only (delta-net layers are skipped as pass-through).
+///
+/// Returns the full hidden state after all layers (before final LM head).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_pass_full_attn(
+    token_id: u32,
+    layers: &[FullAttnLayerWeights<'_>],
+    embd_weight: &[f32],
+    output_norm_w: &[f32],
+    output_weight: &[f32],
+    n_embd: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_size: usize,
+    n_ff: usize,
+    n_vocab: usize,
+    eps: f32,
+    rope_cfg: &RopeConfig,
+    rope_sections: [i32; 4],
+) -> (Vec<f32>, u32) {
+    // Embed
+    let mut hidden = embed_tokens(token_id, embd_weight, n_embd);
+
+    // Process through layers
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let pos = [layer_idx as i32, 0, 0, 0]; // simplified: position = layer_idx
+        hidden = full_layer_forward(
+            &hidden,
+            layer.attn_norm_w,
+            layer.wq,
+            layer.wk,
+            layer.wv,
+            layer.wo,
+            layer.q_norm_w,
+            layer.k_norm_w,
+            pos,
+            rope_cfg,
+            layer.post_norm_w,
+            layer.ffn_gate_w,
+            layer.ffn_up_w,
+            layer.ffn_down_w,
+            n_embd,
+            n_heads,
+            n_kv_heads,
+            head_size,
+            n_ff,
+            1, // n_tokens = 1 (single token)
+            eps,
+            rope_sections,
+        );
+    }
+
+    // LM head
+    let next_token = lm_head_argmax(&hidden, output_norm_w, output_weight, n_embd, n_vocab, eps);
+    (hidden, next_token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2139,5 +2252,98 @@ mod tests {
             let rel = (out[i] - expected[i]).abs() / denom;
             assert!(rel < 1e-5, "moe_ffn[{i}]: rust={} expected={} rel={rel}", out[i], expected[i]);
         }
+    }
+
+    #[test]
+    fn embed_and_lm_head() {
+        let n_embd = 8;
+        let n_vocab = 16;
+        let eps = 1e-6;
+
+        // Embedding weight: identity-ish
+        let embd: Vec<f32> = (0..n_vocab * n_embd).map(|i| (i as f32) * 0.01).collect();
+
+        // Token 3 → rows 3*8..4*8
+        let tok = embed_tokens(3, &embd, n_embd);
+        assert_eq!(tok.len(), n_embd);
+        assert!((tok[0] - 0.24).abs() < 1e-6);
+        assert!((tok[7] - 0.31).abs() < 1e-6);
+
+        // LM head: norm then dot, pick argmax
+        let norm_w = vec![1.0f32; n_embd];
+        // Weight tying: output_weight = embd_weight
+        let next = lm_head_argmax(&tok, &norm_w, &embd, n_embd, n_vocab, eps);
+        assert!((next as usize) < n_vocab, "next_token {next} out of vocab range");
+        // With weight tying, the dot product is proportional to ||tok||^2 for the
+        // matching row and cross-terms for others.  Just verify it returns a valid id.
+        // Token 15's embedding row has the largest values, so it wins the argmax.
+        assert_eq!(next, 15);
+    }
+
+    #[test]
+    fn forward_pass_smoke() {
+        // Tiny model: 2 layers, embd=32, heads=2, kv=2, head_size=32, ff=48, vocab=32
+        let n_embd = 32;
+        let n_heads = 2;
+        let n_kv_heads = 2;
+        let head_size = 32;
+        let n_ff = 48;
+        let n_vocab = 32;
+        let eps = 1e-6;
+        let rope_cfg = RopeConfig {
+            freq_base: 10000.0,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        };
+        let rope_sections = [8, 8, 0, 0];
+
+        let rng = |i: usize| (i as f32 * 0.13 + 1.7).sin() * 0.3;
+
+        // Weight tying: embd = output
+        let embd: Vec<f32> = (0..n_vocab * n_embd).map(rng).collect();
+        let norm_w = vec![1.0f32; n_embd];
+
+        // Build 2 full-attention layers — must own all weight vecs
+        let wq0: Vec<f32> = (0..2 * n_heads * head_size * n_embd).map(rng).collect();
+        let wk0: Vec<f32> = (0..n_kv_heads * head_size * n_embd).map(rng).collect();
+        let wv0: Vec<f32> = (0..n_kv_heads * head_size * n_embd).map(rng).collect();
+        let wo0: Vec<f32> = (0..n_embd * n_heads * head_size).map(rng).collect();
+        let fg0: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
+        let fu0: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
+        let fd0: Vec<f32> = (0..n_embd * n_ff).map(rng).collect();
+        let wq1: Vec<f32> = (0..2 * n_heads * head_size * n_embd).map(rng).collect();
+        let wk1: Vec<f32> = (0..n_kv_heads * head_size * n_embd).map(rng).collect();
+        let wv1: Vec<f32> = (0..n_kv_heads * head_size * n_embd).map(rng).collect();
+        let wo1: Vec<f32> = (0..n_embd * n_heads * head_size).map(rng).collect();
+        let fg1: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
+        let fu1: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
+        let fd1: Vec<f32> = (0..n_embd * n_ff).map(rng).collect();
+
+        let layer_refs = vec![
+            FullAttnLayerWeights {
+                attn_norm_w: &norm_w, wq: &wq0, wk: &wk0, wv: &wv0, wo: &wo0,
+                q_norm_w: &norm_w, k_norm_w: &norm_w,
+                post_norm_w: &norm_w, ffn_gate_w: &fg0, ffn_up_w: &fu0, ffn_down_w: &fd0,
+            },
+            FullAttnLayerWeights {
+                attn_norm_w: &norm_w, wq: &wq1, wk: &wk1, wv: &wv1, wo: &wo1,
+                q_norm_w: &norm_w, k_norm_w: &norm_w,
+                post_norm_w: &norm_w, ffn_gate_w: &fg1, ffn_up_w: &fu1, ffn_down_w: &fd1,
+            },
+        ];
+
+        let (hidden, next_token) = forward_pass_full_attn(
+            5, // token id
+            &layer_refs,
+            &embd, &norm_w, &embd, // weight tying
+            n_embd, n_heads, n_kv_heads, head_size, n_ff, n_vocab,
+            eps, &rope_cfg, rope_sections,
+        );
+
+        assert_eq!(hidden.len(), n_embd);
+        assert!((next_token as usize) < n_vocab, "next_token {next_token} out of vocab range");
     }
 }
