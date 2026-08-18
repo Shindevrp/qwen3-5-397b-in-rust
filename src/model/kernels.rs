@@ -778,6 +778,146 @@ pub fn rope_multi_imrope(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3a – small utility kernels for MoE FFN / full-layer forward pass
+// ---------------------------------------------------------------------------
+
+/// SwiGLU activation: `out[i] = silu(gate[i]) * up[i]`.
+///
+/// Port of `ggml_swiglu_split` for the common case where gate and up are
+/// already separate tensors (Qwen3.5 MoE path).
+#[inline]
+pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len(), "swiglu: gate and up must have same length");
+    gate.iter().zip(up.iter()).map(|(&g, &u)| {
+        let s = 1.0 / (1.0 + (-g).exp());
+        g * s * u
+    }).collect()
+}
+
+/// Per-head RMS norm.
+///
+/// Normalizes each contiguous `head_size` chunk of `x` independently, applying
+/// the weight `w` (also `head_size` long, tiled for every head).
+///
+/// Port of applying `LLM_NORM_RMS` to a `[head_size, n_heads]` tensor.
+pub fn rms_norm_per_head(x: &[f32], w: &[f32], head_size: usize, eps: f32) -> Vec<f32> {
+    assert!(x.len().is_multiple_of(head_size), "rms_norm_per_head: x.len must be multiple of head_size");
+    assert_eq!(w.len(), head_size, "rms_norm_per_head: w must be head_size long");
+    let n_heads = x.len() / head_size;
+    let mut out = vec![0.0f32; x.len()];
+    for h in 0..n_heads {
+        let base = h * head_size;
+        let mut sum = 0.0f64;
+        for i in 0..head_size {
+            let v = x[base + i];
+            sum += (v * v) as f64;
+        }
+        let mean = (sum / head_size as f64) as f32;
+        let scale = 1.0f32 / (mean + eps).sqrt();
+        for i in 0..head_size {
+            out[base + i] = x[base + i] * scale * w[i];
+        }
+    }
+    out
+}
+
+/// Softmax + top-k selection + renormalize.
+///
+/// Given `logits` of length `n_experts`, computes softmax, selects the `k`
+/// largest experts, and renormalizes the selected weights to sum to 1.
+///
+/// Returns `(selected_weights, selected_indices)` where both are length `k`.
+///
+/// Port of `ggml_soft_max` → `ggml_argsort_top_k` → weight normalization.
+pub fn softmax_topk(logits: &[f32], k: usize) -> (Vec<f32>, Vec<usize>) {
+    let n = logits.len();
+    assert!(k <= n, "softmax_topk: k must be <= n_experts");
+
+    // Softmax in f64 for numerical stability
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps_f64: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
+    let sum_exp: f64 = exps_f64.iter().sum();
+    let probs: Vec<f32> = exps_f64.iter().map(|&e| (e / sum_exp) as f32).collect();
+
+    // Partial sort to find top-k indices, then sort within top-k (descending)
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.select_nth_unstable_by(k, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.truncate(k);
+    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+
+    let mut weights = Vec::with_capacity(k);
+    let mut sum_w = 0.0f64;
+    for &i in &idx {
+        sum_w += probs[i] as f64;
+    }
+    for &i in &idx {
+        weights.push((probs[i] as f64 / sum_w) as f32);
+    }
+
+    (weights, idx)
+}
+
+/// Causal 1D convolution over the channel dimension with SiLU activation.
+///
+/// `input` has shape `[channels, seq_len]` (row-major: `input[c * seq_len + t]`).
+/// `kernel` has shape `[channels, kernel_size]` (same layout as ggml `ssm_conv1d`).
+/// `state_in` has shape `[channels, kernel_size - 1]` — the causal history.
+///
+/// Returns `(output, state_out)` where:
+/// - `output` has shape `[channels, seq_len]` with SiLU applied
+/// - `state_out` has shape `[channels, kernel_size - 1]` — updated causal state
+///
+/// Port of `ggml_ssm_conv` + `ggml_silu` for the Qwen3.5 delta-net path.
+/// The kernel slides over the concatenated `[state | input]` sequence:
+///   t=0: dot(kernel, [state[0], state[1], ..., input[0]])
+///   t=1: dot(kernel, [state[1], ..., input[0], input[1]])
+///   ...
+pub fn conv1d_silu(
+    input: &[f32],
+    kernel: &[f32],
+    state_in: &[f32],
+    channels: usize,
+    seq_len: usize,
+    kernel_size: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let pad = kernel_size - 1;
+    assert_eq!(input.len(), channels * seq_len);
+    assert_eq!(kernel.len(), channels * kernel_size);
+    assert_eq!(state_in.len(), channels * pad);
+
+    let mut output = vec![0.0f32; channels * seq_len];
+    let mut state_out = vec![0.0f32; channels * pad];
+
+    for c in 0..channels {
+        for t in 0..seq_len {
+            let mut acc = 0.0f32;
+            // For position t in the output, the kernel window covers
+            // the pad state elements + the first (t+1) input elements.
+            // window[k] = state_in[c*pad + t+k - (kernel_size-1)] for k where in range,
+            //              or input[c*seq_len + t+k - (kernel_size-1)] otherwise.
+            for k in 0..kernel_size {
+                let src_idx = t as isize + k as isize - pad as isize;
+                let val = if src_idx < 0 {
+                    state_in[c * pad + (src_idx + pad as isize) as usize]
+                } else {
+                    input[c * seq_len + src_idx as usize]
+                };
+                acc += val * kernel[c * kernel_size + k];
+            }
+            // Apply SiLU
+            let s = 1.0 / (1.0 + (-acc).exp());
+            output[c * seq_len + t] = acc * s;
+        }
+        // New state: last `pad` elements of input
+        for s in 0..pad {
+            state_out[c * pad + s] = input[c * seq_len + seq_len - pad + s];
+        }
+    }
+
+    (output, state_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,5 +1469,168 @@ mod tests {
             assert!((out[ic] - c).abs() < 1e-5, "ic {ic}: got {} expected {}", out[ic], c);
             assert!((out[ic + 32] - s).abs() < 1e-5, "ic {ic}: got {} expected {}", out[ic + 32], s);
         }
+    }
+
+    // ---- Phase 3a kernel tests -----------------------------------------------
+
+    #[test]
+    fn swiglu_known_values() {
+        // silu(1.0) = 1 / (1 + e^-1) ≈ 0.7310585786
+        // silu(0.0) = 0.5
+        // silu(-1.0) = 1 / (1 + e^1) ≈ 0.2689414214
+        let gate = [1.0f32, 0.0, -1.0];
+        let up = [2.0f32, 3.0, 4.0];
+        let out = swiglu(&gate, &up);
+        // silu(g) = g * sigmoid(g)
+        let s1 = 1.0f32 * 1.0 / (1.0 + (-1.0f32).exp());  // silu(1)
+        let s0 = 0.0f32 * 0.5f32;                           // silu(0) = 0
+        let sm1 = -1.0f32 / (1.0 + (1.0f32).exp()); // silu(-1)
+        assert!((out[0] - s1 * 2.0).abs() < 1e-6);
+        assert!((out[1] - s0 * 3.0).abs() < 1e-6);
+        assert!((out[2] - sm1 * 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_matches_numpy() {
+        let rng_swi = |i: usize| (i as f32 * 0.15 + 1.7).sin() * 2.0 - 1.0;
+        let gate: Vec<f32> = (0..64).map(rng_swi).collect();
+        let up: Vec<f32> = (0..64).map(|i| (i as f32 * 0.23 - 0.5).cos()).collect();
+        let out = swiglu(&gate, &up);
+        // Cross-check against manual numpy-style computation
+        for i in 0..64 {
+            let s = 1.0f32 / (1.0 + (-gate[i]).exp());
+            let expect = gate[i] * s * up[i];
+            assert!((out[i] - expect).abs() < 1e-6, "swiglu[{i}]: got {} expected {}", out[i], expect);
+        }
+    }
+
+    #[test]
+    fn rms_norm_per_head_known() {
+        // 2 heads, head_size=4
+        let x = [1.0f32, -2.0, 3.0, -4.0,   2.0, 0.0, -1.0, 3.0];
+        let w = [1.0f32, 1.0, 1.0, 1.0];
+        let out = rms_norm_per_head(&x, &w, 4, 1e-6);
+        // Head 0: sum_sq = 1+4+9+16=30, mean=7.5, scale=1/sqrt(7.5+eps)
+        let s0 = 1.0f32 / (7.5f32 + 1e-6f32).sqrt();
+        assert!((out[0] - 1.0 * s0).abs() < 1e-5);
+        assert!((out[1] + 2.0 * s0).abs() < 1e-5);
+        // Head 1: sum_sq = 4+0+1+9=14, mean=3.5, scale=1/sqrt(3.5+eps)
+        let s1 = 1.0f32 / (3.5f32 + 1e-6f32).sqrt();
+        assert!((out[4] - 2.0 * s1).abs() < 1e-5);
+        assert!((out[6] + 1.0 * s1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rms_norm_per_head_weighted() {
+        let x = [3.0f32, -4.0, 5.0, -6.0];
+        let w = [2.0f32, 0.5, 1.0, 3.0];
+        let out = rms_norm_per_head(&x, &w, 4, 1e-6);
+        // sum_sq = 9+16+25+36=86, mean=21.5, scale=1/sqrt(21.5+eps)
+        let s = 1.0f32 / (21.5f32 + 1e-6f32).sqrt();
+        assert!((out[0] - 3.0 * s * 2.0).abs() < 1e-5);
+        assert!((out[1] + 4.0 * s * 0.5).abs() < 1e-5);
+        assert!((out[2] - 5.0 * s * 1.0).abs() < 1e-5);
+        assert!((out[3] + 6.0 * s * 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softmax_topk_basic() {
+        let logits = [1.0f32, 2.0, 0.5, 3.0, -1.0];
+        let (weights, indices) = softmax_topk(&logits, 2);
+        // Top-2 should be indices 3 (3.0) and 1 (2.0)
+        assert_eq!(indices[0], 3);
+        assert_eq!(indices[1], 1);
+        // Weights should sum to 1
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "weights sum: {sum}");
+        // They should be proportional to softmax probs
+        let max_l = 3.0f32;
+        let e3 = (3.0 - max_l).exp();
+        let e1 = (2.0 - max_l).exp();
+        let total: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+        let expected_w0 = e3 / total;
+        let expected_w1 = e1 / total;
+        // After renormalization within top-2:
+        let norm = expected_w0 + expected_w1;
+        assert!((weights[0] - expected_w0 / norm).abs() < 1e-5);
+        assert!((weights[1] - expected_w1 / norm).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softmax_topk_single() {
+        let logits = [0.1f32, -0.5, 0.3, 0.2];
+        let (weights, indices) = softmax_topk(&logits, 1);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], 2); // highest logit
+        assert!((weights[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softmax_topk_all_equal() {
+        let logits = [1.0f32, 1.0, 1.0, 1.0];
+        let (weights, indices) = softmax_topk(&logits, 2);
+        assert_eq!(indices.len(), 2);
+        // All equal -> softmax gives 0.25 each, renormalized top-2 -> 0.5 each
+        assert!((weights[0] - 0.5).abs() < 1e-5);
+        assert!((weights[1] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn conv1d_silu_basic() {
+        // 2 channels, kernel_size=3, seq_len=4
+        let channels = 2;
+        let kernel_size = 3;
+        let seq_len = 4;
+        let input: Vec<f32> = (0..channels * seq_len).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        // input: ch0=[0.1, 0.2, 0.3, 0.4], ch1=[0.5, 0.6, 0.7, 0.8]
+        let kernel: Vec<f32> = (0..channels * kernel_size).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        // kernel: ch0=[0.05, 0.10, 0.15], ch1=[0.20, 0.25, 0.30]
+        let state_in = vec![0.0f32; channels * (kernel_size - 1)];
+
+        let (out, state_out) = conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
+
+        // ch0, t=0: acc = 0*0.05 + 0*0.10 + 0.1*0.15 = 0.015, silu(0.015) ≈ 0.015 * 0.50375
+        let acc00 = 0.1f32 * 0.15f32;
+        let expected00 = acc00 / (1.0f32 + (-acc00).exp());
+        assert!((out[0] - expected00).abs() < 1e-5, "out[0]: got {} expected {}", out[0], expected00);
+
+        // ch0, t=1: acc = 0*0.05 + 0.1*0.10 + 0.2*0.15 = 0.04
+        let acc01 = 0.1f32 * 0.10f32 + 0.2f32 * 0.15f32;
+        let expected01 = acc01 / (1.0f32 + (-acc01).exp());
+        assert!((out[1] - expected01).abs() < 1e-5, "out[1]: got {} expected {}", out[1], expected01);
+
+        // State update: ch0 state = [input[2], input[3]] = [0.3, 0.4]
+        assert!((state_out[0] - 0.3).abs() < 1e-6);
+        assert!((state_out[1] - 0.4).abs() < 1e-6);
+        // ch1 state = [input[6], input[7]] = [0.7, 0.8]
+        assert!((state_out[2] - 0.7).abs() < 1e-6);
+        assert!((state_out[3] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn conv1d_silu_state_carry() {
+        // Verify that state is properly used in the convolution
+        let channels = 1;
+        let kernel_size = 3;
+        let seq_len = 2;
+        let input = [0.1f32, 0.2];
+        let kernel = [1.0f32, 1.0, 1.0]; // simple sum kernel
+        let state_in = [0.3f32, 0.4]; // causal history
+
+        let (out, state_out) = conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
+
+        // t=0: acc = 0.3*1 + 0.4*1 + 0.1*1 = 0.8, silu(0.8) = 0.8 / (1 + e^-0.8)
+        let acc0 = 0.8f32;
+        let expected0 = acc0 / (1.0 + (-acc0).exp());
+        assert!((out[0] - expected0).abs() < 1e-5);
+
+        // t=1: acc = 0.4*1 + 0.1*1 + 0.2*1 = 0.7, silu(0.7)
+        let acc1 = 0.7f32;
+        let expected1 = acc1 / (1.0 + (-acc1).exp());
+        assert!((out[1] - expected1).abs() < 1e-5);
+
+        // New state = [input[0], input[1]] = [0.1, 0.2]
+        assert!((state_out[0] - 0.1).abs() < 1e-6);
+        assert!((state_out[1] - 0.2).abs() < 1e-6);
     }
 }

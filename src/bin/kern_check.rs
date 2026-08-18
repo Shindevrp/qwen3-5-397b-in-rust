@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, delta_net_autoregressive, gemm, gemv, rms_norm, rope_multi_imrope, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, gemm, gemv, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -136,6 +136,54 @@ fn main() {
                 let out = rope_multi_imrope(&x, pos, n_dims, sections, n_ctx_orig, &cfg);
                 assert_eq!(out.len(), ne0);
                 write_txt(&dir.join(format!("rust_rope_{id}.txt")), &out);
+            }
+            "swiglu" => {
+                let id = f[1];
+                let n: usize = f[2].parse().unwrap();
+                let gate = read_f32_file(&dir.join(format!("swiglu_{id}_gate.bin")), n);
+                let up = read_f32_file(&dir.join(format!("swiglu_{id}_up.bin")), n);
+                let out = swiglu(&gate, &up);
+                assert_eq!(out.len(), n);
+                write_txt(&dir.join(format!("rust_swiglu_{id}.txt")), &out);
+            }
+            "rph" => {
+                let id = f[1];
+                let n: usize = f[2].parse().unwrap();
+                let head_size: usize = f[3].parse().unwrap();
+                let x = read_f32_file(&dir.join(format!("rph_{id}.bin")), n);
+                let w = read_f32_file(&dir.join(format!("rph_{id}_w.bin")), head_size);
+                let out = rms_norm_per_head(&x, &w, head_size, 1e-6);
+                assert_eq!(out.len(), n);
+                write_txt(&dir.join(format!("rust_rph_{id}.txt")), &out);
+            }
+            "topk" => {
+                let id = f[1];
+                let n_experts: usize = f[2].parse().unwrap();
+                let k: usize = f[3].parse().unwrap();
+                let logits = read_f32_file(&dir.join(format!("topk_{id}.bin")), n_experts);
+                let (weights, indices) = softmax_topk(&logits, k);
+                assert_eq!(weights.len(), k);
+                assert_eq!(indices.len(), k);
+                // Save weights as txt
+                write_txt(&dir.join(format!("rust_topk_{id}_w.txt")), &weights);
+                // Save indices as f32 txt
+                let idx_f32: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
+                write_txt(&dir.join(format!("rust_topk_{id}_i.txt")), &idx_f32);
+            }
+            "conv" => {
+                let id = f[1];
+                let channels: usize = f[2].parse().unwrap();
+                let kernel_size: usize = f[3].parse().unwrap();
+                let seq_len: usize = f[4].parse().unwrap();
+                let inp = read_f32_file(&dir.join(format!("conv_{id}_inp.bin")), channels * seq_len);
+                let krn = read_f32_file(&dir.join(format!("conv_{id}_krn.bin")), channels * kernel_size);
+                let pad = kernel_size - 1;
+                let st = read_f32_file(&dir.join(format!("conv_{id}_st.bin")), channels * pad);
+                let (out, state_out) = conv1d_silu(&inp, &krn, &st, channels, seq_len, kernel_size);
+                assert_eq!(out.len(), channels * seq_len);
+                assert_eq!(state_out.len(), channels * pad);
+                write_txt(&dir.join(format!("rust_conv_{id}_out.txt")), &out);
+                write_txt(&dir.join(format!("rust_conv_{id}_st.txt")), &state_out);
             }
             other => panic!("spec line {}: unknown directive {other}", lineno + 1),
         }
