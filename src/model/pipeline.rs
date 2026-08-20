@@ -651,10 +651,16 @@ impl GenerationState {
         let mut delta_net_count = 0;
         for i in 0..cfg.block_count as usize {
             if cfg.is_recurrent(i) {
-                let layer = &model.delta_net_layers[delta_net_count];
+                let _layer = &model.delta_net_layers[delta_net_count];
                 delta_net_count += 1;
-                conv_states.push(vec![0.0f32; layer.conv_kernel.n_elements]);
-                ssm_states.push(vec![0.0f32; layer.ssm_out.n_elements / n_embd(cfg)]);
+                // conv state: channels × (kernel_size - 1)
+                let kernel_size = cfg.ssm_conv_kernel as usize;
+                let channels = cfg.conv_dim as usize;
+                conv_states.push(vec![0.0f32; channels * kernel_size.saturating_sub(1)]);
+                // ssm state: [s_v * s_v * n_heads_v]
+                let s_v = cfg.head_v_dim as usize;
+                let n_heads_v = cfg.ssm_time_step_rank as usize;
+                ssm_states.push(vec![0.0f32; s_v * s_v * n_heads_v]);
             } else {
                 kv_caches.push(LayerKvCache::new(n_ctx, n_kv_heads, head_size));
             }
@@ -662,10 +668,6 @@ impl GenerationState {
 
         Self { kv_caches, conv_states, ssm_states, pos: 0 }
     }
-}
-
-fn n_embd(cfg: &crate::model::config::Qwen3_5Config) -> usize {
-    cfg.embedding_length as usize
 }
 
 /// Prefill: process all prompt tokens at once, populating the KV cache

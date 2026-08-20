@@ -3,7 +3,6 @@ pub mod header;
 pub mod metadata;
 pub mod tensor;
 pub mod value;
-#[cfg(test)]
 pub mod writer;
 
 pub use error::GgufError;
