@@ -11,6 +11,7 @@ use crate::model::kernels::{
     lm_head_argmax, lm_head_logits,
 };
 use crate::model::loader::ModelLoader;
+use crate::model::quant::RawTensor;
 
 /// GGUF tensor name helpers per layer.
 struct TensorNames {
@@ -78,71 +79,77 @@ impl TensorNames {
 // ---------------------------------------------------------------------------
 
 pub struct LoadedMoeFfn {
-    pub router_w: Vec<f32>,      // [n_expert, n_embd]
-    pub gate_up_w: Vec<f32>,     // [n_expert, 2*n_ff, n_embd] (fused gate+up)
-    pub down_w: Vec<f32>,        // [n_expert, n_embd, n_ff]
+    pub router_w: RawTensor,      // [n_expert, n_embd]
+    pub gate_up_w: RawTensor,     // [n_expert, 2*n_ff, n_embd] (fused gate+up)
+    pub down_w: RawTensor,        // [n_expert, n_embd, n_ff]
     // Shared expert (shexp)
-    pub shexp_gate_w: Vec<f32>,     // [n_ff_shexp, n_embd]
-    pub shexp_up_w: Vec<f32>,       // [n_ff_shexp, n_embd]
-    pub shexp_down_w: Vec<f32>,     // [n_embd, n_ff_shexp]
-    pub shexp_gate_inp_w: Vec<f32>, // [n_embd]
+    pub shexp_gate_w: RawTensor,     // [n_ff_shexp, n_embd]
+    pub shexp_up_w: RawTensor,       // [n_ff_shexp, n_embd]
+    pub shexp_down_w: RawTensor,     // [n_embd, n_ff_shexp]
+    pub shexp_gate_inp_w: RawTensor, // [n_embd]
     pub n_ff_shexp: usize,
 }
 
 // ---------------------------------------------------------------------------
-// Full-attention layer weights (loaded eagerly)
+// Full-attention layer weights (loaded as raw quantized bytes)
 // ---------------------------------------------------------------------------
 
 pub struct LoadedFullAttnLayer {
-    pub attn_norm_w: Vec<f32>,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
-    pub q_norm_w: Vec<f32>,
-    pub k_norm_w: Vec<f32>,
-    pub post_norm_w: Vec<f32>,
+    pub attn_norm_w: RawTensor,
+    pub wq: RawTensor,
+    pub wk: RawTensor,
+    pub wv: RawTensor,
+    pub wo: RawTensor,
+    pub q_norm_w: RawTensor,
+    pub k_norm_w: RawTensor,
+    pub post_norm_w: RawTensor,
     /// Dense FFN (when expert_count == 0)
-    pub ffn_gate_w: Vec<f32>,
-    pub ffn_up_w: Vec<f32>,
-    pub ffn_down_w: Vec<f32>,
+    pub ffn_gate_w: RawTensor,
+    pub ffn_up_w: RawTensor,
+    pub ffn_down_w: RawTensor,
     /// MoE FFN (when expert_count > 0), None if dense
     pub moe_ffn: Option<LoadedMoeFfn>,
 }
 
 // ---------------------------------------------------------------------------
-// Delta-net layer weights (loaded eagerly)
+// Delta-net layer weights (loaded as raw quantized bytes)
 // ---------------------------------------------------------------------------
 
 pub struct LoadedDeltaNetLayer {
-    pub attn_norm_w: Vec<f32>,
-    pub wqkv: Vec<f32>,
-    pub wqkv_gate: Vec<f32>,
-    pub conv_kernel: Vec<f32>,
-    pub alpha_bias: Vec<f32>,
-    pub ssm_a: Vec<f32>,
-    pub ssm_norm_w: Vec<f32>,
-    pub ssm_out: Vec<f32>,
-    pub post_norm_w: Vec<f32>,
+    pub attn_norm_w: RawTensor,
+    pub wqkv: RawTensor,
+    pub wqkv_gate: RawTensor,
+    pub conv_kernel: RawTensor,
+    pub alpha_bias: RawTensor,
+    pub ssm_a: RawTensor,
+    pub ssm_norm_w: RawTensor,
+    pub ssm_out: RawTensor,
+    pub post_norm_w: RawTensor,
     /// Dense FFN (when expert_count == 0)
-    pub ffn_gate_w: Vec<f32>,
-    pub ffn_up_w: Vec<f32>,
-    pub ffn_down_w: Vec<f32>,
+    pub ffn_gate_w: RawTensor,
+    pub ffn_up_w: RawTensor,
+    pub ffn_down_w: RawTensor,
     /// MoE FFN (when expert_count > 0), None if dense
     pub moe_ffn: Option<LoadedMoeFfn>,
 }
 
 // ---------------------------------------------------------------------------
-// Full model weights
+// Full model weights (raw quantized bytes, dequantized on demand)
 // ---------------------------------------------------------------------------
 
 pub struct ModelWeights {
     pub cfg: Qwen3_5Config,
-    pub tok_embd: Vec<f32>,
-    pub output_norm_w: Vec<f32>,
-    pub output_weight: Vec<f32>,
+    pub tok_embd: RawTensor,
+    pub output_norm_w: RawTensor,
+    pub output_weight: RawTensor,
     pub full_attn_layers: Vec<LoadedFullAttnLayer>,
     pub delta_net_layers: Vec<LoadedDeltaNetLayer>,
+}
+
+/// Helper: dequantize a `RawTensor` to `Vec<f32>`. Panics on quant error
+/// (weights are validated at GGUF load time).
+fn dq(rt: &RawTensor) -> Vec<f32> {
+    rt.dequant().expect("dequant failed (tensor corrupted?)")
 }
 
 impl ModelWeights {
@@ -155,22 +162,15 @@ impl ModelWeights {
             meta.dims[0] as usize
         };
 
-        // Global weights
-        let tok_embd = loader.dequant("token_embd.weight").map_err(|e| e.to_string())?;
-        let output_norm_w = loader.dequant("output_norm.weight").map_err(|e| e.to_string())?;
+        // Global weights — stored as raw quantized bytes
+        let tok_embd = loader.raw_tensor("token_embd.weight").map_err(|e| e.to_string())?;
+        let output_norm_w = loader.raw_tensor("output_norm.weight").map_err(|e| e.to_string())?;
         let output_weight = if loader.tensor_meta("output.weight").is_some() {
-            loader.dequant("output.weight").map_err(|e| e.to_string())?
+            loader.raw_tensor("output.weight").map_err(|e| e.to_string())?
         } else {
             // Weight-tied: output shares token_embd
             tok_embd.clone()
         };
-
-        // Verify dimensions
-        assert_eq!(tok_embd.len(), n_vocab * n_embd,
-            "token_embd shape mismatch: got {} elements, expected {n_vocab}x{n_embd}={}",
-            tok_embd.len(), n_vocab * n_embd);
-        assert_eq!(output_norm_w.len(), n_embd);
-        assert_eq!(output_weight.len(), n_vocab * n_embd);
 
         let n_layers = cfg.block_count as usize;
         let n_expert = cfg.expert_count as usize;
@@ -179,45 +179,55 @@ impl ModelWeights {
         let mut full_attn_layers = Vec::new();
         let mut delta_net_layers = Vec::new();
 
-        let dequant = |name: &str| -> Result<Vec<f32>, String> {
-            loader.dequant(name).map_err(|e| format!("{name}: {e}"))
+        let raw = |name: &str| -> Result<RawTensor, String> {
+            loader.raw_tensor(name).map_err(|e| format!("{name}: {e}"))
         };
 
         // MoE FFN loader (shared by both layer types)
+        // Fuses gate+up into a single F32 RawTensor at load time.
         let load_moe = |t: &TensorNames| -> Result<Option<LoadedMoeFfn>, String> {
             if n_expert == 0 {
                 return Ok(None);
             }
-            let router_w = dequant(&t.ffn_gate_inp())?;
-            let gate_exps = dequant(&t.ffn_gate_exps())?;
-            let up_exps = dequant(&t.ffn_up_exps())?;
-            let down_w = dequant(&t.ffn_down_exps())?;
+            let router_w = raw(&t.ffn_gate_inp())?;
+            let gate_exps = raw(&t.ffn_gate_exps())?;
+            let up_exps = raw(&t.ffn_up_exps())?;
+            let down_w = raw(&t.ffn_down_exps())?;
 
-            // Fuse gate_exps [n_expert, n_ff, n_embd] + up_exps [n_expert, n_ff, n_embd]
-            // into gate_up_w [n_expert, 2*n_ff, n_embd]
-            let mut gate_up_w = vec![0.0f32; n_expert * 2 * n_ff * n_embd];
+            // Fuse gate+up: dequant both, interleave, store as F32 RawTensor
+            let gate_dq = gate_exps.dequant().map_err(|e| format!("gate_exps: {e}"))?;
+            let up_dq = up_exps.dequant().map_err(|e| format!("up_exps: {e}"))?;
+            let mut fused = vec![0.0f32; n_expert * 2 * n_ff * n_embd];
             for e in 0..n_expert {
                 let gate_base = e * n_ff * n_embd;
-                let up_base = e * n_ff * n_embd;
                 let fused_base = e * 2 * n_ff * n_embd;
-                // Copy gate weights (first n_ff rows)
-                gate_up_w[fused_base..fused_base + n_ff * n_embd]
-                    .copy_from_slice(&gate_exps[gate_base..gate_base + n_ff * n_embd]);
-                // Copy up weights (next n_ff rows)
-                gate_up_w[fused_base + n_ff * n_embd..fused_base + 2 * n_ff * n_embd]
-                    .copy_from_slice(&up_exps[up_base..up_base + n_ff * n_embd]);
+                fused[fused_base..fused_base + n_ff * n_embd]
+                    .copy_from_slice(&gate_dq[gate_base..gate_base + n_ff * n_embd]);
+                fused[fused_base + n_ff * n_embd..fused_base + 2 * n_ff * n_embd]
+                    .copy_from_slice(&up_dq[gate_base..gate_base + n_ff * n_embd]);
             }
+            // Store fused result as F32 RawTensor
+            let gate_up_w = RawTensor::new(
+                crate::gguf::GGmlType::F32,
+                fused.iter().flat_map(|f| f.to_le_bytes()).collect(),
+                n_expert * 2 * n_ff * n_embd,
+            );
 
             // Shared expert (shexp) — loaded when n_ff_shexp > 0
             let (shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w) = if n_ff_shexp > 0 {
                 (
-                    dequant(&t.ffn_gate_shexp())?,
-                    dequant(&t.ffn_up_shexp())?,
-                    dequant(&t.ffn_down_shexp())?,
-                    dequant(&t.ffn_gate_inp_shexp())?,
+                    raw(&t.ffn_gate_shexp())?,
+                    raw(&t.ffn_up_shexp())?,
+                    raw(&t.ffn_down_shexp())?,
+                    raw(&t.ffn_gate_inp_shexp())?,
                 )
             } else {
-                (vec![], vec![], vec![], vec![])
+                (
+                    RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                    RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                    RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                    RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                )
             };
 
             Ok(Some(LoadedMoeFfn {
@@ -234,25 +244,29 @@ impl ModelWeights {
 
         for i in 0..n_layers {
             let t = TensorNames::new(i);
-            let attn_norm_w = dequant(&t.attn_norm())?;
-            let post_norm_w = dequant(&t.post_attn_norm())?;
+            let attn_norm_w = raw(&t.attn_norm())?;
+            let post_norm_w = raw(&t.post_attn_norm())?;
 
             if cfg.is_recurrent(i) {
                 // Delta-net layer
-                let wqkv = dequant(&t.attn_qkv())?;
-                let wqkv_gate = dequant(&t.attn_gate())?;
-                let conv_kernel = dequant(&t.ssm_conv1d())?;
-                let alpha_bias = dequant(&t.ssm_dt())?;
-                let ssm_a = dequant(&t.ssm_a())?;
-                let ssm_norm_w = dequant(&t.ssm_norm())?;
-                let ssm_out = dequant(&t.ssm_out())?;
+                let wqkv = raw(&t.attn_qkv())?;
+                let wqkv_gate = raw(&t.attn_gate())?;
+                let conv_kernel = raw(&t.ssm_conv1d())?;
+                let alpha_bias = raw(&t.ssm_dt())?;
+                let ssm_a = raw(&t.ssm_a())?;
+                let ssm_norm_w = raw(&t.ssm_norm())?;
+                let ssm_out = raw(&t.ssm_out())?;
 
                 // FFN: MoE or dense
                 let moe_ffn = load_moe(&t)?;
                 let (ffn_gate_w, ffn_up_w, ffn_down_w) = if moe_ffn.is_some() {
-                    (vec![], vec![], vec![])
+                    (
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                    )
                 } else {
-                    (dequant(&t.ffn_gate())?, dequant(&t.ffn_up())?, dequant(&t.ffn_down())?)
+                    (raw(&t.ffn_gate())?, raw(&t.ffn_up())?, raw(&t.ffn_down())?)
                 };
 
                 delta_net_layers.push(LoadedDeltaNetLayer {
@@ -272,19 +286,23 @@ impl ModelWeights {
                 });
             } else {
                 // Full-attention layer
-                let wq = dequant(&t.attn_q())?;
-                let wk = dequant(&t.attn_k())?;
-                let wv = dequant(&t.attn_v())?;
-                let wo = dequant(&t.attn_o())?;
-                let q_norm_w = dequant(&t.attn_q_norm())?;
-                let k_norm_w = dequant(&t.attn_k_norm())?;
+                let wq = raw(&t.attn_q())?;
+                let wk = raw(&t.attn_k())?;
+                let wv = raw(&t.attn_v())?;
+                let wo = raw(&t.attn_o())?;
+                let q_norm_w = raw(&t.attn_q_norm())?;
+                let k_norm_w = raw(&t.attn_k_norm())?;
 
                 // FFN: MoE or dense
                 let moe_ffn = load_moe(&t)?;
                 let (ffn_gate_w, ffn_up_w, ffn_down_w) = if moe_ffn.is_some() {
-                    (vec![], vec![], vec![])
+                    (
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                        RawTensor::new(crate::gguf::GGmlType::F32, vec![], 0),
+                    )
                 } else {
-                    (dequant(&t.ffn_gate())?, dequant(&t.ffn_up())?, dequant(&t.ffn_down())?)
+                    (raw(&t.ffn_gate())?, raw(&t.ffn_up())?, raw(&t.ffn_down())?)
                 };
 
                 full_attn_layers.push(LoadedFullAttnLayer {
@@ -336,7 +354,7 @@ pub fn forward_pass(
     let n_kv_heads = cfg.attention_head_count_kv as usize;
     let head_size = cfg.attention_key_length as usize;
     let n_ff = cfg.expert_feed_forward_length as usize;
-    let n_vocab = model.tok_embd.len() / n_embd;
+    let n_vocab = model.tok_embd.n_elements / n_embd;
     let eps = cfg.attention_layer_norm_rms_epsilon;
 
     let rope_cfg = RopeConfig {
@@ -350,7 +368,8 @@ pub fn forward_pass(
     let rope_sections = cfg.rope_sections;
 
     // Embed
-    let mut hidden = embed_tokens(token_id, &model.tok_embd, n_embd);
+    let tok_embd_dq = dq(&model.tok_embd);
+    let mut hidden = embed_tokens(token_id, &tok_embd_dq, n_embd);
 
     // Layer state buffers (for delta-net recurrent states)
     let conv_dim = cfg.conv_dim as usize;
@@ -370,41 +389,76 @@ pub fn forward_pass(
             let layer = &model.delta_net_layers[delta_net_idx];
             delta_net_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                if let Some(ref moe) = layer.moe_ffn {
-                    (&moe.router_w[..], &moe.gate_up_w[..], &moe.down_w[..],
-                     cfg.expert_count as usize, cfg.expert_used_count as usize,
-                     &moe.shexp_gate_w[..], &moe.shexp_up_w[..],
-                     &moe.shexp_down_w[..], &moe.shexp_gate_inp_w[..],
-                     moe.n_ff_shexp)
-                } else {
-                    (&[][..], &[][..], &[][..], 0, 0,
-                     &[][..], &[][..], &[][..], &[][..], 0)
-                };
+            let moe_router_w_dq;
+            let moe_gate_up_w_dq;
+            let moe_down_w_dq;
+            let n_expert;
+            let n_expert_used;
+            let shexp_gate_w_dq;
+            let shexp_up_w_dq;
+            let shexp_down_w_dq;
+            let shexp_gate_inp_w_dq;
+            let n_ff_shexp;
+
+            if let Some(ref moe) = layer.moe_ffn {
+                moe_router_w_dq = dq(&moe.router_w);
+                moe_gate_up_w_dq = dq(&moe.gate_up_w);
+                moe_down_w_dq = dq(&moe.down_w);
+                n_expert = cfg.expert_count as usize;
+                n_expert_used = cfg.expert_used_count as usize;
+                shexp_gate_w_dq = dq(&moe.shexp_gate_w);
+                shexp_up_w_dq = dq(&moe.shexp_up_w);
+                shexp_down_w_dq = dq(&moe.shexp_down_w);
+                shexp_gate_inp_w_dq = dq(&moe.shexp_gate_inp_w);
+                n_ff_shexp = moe.n_ff_shexp;
+            } else {
+                moe_router_w_dq = vec![];
+                moe_gate_up_w_dq = vec![];
+                moe_down_w_dq = vec![];
+                n_expert = 0;
+                n_expert_used = 0;
+                shexp_gate_w_dq = vec![];
+                shexp_up_w_dq = vec![];
+                shexp_down_w_dq = vec![];
+                shexp_gate_inp_w_dq = vec![];
+                n_ff_shexp = 0;
+            };
+
+            let dn_attn_norm_w = dq(&layer.attn_norm_w);
+            let dn_wqkv = dq(&layer.wqkv);
+            let dn_wqkv_gate = dq(&layer.wqkv_gate);
+            let dn_conv_kernel = dq(&layer.conv_kernel);
+            let dn_alpha_bias = dq(&layer.alpha_bias);
+            let dn_ssm_a = dq(&layer.ssm_a);
+            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
+            let dn_ssm_out = dq(&layer.ssm_out);
+            let dn_post_norm_w = dq(&layer.post_norm_w);
+            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let dn_ffn_up_w = dq(&layer.ffn_up_w);
+            let dn_ffn_down_w = dq(&layer.ffn_down_w);
 
             let layer_ref = DeltaNetLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wqkv: &layer.wqkv,
-                wqkv_gate: &layer.wqkv_gate,
-                conv_kernel: &layer.conv_kernel,
-                alpha_bias: &layer.alpha_bias,
-                ssm_a: &layer.ssm_a,
-                ssm_norm_w: &layer.ssm_norm_w,
-                ssm_out: &layer.ssm_out,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &dn_attn_norm_w,
+                wqkv: &dn_wqkv,
+                wqkv_gate: &dn_wqkv_gate,
+                conv_kernel: &dn_conv_kernel,
+                alpha_bias: &dn_alpha_bias,
+                ssm_a: &dn_ssm_a,
+                ssm_norm_w: &dn_ssm_norm_w,
+                ssm_out: &dn_ssm_out,
+                post_norm_w: &dn_post_norm_w,
+                ffn_gate_w: &dn_ffn_gate_w,
+                ffn_up_w: &dn_ffn_up_w,
+                ffn_down_w: &dn_ffn_down_w,
+                moe_router_w: &moe_router_w_dq,
+                moe_gate_up_w: &moe_gate_up_w_dq,
+                moe_down_w: &moe_down_w_dq,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w_dq,
+                shexp_up_w: &shexp_up_w_dq,
+                shexp_down_w: &shexp_down_w_dq,
+                shexp_gate_inp_w: &shexp_gate_inp_w_dq,
                 n_ff_shexp,
             };
 
@@ -428,40 +482,74 @@ pub fn forward_pass(
             let layer = &model.full_attn_layers[full_attn_idx];
             full_attn_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                if let Some(ref moe) = layer.moe_ffn {
-                    (&moe.router_w[..], &moe.gate_up_w[..], &moe.down_w[..],
-                     cfg.expert_count as usize, cfg.expert_used_count as usize,
-                     &moe.shexp_gate_w[..], &moe.shexp_up_w[..],
-                     &moe.shexp_down_w[..], &moe.shexp_gate_inp_w[..],
-                     moe.n_ff_shexp)
-                } else {
-                    (&[][..], &[][..], &[][..], 0, 0,
-                     &[][..], &[][..], &[][..], &[][..], 0)
-                };
+            let moe_router_w_dq;
+            let moe_gate_up_w_dq;
+            let moe_down_w_dq;
+            let n_expert;
+            let n_expert_used;
+            let shexp_gate_w_dq;
+            let shexp_up_w_dq;
+            let shexp_down_w_dq;
+            let shexp_gate_inp_w_dq;
+            let n_ff_shexp;
+
+            if let Some(ref moe) = layer.moe_ffn {
+                moe_router_w_dq = dq(&moe.router_w);
+                moe_gate_up_w_dq = dq(&moe.gate_up_w);
+                moe_down_w_dq = dq(&moe.down_w);
+                n_expert = cfg.expert_count as usize;
+                n_expert_used = cfg.expert_used_count as usize;
+                shexp_gate_w_dq = dq(&moe.shexp_gate_w);
+                shexp_up_w_dq = dq(&moe.shexp_up_w);
+                shexp_down_w_dq = dq(&moe.shexp_down_w);
+                shexp_gate_inp_w_dq = dq(&moe.shexp_gate_inp_w);
+                n_ff_shexp = moe.n_ff_shexp;
+            } else {
+                moe_router_w_dq = vec![];
+                moe_gate_up_w_dq = vec![];
+                moe_down_w_dq = vec![];
+                n_expert = 0;
+                n_expert_used = 0;
+                shexp_gate_w_dq = vec![];
+                shexp_up_w_dq = vec![];
+                shexp_down_w_dq = vec![];
+                shexp_gate_inp_w_dq = vec![];
+                n_ff_shexp = 0;
+            };
+
+            let fa_attn_norm_w = dq(&layer.attn_norm_w);
+            let fa_wq = dq(&layer.wq);
+            let fa_wk = dq(&layer.wk);
+            let fa_wv = dq(&layer.wv);
+            let fa_wo = dq(&layer.wo);
+            let fa_q_norm_w = dq(&layer.q_norm_w);
+            let fa_k_norm_w = dq(&layer.k_norm_w);
+            let fa_post_norm_w = dq(&layer.post_norm_w);
+            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let fa_ffn_up_w = dq(&layer.ffn_up_w);
+            let fa_ffn_down_w = dq(&layer.ffn_down_w);
 
             let layer_ref = FullAttnLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wq: &layer.wq,
-                wk: &layer.wk,
-                wv: &layer.wv,
-                wo: &layer.wo,
-                q_norm_w: &layer.q_norm_w,
-                k_norm_w: &layer.k_norm_w,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &fa_attn_norm_w,
+                wq: &fa_wq,
+                wk: &fa_wk,
+                wv: &fa_wv,
+                wo: &fa_wo,
+                q_norm_w: &fa_q_norm_w,
+                k_norm_w: &fa_k_norm_w,
+                post_norm_w: &fa_post_norm_w,
+                ffn_gate_w: &fa_ffn_gate_w,
+                ffn_up_w: &fa_ffn_up_w,
+                ffn_down_w: &fa_ffn_down_w,
+                moe_router_w: &moe_router_w_dq,
+                moe_gate_up_w: &moe_gate_up_w_dq,
+                moe_down_w: &moe_down_w_dq,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w_dq,
+                shexp_up_w: &shexp_up_w_dq,
+                shexp_down_w: &shexp_down_w_dq,
+                shexp_gate_inp_w: &shexp_gate_inp_w_dq,
                 n_ff_shexp,
             };
 
@@ -489,15 +577,15 @@ pub fn forward_pass(
                 1,
                 eps,
                 rope_sections,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                &moe_router_w_dq,
+                &moe_gate_up_w_dq,
+                &moe_down_w_dq,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                &shexp_gate_w_dq,
+                &shexp_up_w_dq,
+                &shexp_down_w_dq,
+                &shexp_gate_inp_w_dq,
                 n_ff_shexp,
                 None,
             );
@@ -505,10 +593,12 @@ pub fn forward_pass(
     }
 
     // LM head
+    let output_norm_dq = dq(&model.output_norm_w);
+    let output_weight_dq = dq(&model.output_weight);
     let next_token = lm_head_argmax(
         &hidden,
-        &model.output_norm_w,
-        &model.output_weight,
+        &output_norm_dq,
+        &output_weight_dq,
         n_embd,
         n_vocab,
         eps,
@@ -563,8 +653,8 @@ impl GenerationState {
             if cfg.is_recurrent(i) {
                 let layer = &model.delta_net_layers[delta_net_count];
                 delta_net_count += 1;
-                conv_states.push(vec![0.0f32; layer.conv_kernel.len()]);
-                ssm_states.push(vec![0.0f32; layer.ssm_out.len() / n_embd(cfg)]);
+                conv_states.push(vec![0.0f32; layer.conv_kernel.n_elements]);
+                ssm_states.push(vec![0.0f32; layer.ssm_out.n_elements / n_embd(cfg)]);
             } else {
                 kv_caches.push(LayerKvCache::new(n_ctx, n_kv_heads, head_size));
             }
@@ -605,9 +695,10 @@ pub fn prefill(
 
     // Embed all prompt tokens at once
     let n_tokens = token_ids.len();
+    let tok_embd_dq = dq(&model.tok_embd);
     let mut hidden = vec![0.0f32; n_tokens * n_embd];
     for (t, &tid) in token_ids.iter().enumerate() {
-        let emb = embed_tokens(tid, &model.tok_embd, n_embd);
+        let emb = embed_tokens(tid, &tok_embd_dq, n_embd);
         hidden[t * n_embd..(t + 1) * n_embd].copy_from_slice(&emb);
     }
 
@@ -623,28 +714,41 @@ pub fn prefill(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields(layer, cfg);
 
+            let dn_attn_norm_w = dq(&layer.attn_norm_w);
+            let dn_wqkv = dq(&layer.wqkv);
+            let dn_wqkv_gate = dq(&layer.wqkv_gate);
+            let dn_conv_kernel = dq(&layer.conv_kernel);
+            let dn_alpha_bias = dq(&layer.alpha_bias);
+            let dn_ssm_a = dq(&layer.ssm_a);
+            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
+            let dn_ssm_out = dq(&layer.ssm_out);
+            let dn_post_norm_w = dq(&layer.post_norm_w);
+            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let dn_ffn_up_w = dq(&layer.ffn_up_w);
+            let dn_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = DeltaNetLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wqkv: &layer.wqkv,
-                wqkv_gate: &layer.wqkv_gate,
-                conv_kernel: &layer.conv_kernel,
-                alpha_bias: &layer.alpha_bias,
-                ssm_a: &layer.ssm_a,
-                ssm_norm_w: &layer.ssm_norm_w,
-                ssm_out: &layer.ssm_out,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &dn_attn_norm_w,
+                wqkv: &dn_wqkv,
+                wqkv_gate: &dn_wqkv_gate,
+                conv_kernel: &dn_conv_kernel,
+                alpha_bias: &dn_alpha_bias,
+                ssm_a: &dn_ssm_a,
+                ssm_norm_w: &dn_ssm_norm_w,
+                ssm_out: &dn_ssm_out,
+                post_norm_w: &dn_post_norm_w,
+                ffn_gate_w: &dn_ffn_gate_w,
+                ffn_up_w: &dn_ffn_up_w,
+                ffn_down_w: &dn_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -682,27 +786,39 @@ pub fn prefill(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
+            let fa_attn_norm_w = dq(&layer.attn_norm_w);
+            let fa_wq = dq(&layer.wq);
+            let fa_wk = dq(&layer.wk);
+            let fa_wv = dq(&layer.wv);
+            let fa_wo = dq(&layer.wo);
+            let fa_q_norm_w = dq(&layer.q_norm_w);
+            let fa_k_norm_w = dq(&layer.k_norm_w);
+            let fa_post_norm_w = dq(&layer.post_norm_w);
+            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let fa_ffn_up_w = dq(&layer.ffn_up_w);
+            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = FullAttnLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wq: &layer.wq,
-                wk: &layer.wk,
-                wv: &layer.wv,
-                wo: &layer.wo,
-                q_norm_w: &layer.q_norm_w,
-                k_norm_w: &layer.k_norm_w,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &fa_attn_norm_w,
+                wq: &fa_wq,
+                wk: &fa_wk,
+                wv: &fa_wv,
+                wo: &fa_wo,
+                q_norm_w: &fa_q_norm_w,
+                k_norm_w: &fa_k_norm_w,
+                post_norm_w: &fa_post_norm_w,
+                ffn_gate_w: &fa_ffn_gate_w,
+                ffn_up_w: &fa_ffn_up_w,
+                ffn_down_w: &fa_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -733,15 +849,15 @@ pub fn prefill(
                 n_tokens,
                 eps,
                 rope_sections,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                &moe_router_w,
+                &moe_gate_up_w,
+                &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                &shexp_gate_w,
+                &shexp_up_w,
+                &shexp_down_w,
+                &shexp_gate_inp_w,
                 n_ff_shexp,
                 Some(crate::model::kernels::KvCacheMut {
                     k: &mut cache.k,
@@ -770,7 +886,7 @@ pub fn generate_token(
     let n_kv_heads = cfg.attention_head_count_kv as usize;
     let head_size = cfg.attention_key_length as usize;
     let n_ff = cfg.expert_feed_forward_length as usize;
-    let n_vocab = model.tok_embd.len() / n_embd;
+    let n_vocab = model.tok_embd.n_elements / n_embd;
     let eps = cfg.attention_layer_norm_rms_epsilon;
 
     let rope_cfg = RopeConfig {
@@ -783,7 +899,8 @@ pub fn generate_token(
     };
     let rope_sections = cfg.rope_sections;
 
-    let mut hidden = embed_tokens(token_id, &model.tok_embd, n_embd);
+    let tok_embd_dq = dq(&model.tok_embd);
+    let mut hidden = embed_tokens(token_id, &tok_embd_dq, n_embd);
 
     let mut full_attn_idx = 0;
     let mut delta_net_idx = 0;
@@ -797,28 +914,41 @@ pub fn generate_token(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields(layer, cfg);
 
+            let dn_attn_norm_w = dq(&layer.attn_norm_w);
+            let dn_wqkv = dq(&layer.wqkv);
+            let dn_wqkv_gate = dq(&layer.wqkv_gate);
+            let dn_conv_kernel = dq(&layer.conv_kernel);
+            let dn_alpha_bias = dq(&layer.alpha_bias);
+            let dn_ssm_a = dq(&layer.ssm_a);
+            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
+            let dn_ssm_out = dq(&layer.ssm_out);
+            let dn_post_norm_w = dq(&layer.post_norm_w);
+            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let dn_ffn_up_w = dq(&layer.ffn_up_w);
+            let dn_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = DeltaNetLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wqkv: &layer.wqkv,
-                wqkv_gate: &layer.wqkv_gate,
-                conv_kernel: &layer.conv_kernel,
-                alpha_bias: &layer.alpha_bias,
-                ssm_a: &layer.ssm_a,
-                ssm_norm_w: &layer.ssm_norm_w,
-                ssm_out: &layer.ssm_out,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &dn_attn_norm_w,
+                wqkv: &dn_wqkv,
+                wqkv_gate: &dn_wqkv_gate,
+                conv_kernel: &dn_conv_kernel,
+                alpha_bias: &dn_alpha_bias,
+                ssm_a: &dn_ssm_a,
+                ssm_norm_w: &dn_ssm_norm_w,
+                ssm_out: &dn_ssm_out,
+                post_norm_w: &dn_post_norm_w,
+                ffn_gate_w: &dn_ffn_gate_w,
+                ffn_up_w: &dn_ffn_up_w,
+                ffn_down_w: &dn_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -851,27 +981,39 @@ pub fn generate_token(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
+            let fa_attn_norm_w = dq(&layer.attn_norm_w);
+            let fa_wq = dq(&layer.wq);
+            let fa_wk = dq(&layer.wk);
+            let fa_wv = dq(&layer.wv);
+            let fa_wo = dq(&layer.wo);
+            let fa_q_norm_w = dq(&layer.q_norm_w);
+            let fa_k_norm_w = dq(&layer.k_norm_w);
+            let fa_post_norm_w = dq(&layer.post_norm_w);
+            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let fa_ffn_up_w = dq(&layer.ffn_up_w);
+            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = FullAttnLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wq: &layer.wq,
-                wk: &layer.wk,
-                wv: &layer.wv,
-                wo: &layer.wo,
-                q_norm_w: &layer.q_norm_w,
-                k_norm_w: &layer.k_norm_w,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &fa_attn_norm_w,
+                wq: &fa_wq,
+                wk: &fa_wk,
+                wv: &fa_wv,
+                wo: &fa_wo,
+                q_norm_w: &fa_q_norm_w,
+                k_norm_w: &fa_k_norm_w,
+                post_norm_w: &fa_post_norm_w,
+                ffn_gate_w: &fa_ffn_gate_w,
+                ffn_up_w: &fa_ffn_up_w,
+                ffn_down_w: &fa_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -902,15 +1044,15 @@ pub fn generate_token(
                 1,
                 eps,
                 rope_sections,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                &moe_router_w,
+                &moe_gate_up_w,
+                &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                &shexp_gate_w,
+                &shexp_up_w,
+                &shexp_down_w,
+                &shexp_gate_inp_w,
                 n_ff_shexp,
                 Some(crate::model::kernels::KvCacheMut {
                     k: &mut cache.k,
@@ -924,7 +1066,9 @@ pub fn generate_token(
 
     state.pos += 1;
 
-    let next_token = lm_head_argmax(&hidden, &model.output_norm_w, &model.output_weight, n_embd, n_vocab, eps);
+    let output_norm_dq = dq(&model.output_norm_w);
+    let output_weight_dq = dq(&model.output_weight);
+    let next_token = lm_head_argmax(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
     (hidden, next_token)
 }
 
@@ -941,7 +1085,7 @@ pub fn generate_token_logits(
     let n_kv_heads = cfg.attention_head_count_kv as usize;
     let head_size = cfg.attention_key_length as usize;
     let n_ff = cfg.expert_feed_forward_length as usize;
-    let n_vocab = model.tok_embd.len() / n_embd;
+    let n_vocab = model.tok_embd.n_elements / n_embd;
     let eps = cfg.attention_layer_norm_rms_epsilon;
 
     let rope_cfg = RopeConfig {
@@ -954,7 +1098,8 @@ pub fn generate_token_logits(
     };
     let rope_sections = cfg.rope_sections;
 
-    let mut hidden = embed_tokens(token_id, &model.tok_embd, n_embd);
+    let tok_embd_dq = dq(&model.tok_embd);
+    let mut hidden = embed_tokens(token_id, &tok_embd_dq, n_embd);
 
     let mut full_attn_idx = 0;
     let mut delta_net_idx = 0;
@@ -968,28 +1113,41 @@ pub fn generate_token_logits(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields(layer, cfg);
 
+            let dn_attn_norm_w = dq(&layer.attn_norm_w);
+            let dn_wqkv = dq(&layer.wqkv);
+            let dn_wqkv_gate = dq(&layer.wqkv_gate);
+            let dn_conv_kernel = dq(&layer.conv_kernel);
+            let dn_alpha_bias = dq(&layer.alpha_bias);
+            let dn_ssm_a = dq(&layer.ssm_a);
+            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
+            let dn_ssm_out = dq(&layer.ssm_out);
+            let dn_post_norm_w = dq(&layer.post_norm_w);
+            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let dn_ffn_up_w = dq(&layer.ffn_up_w);
+            let dn_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = DeltaNetLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wqkv: &layer.wqkv,
-                wqkv_gate: &layer.wqkv_gate,
-                conv_kernel: &layer.conv_kernel,
-                alpha_bias: &layer.alpha_bias,
-                ssm_a: &layer.ssm_a,
-                ssm_norm_w: &layer.ssm_norm_w,
-                ssm_out: &layer.ssm_out,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &dn_attn_norm_w,
+                wqkv: &dn_wqkv,
+                wqkv_gate: &dn_wqkv_gate,
+                conv_kernel: &dn_conv_kernel,
+                alpha_bias: &dn_alpha_bias,
+                ssm_a: &dn_ssm_a,
+                ssm_norm_w: &dn_ssm_norm_w,
+                ssm_out: &dn_ssm_out,
+                post_norm_w: &dn_post_norm_w,
+                ffn_gate_w: &dn_ffn_gate_w,
+                ffn_up_w: &dn_ffn_up_w,
+                ffn_down_w: &dn_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -1022,27 +1180,39 @@ pub fn generate_token_logits(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
+            let fa_attn_norm_w = dq(&layer.attn_norm_w);
+            let fa_wq = dq(&layer.wq);
+            let fa_wk = dq(&layer.wk);
+            let fa_wv = dq(&layer.wv);
+            let fa_wo = dq(&layer.wo);
+            let fa_q_norm_w = dq(&layer.q_norm_w);
+            let fa_k_norm_w = dq(&layer.k_norm_w);
+            let fa_post_norm_w = dq(&layer.post_norm_w);
+            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
+            let fa_ffn_up_w = dq(&layer.ffn_up_w);
+            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+
             let layer_ref = FullAttnLayerWeights {
-                attn_norm_w: &layer.attn_norm_w,
-                wq: &layer.wq,
-                wk: &layer.wk,
-                wv: &layer.wv,
-                wo: &layer.wo,
-                q_norm_w: &layer.q_norm_w,
-                k_norm_w: &layer.k_norm_w,
-                post_norm_w: &layer.post_norm_w,
-                ffn_gate_w: &layer.ffn_gate_w,
-                ffn_up_w: &layer.ffn_up_w,
-                ffn_down_w: &layer.ffn_down_w,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                attn_norm_w: &fa_attn_norm_w,
+                wq: &fa_wq,
+                wk: &fa_wk,
+                wv: &fa_wv,
+                wo: &fa_wo,
+                q_norm_w: &fa_q_norm_w,
+                k_norm_w: &fa_k_norm_w,
+                post_norm_w: &fa_post_norm_w,
+                ffn_gate_w: &fa_ffn_gate_w,
+                ffn_up_w: &fa_ffn_up_w,
+                ffn_down_w: &fa_ffn_down_w,
+                moe_router_w: &moe_router_w,
+                moe_gate_up_w: &moe_gate_up_w,
+                moe_down_w: &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                shexp_gate_w: &shexp_gate_w,
+                shexp_up_w: &shexp_up_w,
+                shexp_down_w: &shexp_down_w,
+                shexp_gate_inp_w: &shexp_gate_inp_w,
                 n_ff_shexp,
             };
 
@@ -1073,15 +1243,15 @@ pub fn generate_token_logits(
                 1,
                 eps,
                 rope_sections,
-                moe_router_w,
-                moe_gate_up_w,
-                moe_down_w,
+                &moe_router_w,
+                &moe_gate_up_w,
+                &moe_down_w,
                 n_expert,
                 n_expert_used,
-                shexp_gate_w,
-                shexp_up_w,
-                shexp_down_w,
-                shexp_gate_inp_w,
+                &shexp_gate_w,
+                &shexp_up_w,
+                &shexp_down_w,
+                &shexp_gate_inp_w,
                 n_ff_shexp,
                 Some(crate::model::kernels::KvCacheMut {
                     k: &mut cache.k,
@@ -1095,42 +1265,44 @@ pub fn generate_token_logits(
 
     state.pos += 1;
 
-    let logits = lm_head_logits(&hidden, &model.output_norm_w, &model.output_weight, n_embd, n_vocab, eps);
+    let output_norm_dq = dq(&model.output_norm_w);
+    let output_weight_dq = dq(&model.output_weight);
+    let logits = lm_head_logits(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
     (hidden, logits)
 }
 
 // Helper to extract MoE fields from a delta-net layer
-type MoeFields<'a> = (&'a [f32], &'a [f32], &'a [f32], usize, usize,
-      &'a [f32], &'a [f32], &'a [f32], &'a [f32], usize);
+type MoeFields = (Vec<f32>, Vec<f32>, Vec<f32>, usize, usize,
+      Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize);
 
-fn moe_fields<'a>(
-    layer: &'a LoadedDeltaNetLayer,
+fn moe_fields(
+    layer: &LoadedDeltaNetLayer,
     cfg: &crate::model::config::Qwen3_5Config,
-) -> MoeFields<'a> {
+) -> MoeFields {
     if let Some(ref moe) = layer.moe_ffn {
-        (&moe.router_w, &moe.gate_up_w, &moe.down_w,
+        (dq(&moe.router_w), dq(&moe.gate_up_w), dq(&moe.down_w),
          cfg.expert_count as usize, cfg.expert_used_count as usize,
-         &moe.shexp_gate_w, &moe.shexp_up_w, &moe.shexp_down_w,
-         &moe.shexp_gate_inp_w, moe.n_ff_shexp)
+         dq(&moe.shexp_gate_w), dq(&moe.shexp_up_w), dq(&moe.shexp_down_w),
+         dq(&moe.shexp_gate_inp_w), moe.n_ff_shexp)
     } else {
-        (&[], &[], &[], 0, 0,
-         &[], &[], &[], &[], 0)
+        (vec![], vec![], vec![], 0, 0,
+         vec![], vec![], vec![], vec![], 0)
     }
 }
 
 // Helper to extract MoE fields from a full-attention layer
-fn moe_fields_full<'a>(
-    layer: &'a LoadedFullAttnLayer,
+fn moe_fields_full(
+    layer: &LoadedFullAttnLayer,
     cfg: &crate::model::config::Qwen3_5Config,
-) -> MoeFields<'a> {
+) -> MoeFields {
     if let Some(ref moe) = layer.moe_ffn {
-        (&moe.router_w, &moe.gate_up_w, &moe.down_w,
+        (dq(&moe.router_w), dq(&moe.gate_up_w), dq(&moe.down_w),
          cfg.expert_count as usize, cfg.expert_used_count as usize,
-         &moe.shexp_gate_w, &moe.shexp_up_w, &moe.shexp_down_w,
-         &moe.shexp_gate_inp_w, moe.n_ff_shexp)
+         dq(&moe.shexp_gate_w), dq(&moe.shexp_up_w), dq(&moe.shexp_down_w),
+         dq(&moe.shexp_gate_inp_w), moe.n_ff_shexp)
     } else {
-        (&[], &[], &[], 0, 0,
-         &[], &[], &[], &[], 0)
+        (vec![], vec![], vec![], 0, 0,
+         vec![], vec![], vec![], vec![], 0)
     }
 }
 
@@ -1163,7 +1335,9 @@ mod tests {
         let eps = 1e-6;
 
         let embd = vec![0.1f32; n_vocab * n_embd];
+        let embd_bytes: Vec<u8> = embd.iter().flat_map(|f| f.to_le_bytes()).collect();
         let out_norm = vec![1.0f32; n_embd];
+        let out_norm_bytes: Vec<u8> = out_norm.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let (hidden, next_token) = forward_pass(0, &ModelWeights {
             cfg: crate::model::config::Qwen3_5Config {
@@ -1196,9 +1370,9 @@ mod tests {
                 ba_dim: 0,
                 full_attn_q_fused_dim: 0,
             },
-            tok_embd: embd.clone(),
-            output_norm_w: out_norm,
-            output_weight: embd,
+            tok_embd: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes.clone(), n_vocab * n_embd),
+            output_norm_w: RawTensor::new(crate::gguf::GGmlType::F32, out_norm_bytes, n_embd),
+            output_weight: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes, n_vocab * n_embd),
             full_attn_layers: vec![],
             delta_net_layers: vec![],
         });

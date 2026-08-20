@@ -200,6 +200,20 @@ impl ModelLoader {
         quant::dequantize(meta.ggml_type, data, meta.n_elements())
             .map_err(|source| LoaderError::Quant { name: name.to_string(), source })
     }
+
+    /// Load a named tensor as raw quantized bytes (no dequantization).
+    pub fn raw_tensor(&self, name: &str) -> Result<quant::RawTensor, LoaderError> {
+        let (_, meta) = self
+            .by_name
+            .get(name)
+            .ok_or_else(|| LoaderError::TensorNotFound { name: name.to_string() })?;
+        let data = self.data_slice(name)?;
+        Ok(quant::RawTensor::new(
+            meta.ggml_type,
+            data.to_vec(),
+            meta.n_elements() as usize,
+        ))
+    }
 }
 
 /// Does this tensor's relative data range fit inside its shard file?

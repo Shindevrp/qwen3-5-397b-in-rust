@@ -9,6 +9,31 @@ use crate::gguf::GGmlType;
 
 pub const QK_K: usize = 256;
 
+/// Raw quantized tensor stored as-is from the GGUF file.
+/// Avoids dequantizing all weights into f32 upfront.
+#[derive(Clone)]
+pub struct RawTensor {
+    pub ty: GGmlType,
+    pub data: Vec<u8>,
+    pub n_elements: usize,
+}
+
+impl RawTensor {
+    pub fn new(ty: GGmlType, data: Vec<u8>, n_elements: usize) -> Self {
+        Self { ty, data, n_elements }
+    }
+
+    /// Dequantize to f32 on demand.
+    pub fn dequant(&self) -> Result<Vec<f32>, QuantError> {
+        dequantize(self.ty, &self.data, self.n_elements as u64)
+    }
+
+    /// Row size in bytes for this tensor's quantization type and inner dimension.
+    pub fn row_bytes(&self, n_in: usize) -> Result<usize, QuantError> {
+        tensor_size(self.ty, n_in as u64).map(|b| b as usize)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum QuantError {
     #[error("unsupported quant type {0}")]
