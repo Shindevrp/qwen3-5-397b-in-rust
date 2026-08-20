@@ -1487,20 +1487,38 @@ pub fn lm_head_argmax(
     n_vocab: usize,
     eps: f32,
 ) -> u32 {
-    let normed = rms_norm(hidden, output_norm_w, eps);
+    let logits = lm_head_logits(hidden, output_norm_w, output_weight, n_embd, n_vocab, eps);
     let mut best_logit = f32::NEG_INFINITY;
     let mut best_id = 0u32;
+    for (v, &logit) in logits.iter().enumerate() {
+        if logit > best_logit {
+            best_logit = logit;
+            best_id = v as u32;
+        }
+    }
+    best_id
+}
+
+/// Compute raw logits from hidden state (after output norm + linear projection).
+/// Returns `Vec<f32>` of length `n_vocab`.
+pub fn lm_head_logits(
+    hidden: &[f32],
+    output_norm_w: &[f32],
+    output_weight: &[f32],
+    n_embd: usize,
+    n_vocab: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let normed = rms_norm(hidden, output_norm_w, eps);
+    let mut logits = vec![0.0f32; n_vocab];
     for v in 0..n_vocab {
         let mut acc = 0.0f32;
         for i in 0..n_embd {
             acc += normed[i] * output_weight[v * n_embd + i];
         }
-        if acc > best_logit {
-            best_logit = acc;
-            best_id = v as u32;
-        }
+        logits[v] = acc;
     }
-    best_id
+    logits
 }
 
 /// Mutable reference to a layer's KV cache for use during forward pass.

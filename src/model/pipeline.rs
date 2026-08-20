@@ -8,7 +8,7 @@ use crate::model::config::Qwen3_5Config;
 use crate::model::kernels::{
     DeltaNetLayerWeights, FullAttnLayerWeights, RopeConfig,
     delta_net_layer_forward, embed_tokens,
-    lm_head_argmax,
+    lm_head_argmax, lm_head_logits,
 };
 use crate::model::loader::ModelLoader;
 
@@ -926,6 +926,177 @@ pub fn generate_token(
 
     let next_token = lm_head_argmax(&hidden, &model.output_norm_w, &model.output_weight, n_embd, n_vocab, eps);
     (hidden, next_token)
+}
+
+/// Same as `generate_token` but returns raw logits instead of argmax token.
+/// Caller can apply custom sampling (temperature, top-k, top-p, etc.).
+pub fn generate_token_logits(
+    state: &mut GenerationState,
+    token_id: u32,
+    model: &ModelWeights,
+) -> (Vec<f32>, Vec<f32>) {
+    let cfg = &model.cfg;
+    let n_embd = cfg.embedding_length as usize;
+    let n_heads = cfg.attention_head_count as usize;
+    let n_kv_heads = cfg.attention_head_count_kv as usize;
+    let head_size = cfg.attention_key_length as usize;
+    let n_ff = cfg.expert_feed_forward_length as usize;
+    let n_vocab = model.tok_embd.len() / n_embd;
+    let eps = cfg.attention_layer_norm_rms_epsilon;
+
+    let rope_cfg = RopeConfig {
+        freq_base: cfg.rope_freq_base,
+        freq_scale: 1.0,
+        ext_factor: 0.0,
+        attn_factor: 1.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+    };
+    let rope_sections = cfg.rope_sections;
+
+    let mut hidden = embed_tokens(token_id, &model.tok_embd, n_embd);
+
+    let mut full_attn_idx = 0;
+    let mut delta_net_idx = 0;
+
+    for layer_idx in 0..cfg.block_count as usize {
+        if cfg.is_recurrent(layer_idx) {
+            let layer = &model.delta_net_layers[delta_net_idx];
+            delta_net_idx += 1;
+
+            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
+                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
+                moe_fields(layer, cfg);
+
+            let layer_ref = DeltaNetLayerWeights {
+                attn_norm_w: &layer.attn_norm_w,
+                wqkv: &layer.wqkv,
+                wqkv_gate: &layer.wqkv_gate,
+                conv_kernel: &layer.conv_kernel,
+                alpha_bias: &layer.alpha_bias,
+                ssm_a: &layer.ssm_a,
+                ssm_norm_w: &layer.ssm_norm_w,
+                ssm_out: &layer.ssm_out,
+                post_norm_w: &layer.post_norm_w,
+                ffn_gate_w: &layer.ffn_gate_w,
+                ffn_up_w: &layer.ffn_up_w,
+                ffn_down_w: &layer.ffn_down_w,
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            };
+
+            let conv_dim = cfg.conv_dim as usize;
+            let conv_kernel_size = cfg.ssm_conv_kernel as usize;
+            let s_v = cfg.head_v_dim as usize;
+            let n_heads_v = cfg.ssm_time_step_rank as usize;
+
+            hidden = delta_net_layer_forward(
+                &hidden,
+                &layer_ref,
+                &mut state.conv_states[delta_net_idx - 1],
+                &mut state.ssm_states[delta_net_idx - 1],
+                n_embd,
+                n_ff,
+                conv_dim,
+                conv_kernel_size,
+                cfg.ba_dim as usize,
+                cfg.head_k_dim as usize,
+                s_v,
+                cfg.ssm_group_count as usize,
+                n_heads_v,
+                eps,
+            );
+        } else {
+            let layer = &model.full_attn_layers[full_attn_idx];
+            full_attn_idx += 1;
+
+            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
+                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
+                moe_fields_full(layer, cfg);
+
+            let layer_ref = FullAttnLayerWeights {
+                attn_norm_w: &layer.attn_norm_w,
+                wq: &layer.wq,
+                wk: &layer.wk,
+                wv: &layer.wv,
+                wo: &layer.wo,
+                q_norm_w: &layer.q_norm_w,
+                k_norm_w: &layer.k_norm_w,
+                post_norm_w: &layer.post_norm_w,
+                ffn_gate_w: &layer.ffn_gate_w,
+                ffn_up_w: &layer.ffn_up_w,
+                ffn_down_w: &layer.ffn_down_w,
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            };
+
+            let pos = [state.pos as i32, 0, 0, 0];
+            let cache = &mut state.kv_caches[full_attn_idx - 1];
+            let nc = cache.n_used;
+
+            hidden = crate::model::kernels::full_layer_forward(
+                &hidden,
+                layer_ref.attn_norm_w,
+                layer_ref.wq,
+                layer_ref.wk,
+                layer_ref.wv,
+                layer_ref.wo,
+                layer_ref.q_norm_w,
+                layer_ref.k_norm_w,
+                pos,
+                &rope_cfg,
+                layer_ref.post_norm_w,
+                layer_ref.ffn_gate_w,
+                layer_ref.ffn_up_w,
+                layer_ref.ffn_down_w,
+                n_embd,
+                n_heads,
+                n_kv_heads,
+                head_size,
+                n_ff,
+                1,
+                eps,
+                rope_sections,
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+                Some(crate::model::kernels::KvCacheMut {
+                    k: &mut cache.k,
+                    v: &mut cache.v,
+                    n_cached: nc,
+                }),
+            );
+            cache.n_used = nc + 1;
+        }
+    }
+
+    state.pos += 1;
+
+    let logits = lm_head_logits(&hidden, &model.output_norm_w, &model.output_weight, n_embd, n_vocab, eps);
+    (hidden, logits)
 }
 
 // Helper to extract MoE fields from a delta-net layer
