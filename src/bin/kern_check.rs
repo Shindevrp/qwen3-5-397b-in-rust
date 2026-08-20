@@ -238,6 +238,7 @@ fn main() {
                     n_embd, n_heads, n_kv_heads, head_size, n_ff, n_tokens,
                     1e-6, sections,
                     &[], &[], &[], 0, 0,
+                    &[], &[], &[], &[], 0,
                 );
                 assert_eq!(out.len(), n_tokens * n_embd);
                 write_txt(&dir.join(format!("rust_full_layer_{id}.txt")), &out);
@@ -289,6 +290,11 @@ fn main() {
                     moe_down_w: &[],
                     n_expert: 0,
                     n_expert_used: 0,
+                    shexp_gate_w: &[],
+                    shexp_up_w: &[],
+                    shexp_down_w: &[],
+                    shexp_gate_inp_w: &[],
+                    n_ff_shexp: 0,
                 };
 
                 let out = delta_net_layer_forward(

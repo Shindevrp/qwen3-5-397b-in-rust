@@ -81,6 +81,12 @@ pub struct LoadedMoeFfn {
     pub router_w: Vec<f32>,      // [n_expert, n_embd]
     pub gate_up_w: Vec<f32>,     // [n_expert, 2*n_ff, n_embd] (fused gate+up)
     pub down_w: Vec<f32>,        // [n_expert, n_embd, n_ff]
+    // Shared expert (shexp)
+    pub shexp_gate_w: Vec<f32>,     // [n_ff_shexp, n_embd]
+    pub shexp_up_w: Vec<f32>,       // [n_ff_shexp, n_embd]
+    pub shexp_down_w: Vec<f32>,     // [n_embd, n_ff_shexp]
+    pub shexp_gate_inp_w: Vec<f32>, // [n_embd]
+    pub n_ff_shexp: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +175,7 @@ impl ModelWeights {
         let n_layers = cfg.block_count as usize;
         let n_expert = cfg.expert_count as usize;
         let n_ff = cfg.expert_feed_forward_length as usize;
+        let n_ff_shexp = cfg.expert_shared_feed_forward_length as usize;
         let mut full_attn_layers = Vec::new();
         let mut delta_net_layers = Vec::new();
 
@@ -201,7 +208,28 @@ impl ModelWeights {
                     .copy_from_slice(&up_exps[up_base..up_base + n_ff * n_embd]);
             }
 
-            Ok(Some(LoadedMoeFfn { router_w, gate_up_w, down_w }))
+            // Shared expert (shexp) — loaded when n_ff_shexp > 0
+            let (shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w) = if n_ff_shexp > 0 {
+                (
+                    dequant(&t.ffn_gate_shexp())?,
+                    dequant(&t.ffn_up_shexp())?,
+                    dequant(&t.ffn_down_shexp())?,
+                    dequant(&t.ffn_gate_inp_shexp())?,
+                )
+            } else {
+                (vec![], vec![], vec![], vec![])
+            };
+
+            Ok(Some(LoadedMoeFfn {
+                router_w,
+                gate_up_w,
+                down_w,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            }))
         };
 
         for i in 0..n_layers {
@@ -342,12 +370,17 @@ pub fn forward_pass(
             let layer = &model.delta_net_layers[delta_net_idx];
             delta_net_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used) =
+            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
+                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 if let Some(ref moe) = layer.moe_ffn {
                     (&moe.router_w[..], &moe.gate_up_w[..], &moe.down_w[..],
-                     cfg.expert_count as usize, cfg.expert_used_count as usize)
+                     cfg.expert_count as usize, cfg.expert_used_count as usize,
+                     &moe.shexp_gate_w[..], &moe.shexp_up_w[..],
+                     &moe.shexp_down_w[..], &moe.shexp_gate_inp_w[..],
+                     moe.n_ff_shexp)
                 } else {
-                    (&[][..], &[][..], &[][..], 0, 0)
+                    (&[][..], &[][..], &[][..], 0, 0,
+                     &[][..], &[][..], &[][..], &[][..], 0)
                 };
 
             let layer_ref = DeltaNetLayerWeights {
@@ -368,6 +401,11 @@ pub fn forward_pass(
                 moe_down_w,
                 n_expert,
                 n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
             };
 
             hidden = delta_net_layer_forward(
@@ -390,12 +428,17 @@ pub fn forward_pass(
             let layer = &model.full_attn_layers[full_attn_idx];
             full_attn_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used) =
+            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
+                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 if let Some(ref moe) = layer.moe_ffn {
                     (&moe.router_w[..], &moe.gate_up_w[..], &moe.down_w[..],
-                     cfg.expert_count as usize, cfg.expert_used_count as usize)
+                     cfg.expert_count as usize, cfg.expert_used_count as usize,
+                     &moe.shexp_gate_w[..], &moe.shexp_up_w[..],
+                     &moe.shexp_down_w[..], &moe.shexp_gate_inp_w[..],
+                     moe.n_ff_shexp)
                 } else {
-                    (&[][..], &[][..], &[][..], 0, 0)
+                    (&[][..], &[][..], &[][..], 0, 0,
+                     &[][..], &[][..], &[][..], &[][..], 0)
                 };
 
             let layer_ref = FullAttnLayerWeights {
@@ -415,6 +458,11 @@ pub fn forward_pass(
                 moe_down_w,
                 n_expert,
                 n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
             };
 
             let pos = [layer_idx as i32, 0, 0, 0];
@@ -446,6 +494,11 @@ pub fn forward_pass(
                 moe_down_w,
                 n_expert,
                 n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
             );
         }
     }

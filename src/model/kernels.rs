@@ -1038,6 +1038,90 @@ pub fn moe_ffn(
 }
 
 // ---------------------------------------------------------------------------
+// Shared expert FFN (shexp)
+// ---------------------------------------------------------------------------
+
+/// Shared expert dense SwiGLU FFN with a learned sigmoid gate.
+///
+/// Architecture:
+/// 1. `gate_out = input @ shexp_gate_w^T`  → [n_tokens, n_ff_shexp]
+/// 2. `up_out   = input @ shexp_up_w^T`    → [n_tokens, n_ff_shexp]
+/// 3. `swiglu   = silu(gate_out) * up_out`
+/// 4. `ffn_out  = swiglu @ shexp_down_w^T` → [n_tokens, n_embd]
+/// 5. `sig_gate = sigmoid(input @ shexp_gate_inp_w^T)` → [n_tokens]
+/// 6. `output   = sig_gate * ffn_out`
+#[allow(clippy::too_many_arguments)]
+pub fn shared_expert_ffn(
+    input: &[f32],
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_embd: usize,
+    n_ff_shexp: usize,
+    n_tokens: usize,
+) -> Vec<f32> {
+    assert_eq!(input.len(), n_tokens * n_embd);
+    assert_eq!(shexp_gate_w.len(), n_ff_shexp * n_embd);
+    assert_eq!(shexp_up_w.len(), n_ff_shexp * n_embd);
+    assert_eq!(shexp_down_w.len(), n_embd * n_ff_shexp);
+    assert_eq!(shexp_gate_inp_w.len(), n_embd);
+
+    let mut output = vec![0.0f32; n_tokens * n_embd];
+
+    for t in 0..n_tokens {
+        let x = &input[t * n_embd..(t + 1) * n_embd];
+
+        // Gate + up projections
+        let mut gate_out = vec![0.0f32; n_ff_shexp];
+        let mut up_out = vec![0.0f32; n_ff_shexp];
+        for f in 0..n_ff_shexp {
+            let mut g_acc = 0.0f32;
+            let mut u_acc = 0.0f32;
+            for i in 0..n_embd {
+                g_acc += x[i] * shexp_gate_w[f * n_embd + i];
+                u_acc += x[i] * shexp_up_w[f * n_embd + i];
+            }
+            gate_out[f] = g_acc;
+            up_out[f] = u_acc;
+        }
+
+        // SwiGLU: silu(gate) * up
+        let mut ffn_act = vec![0.0f32; n_ff_shexp];
+        for f in 0..n_ff_shexp {
+            let g = gate_out[f];
+            let u = up_out[f];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[f] = g * s * u;
+        }
+
+        // Down projection
+        let mut ffn_out = vec![0.0f32; n_embd];
+        for j in 0..n_embd {
+            let mut acc = 0.0f32;
+            for f in 0..n_ff_shexp {
+                acc += ffn_act[f] * shexp_down_w[j * n_ff_shexp + f];
+            }
+            ffn_out[j] = acc;
+        }
+
+        // Sigmoid gate: sigmoid(x @ gate_inp_w)
+        let mut gate_logit = 0.0f32;
+        for i in 0..n_embd {
+            gate_logit += x[i] * shexp_gate_inp_w[i];
+        }
+        let sig_gate = 1.0f32 / (1.0f32 + (-gate_logit).exp());
+
+        // Gated output
+        for j in 0..n_embd {
+            output[t * n_embd + j] = sig_gate * ffn_out[j];
+        }
+    }
+
+    output
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3c – Full single-layer forward pass (full-attention + dense FFN)
 // ---------------------------------------------------------------------------
 
@@ -1104,6 +1188,12 @@ pub fn full_layer_forward(
     moe_down_w: &[f32],      // [n_expert, n_embd, n_ff]
     n_expert: usize,
     n_expert_used: usize,
+    // Shared expert (shexp)
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_ff_shexp: usize,
 ) -> Vec<f32> {
     let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
 
@@ -1254,10 +1344,10 @@ pub fn full_layer_forward(
         post_normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
     }
 
-    // 11. FFN: dense SwiGLU or MoE
+    // 11. FFN: dense SwiGLU or MoE (+ optional shared expert)
     let ffn_out = if n_expert > 0 {
         // MoE FFN
-        moe_ffn(
+        let mut moe_out = moe_ffn(
             &post_normed,
             moe_router_w,
             moe_gate_up_w,
@@ -1267,7 +1357,24 @@ pub fn full_layer_forward(
             n_expert,
             n_expert_used,
             n_tokens,
-        )
+        );
+        // Shared expert: gated SwiGLU added to MoE output
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_embd,
+                n_ff_shexp,
+                n_tokens,
+            );
+            for i in 0..n_tokens * n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
     } else {
         // Dense SwiGLU FFN: gate, up → silu(gate)*up → down
         // gate = post_normed @ ffn_gate_w^T → [n_tokens, n_ff]
@@ -1392,6 +1499,12 @@ pub struct FullAttnLayerWeights<'a> {
     pub moe_down_w: &'a [f32],
     pub n_expert: usize,
     pub n_expert_used: usize,
+    // Shared expert (shexp) — present when expert_shared_feed_forward_length > 0
+    pub shexp_gate_w: &'a [f32],
+    pub shexp_up_w: &'a [f32],
+    pub shexp_down_w: &'a [f32],
+    pub shexp_gate_inp_w: &'a [f32],
+    pub n_ff_shexp: usize,
 }
 
 /// End-to-end forward pass for a single token through a stack of
@@ -1449,6 +1562,11 @@ pub fn forward_pass_full_attn(
             layer.moe_down_w,
             layer.n_expert,
             layer.n_expert_used,
+            layer.shexp_gate_w,
+            layer.shexp_up_w,
+            layer.shexp_down_w,
+            layer.shexp_gate_inp_w,
+            layer.n_ff_shexp,
         );
     }
 
@@ -1482,6 +1600,12 @@ pub struct DeltaNetLayerWeights<'a> {
     pub moe_down_w: &'a [f32],       // [n_expert, n_embd, n_ff] or empty
     pub n_expert: usize,
     pub n_expert_used: usize,
+    // Shared expert (shexp) — present when expert_shared_feed_forward_length > 0
+    pub shexp_gate_w: &'a [f32],
+    pub shexp_up_w: &'a [f32],
+    pub shexp_down_w: &'a [f32],
+    pub shexp_gate_inp_w: &'a [f32],
+    pub n_ff_shexp: usize,
 }
 
 /// Full delta-net layer forward pass for Qwen3.5 recurrent layers.
@@ -1648,10 +1772,10 @@ pub fn delta_net_layer_forward(
     // 13. Post-attention norm
     let post_normed = rms_norm(&residual1, layer.post_norm_w, eps);
 
-    // 14. FFN: dense SwiGLU or MoE
+    // 14. FFN: dense SwiGLU or MoE (+ optional shared expert)
     let ffn_out = if layer.n_expert > 0 {
         // MoE FFN
-        moe_ffn(
+        let mut moe_out = moe_ffn(
             &post_normed,
             layer.moe_router_w,
             layer.moe_gate_up_w,
@@ -1661,7 +1785,24 @@ pub fn delta_net_layer_forward(
             layer.n_expert,
             layer.n_expert_used,
             1,
-        )
+        );
+        // Shared expert: gated SwiGLU added to MoE output
+        if !layer.shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                layer.shexp_gate_w,
+                layer.shexp_up_w,
+                layer.shexp_down_w,
+                layer.shexp_gate_inp_w,
+                n_embd,
+                layer.n_ff_shexp,
+                1,
+            );
+            for i in 0..n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
     } else {
         // Dense SwiGLU FFN
         let ffn_gate_out = {
@@ -2625,12 +2766,14 @@ mod tests {
                 q_norm_w: &norm_w, k_norm_w: &norm_w,
                 post_norm_w: &norm_w, ffn_gate_w: &fg0, ffn_up_w: &fu0, ffn_down_w: &fd0,
                 moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
+                shexp_gate_w: &[], shexp_up_w: &[], shexp_down_w: &[], shexp_gate_inp_w: &[], n_ff_shexp: 0,
             },
             FullAttnLayerWeights {
                 attn_norm_w: &norm_w, wq: &wq1, wk: &wk1, wv: &wv1, wo: &wo1,
                 q_norm_w: &norm_w, k_norm_w: &norm_w,
                 post_norm_w: &norm_w, ffn_gate_w: &fg1, ffn_up_w: &fu1, ffn_down_w: &fd1,
                 moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
+                shexp_gate_w: &[], shexp_up_w: &[], shexp_down_w: &[], shexp_gate_inp_w: &[], n_ff_shexp: 0,
             },
         ];
 
@@ -2691,6 +2834,11 @@ mod tests {
             moe_down_w: &[],
             n_expert: 0,
             n_expert_used: 0,
+            shexp_gate_w: &[],
+            shexp_up_w: &[],
+            shexp_down_w: &[],
+            shexp_gate_inp_w: &[],
+            n_ff_shexp: 0,
         };
 
         let input: Vec<f32> = (0..n_embd).map(rng).collect();
