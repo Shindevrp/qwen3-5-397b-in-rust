@@ -1194,6 +1194,7 @@ pub fn full_layer_forward(
     shexp_down_w: &[f32],
     shexp_gate_inp_w: &[f32],
     n_ff_shexp: usize,
+    mut kv_cache: Option<KvCacheMut<'_>>,
 ) -> Vec<f32> {
     let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
 
@@ -1298,12 +1299,35 @@ pub fn full_layer_forward(
         }
     }
 
-    // 6. GQA attention
+    // 6. GQA attention (with optional KV cache)
     let scale = 1.0f32 / (head_size as f32).sqrt();
+    let kv_dim = n_kv_heads * head_size;
+
+    // When using cache: write new K,V to cache, then attend over full cache
+    // When no cache: attend over current tokens only (self-attention)
+    let (k_for_attn, v_for_attn, n_kv_for_attn) = if let Some(ref mut cache) = kv_cache {
+        // Write k_cur (n_rope, already RoPE'd) and v_cur to cache
+        let nc = cache.n_cached;
+        for t in 0..n_tokens {
+            let k_src = t * kv_dim;
+            let v_src = t * kv_dim;
+            let k_dst = (nc + t) * kv_dim;
+            let v_dst = (nc + t) * kv_dim;
+            cache.k[k_dst..k_dst + kv_dim].copy_from_slice(&k_rope[k_src..k_src + kv_dim]);
+            cache.v[v_dst..v_dst + kv_dim].copy_from_slice(&v_cur[v_src..v_src + kv_dim]);
+        }
+        let n_kv_total = nc + n_tokens;
+        (cache.k[..n_kv_total * kv_dim].to_vec(),
+         cache.v[..n_kv_total * kv_dim].to_vec(),
+         n_kv_total)
+    } else {
+        (k_rope.clone(), v_cur.clone(), n_tokens)
+    };
+
     let attn_out = attention_forward(
-        &q_rope, &k_rope, &v_cur,
+        &q_rope, &k_for_attn, &v_for_attn,
         n_heads, n_kv_heads, head_size,
-        n_tokens, n_tokens, scale, true,
+        n_tokens, n_kv_for_attn, scale, true,
     );
 
     // 7. Gate sigmoid + multiply
@@ -1479,6 +1503,13 @@ pub fn lm_head_argmax(
     best_id
 }
 
+/// Mutable reference to a layer's KV cache for use during forward pass.
+pub struct KvCacheMut<'a> {
+    pub k: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
+    pub v: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
+    pub n_cached: usize,   // number of positions already cached
+}
+
 /// All weights needed for a single full-attention layer.
 pub struct FullAttnLayerWeights<'a> {
     pub attn_norm_w: &'a [f32],
@@ -1567,6 +1598,7 @@ pub fn forward_pass_full_attn(
             layer.shexp_down_w,
             layer.shexp_gate_inp_w,
             layer.n_ff_shexp,
+            None,
         );
     }
 

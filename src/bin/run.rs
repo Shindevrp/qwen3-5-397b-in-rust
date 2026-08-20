@@ -4,7 +4,7 @@ use std::env;
 use std::path::PathBuf;
 
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
-use qwen3_5_397b_in_rust::model::pipeline::{forward_pass, ModelWeights};
+use qwen3_5_397b_in_rust::model::pipeline::{generate_token, prefill, GenerationState, ModelWeights};
 use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
 
 fn main() -> anyhow::Result<()> {
@@ -48,27 +48,34 @@ fn main() -> anyhow::Result<()> {
     let tokens = tokenizer.encode(&prompt, false)?;
     eprintln!("Input tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
 
-    let mut all_tokens = tokens.clone();
+    let mut state = GenerationState::new(&model);
+
+    // Prefill: process all prompt tokens at once
+    eprintln!("Prefilling {} tokens ...", tokens.len());
+    prefill(&mut state, &tokens, &model);
+
+    // Autoregressive generation with KV cache
     let eot_id: Option<u32> = tokenizer
-        .token_to_id("<|im_end|>")
-        .or_else(|| tokenizer.token_to_id("<|endoftext|>"));
+        .token_to_id("‣")
+        .or_else(|| tokenizer.token_to_id("‘"));
+
+    let mut last_token_id = *tokens.last().unwrap();
+    let mut gen_tokens = Vec::new();
 
     for _step in 0..n_predict {
-        let token_id = *all_tokens.last().unwrap();
-        let (_hidden, next_token) = forward_pass(token_id, &model);
+        let (_hidden, next_token) = generate_token(&mut state, last_token_id, &model);
 
-        all_tokens.push(next_token);
+        gen_tokens.push(next_token);
+        last_token_id = next_token;
 
         if Some(next_token) == eot_id {
             break;
         }
     }
 
-    let gen_len = all_tokens.len() - tokens.len();
-    eprintln!("Generated {gen_len} tokens");
+    eprintln!("Generated {} tokens", gen_tokens.len());
 
-    let new_tokens = &all_tokens[tokens.len()..];
-    let text = tokenizer.decode(new_tokens, true)?;
+    let text = tokenizer.decode(&gen_tokens, true)?;
     print!("{text}");
 
     Ok(())

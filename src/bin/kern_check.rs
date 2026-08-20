@@ -239,6 +239,7 @@ fn main() {
                     1e-6, sections,
                     &[], &[], &[], 0, 0,
                     &[], &[], &[], &[], 0,
+                    None,
                 );
                 assert_eq!(out.len(), n_tokens * n_embd);
                 write_txt(&dir.join(format!("rust_full_layer_{id}.txt")), &out);
