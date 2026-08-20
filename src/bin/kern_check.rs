@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, full_layer_forward, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, delta_net_layer_forward, full_layer_forward, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig, DeltaNetLayerWeights};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
@@ -237,9 +237,67 @@ fn main() {
                     [5, 0, 0, 0], &rope_cfg, &pnw, &fgw, &fuw, &fdw,
                     n_embd, n_heads, n_kv_heads, head_size, n_ff, n_tokens,
                     1e-6, sections,
+                    &[], &[], &[], 0, 0,
                 );
                 assert_eq!(out.len(), n_tokens * n_embd);
                 write_txt(&dir.join(format!("rust_full_layer_{id}.txt")), &out);
+            }
+            "delta_layer" => {
+                let id = f[1];
+                let n_embd: usize = f[2].parse().unwrap();
+                let n_ff: usize = f[3].parse().unwrap();
+                let conv_dim: usize = f[4].parse().unwrap();
+                let conv_kernel: usize = f[5].parse().unwrap();
+                let ba_dim: usize = f[6].parse().unwrap();
+                let s_k: usize = f[7].parse().unwrap();
+                let s_v: usize = f[8].parse().unwrap();
+                let n_heads_k: usize = f[9].parse().unwrap();
+                let n_heads_v: usize = f[10].parse().unwrap();
+
+                let inp = read_f32_file(&dir.join(format!("delta_layer_{id}_inp.bin")), n_embd);
+                let anw = read_f32_file(&dir.join(format!("delta_layer_{id}_anw.bin")), n_embd);
+                let wqkv = read_f32_file(&dir.join(format!("delta_layer_{id}_wqkv.bin")), conv_dim * n_embd);
+                let wg = read_f32_file(&dir.join(format!("delta_layer_{id}_wg.bin")), ba_dim * n_embd);
+                let ck = read_f32_file(&dir.join(format!("delta_layer_{id}_ck.bin")), conv_dim * conv_kernel);
+                let ab = read_f32_file(&dir.join(format!("delta_layer_{id}_ab.bin")), n_heads_v);
+                let sa = read_f32_file(&dir.join(format!("delta_layer_{id}_sa.bin")), n_heads_v);
+                let snw = read_f32_file(&dir.join(format!("delta_layer_{id}_snw.bin")), s_v * n_heads_v);
+                let so = read_f32_file(&dir.join(format!("delta_layer_{id}_so.bin")), n_embd * s_v * n_heads_v);
+                let pnw = read_f32_file(&dir.join(format!("delta_layer_{id}_pnw.bin")), n_embd);
+                let fgw = read_f32_file(&dir.join(format!("delta_layer_{id}_fgw.bin")), n_ff * n_embd);
+                let fuw = read_f32_file(&dir.join(format!("delta_layer_{id}_fuw.bin")), n_ff * n_embd);
+                let fdw = read_f32_file(&dir.join(format!("delta_layer_{id}_fdw.bin")), n_embd * n_ff);
+
+                let mut cs = vec![0.0f32; conv_dim * (conv_kernel - 1)];
+                let mut ss = vec![0.0f32; s_v * s_v * n_heads_v];
+
+                let layer = DeltaNetLayerWeights {
+                    attn_norm_w: &anw,
+                    wqkv: &wqkv,
+                    wqkv_gate: &wg,
+                    conv_kernel: &ck,
+                    alpha_bias: &ab,
+                    ssm_a: &sa,
+                    ssm_norm_w: &snw,
+                    ssm_out: &so,
+                    post_norm_w: &pnw,
+                    ffn_gate_w: &fgw,
+                    ffn_up_w: &fuw,
+                    ffn_down_w: &fdw,
+                    moe_router_w: &[],
+                    moe_gate_up_w: &[],
+                    moe_down_w: &[],
+                    n_expert: 0,
+                    n_expert_used: 0,
+                };
+
+                let out = delta_net_layer_forward(
+                    &inp, &layer, &mut cs, &mut ss,
+                    n_embd, n_ff, conv_dim, conv_kernel, ba_dim,
+                    s_k, s_v, n_heads_k, n_heads_v, 1e-6,
+                );
+                assert_eq!(out.len(), n_embd);
+                write_txt(&dir.join(format!("rust_delta_layer_{id}.txt")), &out);
             }
             other => panic!("spec line {}: unknown directive {other}", lineno + 1),
         }

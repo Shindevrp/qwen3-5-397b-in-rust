@@ -1098,6 +1098,12 @@ pub fn full_layer_forward(
     n_tokens: usize,
     eps: f32,
     rope_sections: [i32; 4],
+    // MoE FFN (empty slices when dense)
+    moe_router_w: &[f32],    // [n_expert, n_embd]
+    moe_gate_up_w: &[f32],   // [n_expert, 2*n_ff, n_embd]
+    moe_down_w: &[f32],      // [n_expert, n_embd, n_ff]
+    n_expert: usize,
+    n_expert_used: usize,
 ) -> Vec<f32> {
     let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
 
@@ -1248,48 +1254,62 @@ pub fn full_layer_forward(
         post_normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
     }
 
-    // 11. Dense SwiGLU FFN: gate, up → silu(gate)*up → down
-    // gate = post_normed @ ffn_gate_w^T → [n_tokens, n_ff]
-    let ffn_gate = {
-        let mut out = vec![0.0f32; n_tokens * n_ff];
-        for t in 0..n_tokens {
-            for f in 0..n_ff {
-                let mut acc = 0.0f32;
-                for i in 0..n_embd {
-                    acc += post_normed[t * n_embd + i] * ffn_gate_w[f * n_embd + i];
+    // 11. FFN: dense SwiGLU or MoE
+    let ffn_out = if n_expert > 0 {
+        // MoE FFN
+        moe_ffn(
+            &post_normed,
+            moe_router_w,
+            moe_gate_up_w,
+            moe_down_w,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+            n_tokens,
+        )
+    } else {
+        // Dense SwiGLU FFN: gate, up → silu(gate)*up → down
+        // gate = post_normed @ ffn_gate_w^T → [n_tokens, n_ff]
+        let ffn_gate = {
+            let mut out = vec![0.0f32; n_tokens * n_ff];
+            for t in 0..n_tokens {
+                for f in 0..n_ff {
+                    let mut acc = 0.0f32;
+                    for i in 0..n_embd {
+                        acc += post_normed[t * n_embd + i] * ffn_gate_w[f * n_embd + i];
+                    }
+                    out[t * n_ff + f] = acc;
                 }
-                out[t * n_ff + f] = acc;
             }
-        }
-        out
-    };
-    // up = post_normed @ ffn_up_w^T → [n_tokens, n_ff]
-    let ffn_up = {
-        let mut out = vec![0.0f32; n_tokens * n_ff];
-        for t in 0..n_tokens {
-            for f in 0..n_ff {
-                let mut acc = 0.0f32;
-                for i in 0..n_embd {
-                    acc += post_normed[t * n_embd + i] * ffn_up_w[f * n_embd + i];
+            out
+        };
+        // up = post_normed @ ffn_up_w^T → [n_tokens, n_ff]
+        let ffn_up = {
+            let mut out = vec![0.0f32; n_tokens * n_ff];
+            for t in 0..n_tokens {
+                for f in 0..n_ff {
+                    let mut acc = 0.0f32;
+                    for i in 0..n_embd {
+                        acc += post_normed[t * n_embd + i] * ffn_up_w[f * n_embd + i];
+                    }
+                    out[t * n_ff + f] = acc;
                 }
-                out[t * n_ff + f] = acc;
             }
-        }
-        out
-    };
-    // SwiGLU
-    let ffn_act = {
-        let mut out = vec![0.0f32; n_tokens * n_ff];
-        for i in 0..n_tokens * n_ff {
-            let g = ffn_gate[i];
-            let u = ffn_up[i];
-            let s = 1.0f32 / (1.0f32 + (-g).exp());
-            out[i] = g * s * u;
-        }
-        out
-    };
-    // down = ffn_act @ ffn_down_w^T → [n_tokens, n_embd]
-    let ffn_out = {
+            out
+        };
+        // SwiGLU
+        let ffn_act = {
+            let mut out = vec![0.0f32; n_tokens * n_ff];
+            for i in 0..n_tokens * n_ff {
+                let g = ffn_gate[i];
+                let u = ffn_up[i];
+                let s = 1.0f32 / (1.0f32 + (-g).exp());
+                out[i] = g * s * u;
+            }
+            out
+        };
+        // down = ffn_act @ ffn_down_w^T → [n_tokens, n_embd]
         let mut out = vec![0.0f32; n_tokens * n_embd];
         for t in 0..n_tokens {
             for j in 0..n_embd {
@@ -1362,9 +1382,16 @@ pub struct FullAttnLayerWeights<'a> {
     pub q_norm_w: &'a [f32],
     pub k_norm_w: &'a [f32],
     pub post_norm_w: &'a [f32],
+    // Dense FFN (when moe is None)
     pub ffn_gate_w: &'a [f32],
     pub ffn_up_w: &'a [f32],
     pub ffn_down_w: &'a [f32],
+    // MoE FFN (when Some)
+    pub moe_router_w: &'a [f32],
+    pub moe_gate_up_w: &'a [f32],
+    pub moe_down_w: &'a [f32],
+    pub n_expert: usize,
+    pub n_expert_used: usize,
 }
 
 /// End-to-end forward pass for a single token through a stack of
@@ -1417,6 +1444,11 @@ pub fn forward_pass_full_attn(
             1, // n_tokens = 1 (single token)
             eps,
             rope_sections,
+            layer.moe_router_w,
+            layer.moe_gate_up_w,
+            layer.moe_down_w,
+            layer.n_expert,
+            layer.n_expert_used,
         );
     }
 
@@ -1440,9 +1472,16 @@ pub struct DeltaNetLayerWeights<'a> {
     pub ssm_norm_w: &'a [f32],       // [s_v * n_heads_v]
     pub ssm_out: &'a [f32],          // [n_embd, s_v * n_heads_v]
     pub post_norm_w: &'a [f32],      // [n_embd]
+    // Dense FFN (when moe is None)
     pub ffn_gate_w: &'a [f32],       // [n_ff, n_embd]
     pub ffn_up_w: &'a [f32],         // [n_ff, n_embd]
     pub ffn_down_w: &'a [f32],       // [n_embd, n_ff]
+    // MoE FFN (when Some)
+    pub moe_router_w: &'a [f32],     // [n_expert, n_embd] or empty
+    pub moe_gate_up_w: &'a [f32],    // [n_expert, 2*n_ff, n_embd] or empty
+    pub moe_down_w: &'a [f32],       // [n_expert, n_embd, n_ff] or empty
+    pub n_expert: usize,
+    pub n_expert_used: usize,
 }
 
 /// Full delta-net layer forward pass for Qwen3.5 recurrent layers.
@@ -1566,16 +1605,10 @@ pub fn delta_net_layer_forward(
     };
 
     // 9. Delta-net autoregressive (per V-head)
-    let b = {
-        let mut b_out = vec![0.0f32; n_heads_v];
-        for v_hi in 0..n_heads_v {
-            b_out[v_hi] = 1.0f32 / (1.0f32 + (-beta[v_hi]).exp());
-        }
-        b_out
-    };
+    // Pass raw beta; delta_net_autoregressive applies sigmoid internally.
     let attn_out = delta_net_autoregressive(
         &q_conv, &k_conv, &v_conv,
-        &decay_gate, &b, ssm_state,
+        &decay_gate, &beta, ssm_state,
         s_k, s_v, n_heads_v, eps,
     );
     // attn_out: [s_v * n_heads_v]
@@ -1615,37 +1648,51 @@ pub fn delta_net_layer_forward(
     // 13. Post-attention norm
     let post_normed = rms_norm(&residual1, layer.post_norm_w, eps);
 
-    // 14. Dense SwiGLU FFN
-    let ffn_gate_out = {
-        let mut out = vec![0.0f32; n_ff];
-        for f in 0..n_ff {
-            let mut acc = 0.0f32;
-            for i in 0..n_embd {
-                acc += post_normed[i] * layer.ffn_gate_w[f * n_embd + i];
+    // 14. FFN: dense SwiGLU or MoE
+    let ffn_out = if layer.n_expert > 0 {
+        // MoE FFN
+        moe_ffn(
+            &post_normed,
+            layer.moe_router_w,
+            layer.moe_gate_up_w,
+            layer.moe_down_w,
+            n_embd,
+            n_ff,
+            layer.n_expert,
+            layer.n_expert_used,
+            1,
+        )
+    } else {
+        // Dense SwiGLU FFN
+        let ffn_gate_out = {
+            let mut out = vec![0.0f32; n_ff];
+            for f in 0..n_ff {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += post_normed[i] * layer.ffn_gate_w[f * n_embd + i];
+                }
+                out[f] = acc;
             }
-            out[f] = acc;
-        }
-        out
-    };
-    let ffn_up_out = {
-        let mut out = vec![0.0f32; n_ff];
-        for f in 0..n_ff {
-            let mut acc = 0.0f32;
-            for i in 0..n_embd {
-                acc += post_normed[i] * layer.ffn_up_w[f * n_embd + i];
+            out
+        };
+        let ffn_up_out = {
+            let mut out = vec![0.0f32; n_ff];
+            for f in 0..n_ff {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += post_normed[i] * layer.ffn_up_w[f * n_embd + i];
+                }
+                out[f] = acc;
             }
-            out[f] = acc;
+            out
+        };
+        let mut ffn_act = vec![0.0f32; n_ff];
+        for i in 0..n_ff {
+            let g = ffn_gate_out[i];
+            let u = ffn_up_out[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[i] = g * s * u;
         }
-        out
-    };
-    let mut ffn_act = vec![0.0f32; n_ff];
-    for i in 0..n_ff {
-        let g = ffn_gate_out[i];
-        let u = ffn_up_out[i];
-        let s = 1.0f32 / (1.0f32 + (-g).exp());
-        ffn_act[i] = g * s * u;
-    }
-    let ffn_out = {
         let mut out = vec![0.0f32; n_embd];
         for j in 0..n_embd {
             let mut acc = 0.0f32;
@@ -2577,11 +2624,13 @@ mod tests {
                 attn_norm_w: &norm_w, wq: &wq0, wk: &wk0, wv: &wv0, wo: &wo0,
                 q_norm_w: &norm_w, k_norm_w: &norm_w,
                 post_norm_w: &norm_w, ffn_gate_w: &fg0, ffn_up_w: &fu0, ffn_down_w: &fd0,
+                moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
             },
             FullAttnLayerWeights {
                 attn_norm_w: &norm_w, wq: &wq1, wk: &wk1, wv: &wv1, wo: &wo1,
                 q_norm_w: &norm_w, k_norm_w: &norm_w,
                 post_norm_w: &norm_w, ffn_gate_w: &fg1, ffn_up_w: &fu1, ffn_down_w: &fd1,
+                moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
             },
         ];
 
@@ -2637,6 +2686,11 @@ mod tests {
             ffn_gate_w: &ffn_gate,
             ffn_up_w: &ffn_up,
             ffn_down_w: &ffn_down,
+            moe_router_w: &[],
+            moe_gate_up_w: &[],
+            moe_down_w: &[],
+            n_expert: 0,
+            n_expert_used: 0,
         };
 
         let input: Vec<f32> = (0..n_embd).map(rng).collect();
