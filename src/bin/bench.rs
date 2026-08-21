@@ -71,9 +71,277 @@ fn time_it<F: FnMut()>(iters: usize, mut f: F) -> f64 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let scale: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--e2e") {
+        e2e_main(&args[1..]);
+    } else {
+        let scale: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+        kernel_main(scale);
+    }
+}
 
+fn usage_e2e() {
+    eprintln!(
+        "Usage: bench --e2e [model.gguf] [options]\n\
+         \n\
+         Benchmarks the full generation pipeline end-to-end.\n\
+         Without a path, a synthetic model is built in-memory.\n\
+         \n\
+         Options:\n\
+         \x20 --preset NAME     tiny | medium (default) | large\n\
+         \x20 --steps N         decode steps per timing run (default 128)\n\
+         \x20 --batches LIST    comma-separated batch sizes (default 1,2,4,8)\n\
+         \x20 --scale N         multiplier for iteration counts"
+    );
+}
+
+/// End-to-end pipeline benchmark: prefill throughput, single-stream decode,
+/// multi-sequence batch scaling, and cache memory footprint.
+fn e2e_main(args: &[String]) {
+    use qwen3_5_397b_in_rust::model::loader::ModelLoader;
+    use qwen3_5_397b_in_rust::model::pipeline::{
+        generate_token, generate_token_batch, prefill, prefill_batch, GenerationState,
+        ModelWeights,
+    };
+    use qwen3_5_397b_in_rust::model::synth::{write_temp, SynthConfig};
+    use std::time::Instant;
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        usage_e2e();
+        return;
+    }
+
+    // ---- parse args ----
+    let mut model_path: Option<String> = None;
+    let mut preset = "medium".to_string();
+    let mut steps = 128usize;
+    let mut batches: Vec<usize> = vec![1, 2, 4, 8];
+    let mut scale = 1usize;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--preset" => {
+                i += 1;
+                preset = args.get(i).cloned().unwrap_or_else(|| "medium".into());
+            }
+            "--steps" => {
+                i += 1;
+                steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(128);
+            }
+            "--batches" => {
+                i += 1;
+                batches = args
+                    .get(i)
+                    .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                    .unwrap_or(vec![1, 2, 4, 8]);
+            }
+            "--scale" => {
+                i += 1;
+                scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            p if !p.starts_with("--") => model_path = Some(p.to_string()),
+            other => {
+                eprintln!("unknown option {other}");
+                usage_e2e();
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let steps = (steps * scale).max(32);
+
+    println!("== Phase 17 end-to-end benchmark ==");
+    println!(
+        "simd available: {}, threads: {}\n",
+        simd::use_simd(),
+        rayon::current_num_threads()
+    );
+
+    // ---- load model ----
+    let _keepalive;
+    let (cfg_summary, weight_bytes): (String, u64);
+    let loader_tmp;
+    let model = match &model_path {
+        Some(path) => {
+            loader_tmp = ModelLoader::open(path).expect("open gguf");
+            let m = ModelWeights::load(&loader_tmp).expect("load weights");
+            weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            _keepalive = None;
+            cfg_summary = String::new();
+            m
+        }
+        None => {
+            let cfg = SynthConfig::preset(&preset)
+                .unwrap_or_else(|| panic!("unknown preset {preset}"));
+            let t0 = Instant::now();
+            let tmp = write_temp(&cfg).expect("build synthetic gguf");
+            println!(
+                "built synthetic '{preset}' model in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
+            loader_tmp = ModelLoader::open(tmp.path()).expect("open gguf");
+            let m = ModelWeights::load(&loader_tmp).expect("load weights");
+            weight_bytes = tmp.as_file().metadata().map(|md| md.len()).unwrap_or(0);
+            _keepalive = Some(tmp);
+            cfg_summary = format!(" ({preset})");
+            m
+        }
+    };
+
+    let c = &model.cfg;
+    let n_ctx = c.context_length as usize;
+    let n_embd = c.embedding_length as usize;
+    let n_vocab = model.output_weight.n_elements / n_embd;
+    let n_attn_layers = (0..c.block_count as usize)
+        .filter(|&l| (l + 1) % c.full_attention_interval as usize == 0)
+        .count();
+
+    println!(
+        "model{}: {} layers ({} full-attn @ every {}), embd {}, heads {}+{}kv (head {}), vocab {}, ctx {}, experts {}",
+        cfg_summary,
+        c.block_count,
+        n_attn_layers,
+        c.full_attention_interval,
+        n_embd,
+        c.attention_head_count,
+        c.attention_head_count_kv,
+        c.attention_key_length,
+        n_vocab,
+        n_ctx,
+        c.expert_count,
+    );
+    println!(
+        "weights: {:.1} MiB   kv-cache: {} B/token/seq (f32 K+V)\n",
+        weight_bytes as f64 / (1024.0 * 1024.0),
+        2 * c.attention_head_count_kv as usize * c.attention_key_length as usize * 4 * n_attn_layers
+    );
+
+    // ---- prefill throughput ----
+    println!("prefill (single sequence):");
+    println!("{:>10} {:>10} {:>12}", "tokens", "ms", "tok/s");
+    for len in [64usize, 256, 1024] {
+        let len = len.min(n_ctx / 2);
+        if len < 8 {
+            continue;
+        }
+        let prompt: Vec<u32> = (0..len).map(|t| (t % n_vocab) as u32).collect();
+        // warmup on a short prefix to fault in caches/mmaps
+        {
+            let mut w = GenerationState::new(&model);
+            prefill(&mut w, &prompt[..len.min(16)], &model).expect("warmup prefill");
+        }
+        let mut state = GenerationState::new(&model);
+        let t0 = Instant::now();
+        prefill(&mut state, &prompt, &model).expect("prefill");
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        println!("{len:>10} {ms:>10.1} {:>12.0}", len as f64 / ms * 1e3);
+    }
+
+    // ---- single-stream decode ----
+    println!("\ndecode (single stream, argmax):");
+    let prompt_len = 32.min(n_ctx / 4);
+    let prompt: Vec<u32> = (0..prompt_len).map(|t| (t % n_vocab) as u32).collect();
+    let mut state = GenerationState::new(&model);
+    prefill(&mut state, &prompt, &model).expect("prefill");
+    let mut last = *prompt.last().unwrap();
+
+    // warmup
+    for _ in 0..16 {
+        let (_h, next) = generate_token(&mut state, last, &model).expect("generate");
+        last = next;
+    }
+    let t0 = Instant::now();
+    for _ in 0..steps {
+        let (_h, next) = generate_token(&mut state, last, &model).expect("generate");
+        last = next;
+    }
+    let decode_ms = t0.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "{steps} steps in {decode_ms:.0} ms -> {:.1} tok/s",
+        steps as f64 / decode_ms * 1e3
+    );
+
+    // ---- batch scaling ----
+    println!("\nbatch decode (lockstep, aggregate throughput):");
+    println!(
+        "{:>7} {:>10} {:>12} {:>9} {:>9}",
+        "batch", "total tok", "agg tok/s", "speedup", "eff"
+    );
+    let b_prompt_len = 16.min(n_ctx / 4).max(1);
+    let mut base_tps = 0.0f64;
+    for &b in &batches {
+        assert!(b_prompt_len + steps <= n_ctx, "batch run exceeds ctx");
+        let prompts: Vec<Vec<u32>> = (0..b)
+            .map(|s| (0..b_prompt_len).map(|t| ((s * 31 + t) % n_vocab) as u32).collect())
+            .collect();
+        let mut states: Vec<GenerationState> =
+            (0..b).map(|_| GenerationState::new(&model)).collect();
+        let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
+        prefill_batch(&mut states, &refs, &model).expect("batch prefill");
+        let mut lasts: Vec<u32> = prompts.iter().map(|p| *p.last().unwrap()).collect();
+
+        // warmup
+        let w_last = generate_token_batch(&mut states, &lasts, &model).expect("warmup");
+        lasts = w_last;
+
+        let total_tokens = b * steps;
+        let t0 = Instant::now();
+        for _ in 0..steps {
+            lasts = generate_token_batch(&mut states, &lasts, &model).expect("batch step");
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let agg_tps = total_tokens as f64 / ms * 1e3;
+        if b == batches[0] || base_tps == 0.0 {
+            base_tps = agg_tps;
+        }
+        let speedup = agg_tps / base_tps;
+        let eff = speedup / b as f64;
+        println!("{b:>7} {total_tokens:>10} {agg_tps:>12.0} {:>8.2}x {:>8.1}", speedup, eff);
+    }
+
+    // ---- memory footprint ----
+    fn state_bytes(state: &GenerationState) -> usize {
+        let kv: usize = state
+            .kv_caches
+            .iter()
+            .map(|c| (c.k.len() + c.v.len()) * 4)
+            .sum();
+        let conv: usize = state.conv_states.iter().map(|v| v.len() * 4).sum();
+        let ssm: usize = state.ssm_states.iter().map(|v| v.len() * 4).sum();
+        kv + conv + ssm
+    }
+
+    println!("\nper-sequence state footprint:");
+    let empty = GenerationState::new(&model);
+    println!(
+        "  fresh:      {:>8.2} MiB (kv capacity {} tokens/layer)",
+        state_bytes(&empty) as f64 / (1024.0 * 1024.0),
+        empty.kv_caches.first().map(|c| c.k.len()).unwrap_or(0)
+            / (c.attention_head_count_kv as usize * c.attention_key_length as usize).max(1)
+    );
+    let filled_prompt: Vec<u32> = (0..1024.min(n_ctx / 2)).map(|t| (t % n_vocab) as u32).collect();
+    let mut filled = GenerationState::new(&model);
+    prefill(&mut filled, &filled_prompt, &model).expect("prefill");
+    println!(
+        "  after {} tokens: {:>8.2} MiB (pos {})",
+        filled.pos,
+        state_bytes(&filled) as f64 / (1024.0 * 1024.0),
+        filled.pos
+    );
+    println!(
+        "  projected @ full ctx {}: ~{:.1} MiB/sequence (kv only)",
+        n_ctx,
+        (2 * c.attention_head_count_kv as usize
+            * c.attention_key_length as usize
+            * 4
+            * n_attn_layers
+            * n_ctx) as f64
+            / (1024.0 * 1024.0)
+    );
+}
+
+/// Phase 14 kernel micro-benchmarks: scalar vs SIMD on synthetic K-blocks.
+fn kernel_main(scale: usize) {
     println!("== Phase 14 kernel benchmark ==");
     println!(
         "simd available: {} (avx2+fma or NEON), forced-scalar runs use force_scalar(true)\n",

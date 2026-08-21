@@ -5,3 +5,4 @@ pub mod pipeline;
 pub mod quant;
 pub mod sampler;
 pub mod simd;
+pub mod synth;
