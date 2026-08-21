@@ -314,10 +314,12 @@ fn dequantize_q6_k(block: &[u8]) -> [f32; QK_K] {
             let q2 = i32::from(ql[l + 32] & 0x0F) | (i32::from((qh[l] >> 2) & 0x03) << 4);
             let q3 = i32::from(ql[l] >> 4) | (i32::from((qh[l] >> 4) & 0x03) << 4);
             let q4 = i32::from(ql[l + 32] >> 4) | (i32::from((qh[l] >> 6) & 0x03) << 4);
-            out[n * 128 + l] = d * f32::from(sc[is]) * (q1 - 32) as f32;
-            out[n * 128 + l + 32] = d * f32::from(sc[is + 2]) * (q2 - 32) as f32;
-            out[n * 128 + l + 64] = d * f32::from(sc[is + 4]) * (q3 - 32) as f32;
-            out[n * 128 + l + 96] = d * f32::from(sc[is + 6]) * (q4 - 32) as f32;
+            // Q6_K scales are SIGNED int8 in ggml (block_q6_K.scales), unlike
+            // the 6-bit unsigned scales of Q4_K/Q5_K.
+            out[n * 128 + l] = d * f32::from(sc[is] as i8) * (q1 - 32) as f32;
+            out[n * 128 + l + 32] = d * f32::from(sc[is + 2] as i8) * (q2 - 32) as f32;
+            out[n * 128 + l + 64] = d * f32::from(sc[is + 4] as i8) * (q3 - 32) as f32;
+            out[n * 128 + l + 96] = d * f32::from(sc[is + 6] as i8) * (q4 - 32) as f32;
         }
     }
     out
@@ -498,6 +500,15 @@ mod tests {
         assert_eq!(out[64], 3.0 * 2.0 * 16.0);
         // q4 = (ql[32]>>4=0 | (0xff>>6 &3)<<4) = 48 -> 16
         assert_eq!(out[96], 3.0 * 2.0 * 16.0);
+
+        // Scales are SIGNED int8: byte 0x81 = -127, not +129.
+        let mut block = vec![0u8; 210];
+        block[208..210].copy_from_slice(&le16(1.0));
+        for b in block[192..208].iter_mut() {
+            *b = 0x81;
+        }
+        let out = dequantize_q6_k(&block);
+        assert!(out.iter().all(|&v| v == -127.0 * -32.0));
     }
 
     #[test]
