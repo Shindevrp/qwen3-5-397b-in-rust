@@ -21,6 +21,18 @@ pub const QK8_0: usize = 32;
 /// The sum of squares accumulates in f64 exactly like ggml's `ggml_float`;
 /// `mean` and `scale` are computed in f32.
 pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::rms_norm(x, w, eps) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::rms_norm(x, w, eps) };
+    }
+    rms_norm_scalar(x, w, eps)
+}
+
+pub(crate) fn rms_norm_scalar(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     assert_eq!(x.len(), w.len(), "rms_norm weights must match input length");
     let n = x.len();
     let mut sum = 0.0f64;
@@ -99,8 +111,21 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Vec<u8> {
 
 // ---- vec_dot: scalar ports of the `*_generic` functions in quants.c ---------
 
-/// `ggml_vec_dot_q8_0_q8_0_generic`.
+/// `ggml_vec_dot_q8_0_q8_0_generic` (scalar reference) with an AVX2/NEON
+/// fast path. The integer core is exact on both paths.
 pub fn vec_dot_q8_0_q8_0(n: usize, x: &[u8], y: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::vec_dot_q8_0_q8_0(n, x, y) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::vec_dot_q8_0_q8_0(n, x, y) };
+    }
+    vec_dot_q8_0_q8_0_scalar(n, x, y)
+}
+
+pub(crate) fn vec_dot_q8_0_q8_0_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     assert!(n.is_multiple_of(QK8_0));
     let nb = n / QK8_0;
     let mut sumf = 0.0f32;
@@ -118,8 +143,21 @@ pub fn vec_dot_q8_0_q8_0(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// `ggml_vec_dot_q4_K_q8_K_generic`.
+/// `ggml_vec_dot_q4_K_q8_K_generic` (scalar reference) with an AVX2/NEON
+/// fast path.
 pub fn vec_dot_q4_k_q8_k(n: usize, x: &[u8], y: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::vec_dot_q4_k_q8_k(n, x, y) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::vec_dot_q4_k_q8_k(n, x, y) };
+    }
+    vec_dot_q4_k_q8_k_scalar(n, x, y)
+}
+
+pub(crate) fn vec_dot_q4_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     assert!(n.is_multiple_of(QK_K));
     let nb = n / QK_K;
     let mut sumf = 0.0f32;
@@ -190,8 +228,21 @@ pub fn vec_dot_q4_k_q8_k(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// `ggml_vec_dot_q5_K_q8_K_generic`.
+/// `ggml_vec_dot_q5_K_q8_K_generic` (scalar reference) with an AVX2/NEON
+/// fast path.
 pub fn vec_dot_q5_k_q8_k(n: usize, x: &[u8], y: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::vec_dot_q5_k_q8_k(n, x, y) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::vec_dot_q5_k_q8_k(n, x, y) };
+    }
+    vec_dot_q5_k_q8_k_scalar(n, x, y)
+}
+
+pub(crate) fn vec_dot_q5_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     assert!(n.is_multiple_of(QK_K));
     let nb = n / QK_K;
     let mut sumf = 0.0f32;
@@ -267,8 +318,21 @@ pub fn vec_dot_q5_k_q8_k(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// `ggml_vec_dot_q6_K_q8_K_generic`.
+/// `ggml_vec_dot_q6_K_q8_K_generic` (scalar reference) with an AVX2/NEON
+/// fast path.
 pub fn vec_dot_q6_k_q8_k(n: usize, x: &[u8], y: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::vec_dot_q6_k_q8_k(n, x, y) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::vec_dot_q6_k_q8_k(n, x, y) };
+    }
+    vec_dot_q6_k_q8_k_scalar(n, x, y)
+}
+
+pub(crate) fn vec_dot_q6_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     assert!(n.is_multiple_of(QK_K));
     let nb = n / QK_K;
     let mut sumf = 0.0f32;
@@ -336,6 +400,9 @@ pub fn gemv(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Res
     let mut out = Vec::with_capacity(n_out);
     match ty {
         GGmlType::F32 => {
+            // Byte→f32 conversion is nearly free on little-endian x86/aarch64
+            // (a plain load), so a scalar pass beats any scheme that
+            // materializes a decoded copy of the whole matrix first.
             for r in 0..n_out {
                 let row = &w[r * row_bytes..(r + 1) * row_bytes];
                 let mut sum = 0.0f32;
@@ -397,6 +464,7 @@ pub fn gemm(
     let mut out = vec![0.0f32; n_out * n_batch];
     match ty {
         GGmlType::F32 => {
+            // See gemv: scalar byte-walk beats materializing a decoded copy.
             for b in 0..n_batch {
                 let xb = &x[b * n_in..(b + 1) * n_in];
                 for r in 0..n_out {
@@ -739,9 +807,12 @@ pub fn rope_multi_imrope(
     let mut theta_w = pos[2] as f32;
     let mut theta_e = pos[3] as f32;
 
-    let mut cache = vec![0f32; ne0];
+    // Deinterleaved cos/sin caches for the rotated channels (SIMD-friendly).
+    let n_offset = n_dims / 2;
+    let mut cos_v = vec![0f32; n_offset];
+    let mut sin_v = vec![0f32; n_offset];
     let mut i0 = 0usize;
-    while i0 < ne0 {
+    while i0 < 2 * n_offset {
         let sector = (i0 as i32 / 2) % sect_dims;
         let theta = if sector % 3 == 1 && sector < 3 * sections[1] {
             theta_h
@@ -753,8 +824,8 @@ pub fn rope_multi_imrope(
             theta_e
         };
         let (c, s) = rope_yarn(theta, cfg.freq_scale, corr, i0, cfg.ext_factor, cfg.attn_factor);
-        cache[i0] = c;
-        cache[i0 + 1] = s;
+        cos_v[i0 / 2] = c;
+        sin_v[i0 / 2] = s;
 
         theta_t *= theta_scale;
         theta_w *= theta_scale;
@@ -764,18 +835,7 @@ pub fn rope_multi_imrope(
     }
 
     let mut out = x.to_vec();
-    let n_offset = n_dims / 2;
-    let mut i0 = 0usize;
-    while i0 < n_dims {
-        let ic = i0 / 2;
-        let x0 = x[ic];
-        let x1 = x[ic + n_offset];
-        let cos = cache[i0];
-        let sin = cache[i0 + 1];
-        out[ic] = x0 * cos - x1 * sin;
-        out[ic + n_offset] = x0 * sin + x1 * cos;
-        i0 += 2;
-    }
+    crate::model::simd::rotate_halves(x, &cos_v, &sin_v, &mut out, n_offset);
     out
 }
 
@@ -786,9 +846,23 @@ pub fn rope_multi_imrope(
 /// SwiGLU activation: `out[i] = silu(gate[i]) * up[i]`.
 ///
 /// Port of `ggml_swiglu_split` for the common case where gate and up are
-/// already separate tensors (Qwen3.5 MoE path).
+/// already separate tensors (Qwen3.5 MoE path). AVX2/NEON fast path uses a
+/// polynomial vectorized expf.
 #[inline]
 pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::x86::swiglu(gate, up) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::model::simd::use_simd() {
+        return unsafe { crate::model::simd::arm::swiglu(gate, up) };
+    }
+    swiglu_scalar(gate, up)
+}
+
+#[inline]
+pub(crate) fn swiglu_scalar(gate: &[f32], up: &[f32]) -> Vec<f32> {
     assert_eq!(gate.len(), up.len(), "swiglu: gate and up must have same length");
     gate.iter().zip(up.iter()).map(|(&g, &u)| {
         let s = 1.0 / (1.0 + (-g).exp());
