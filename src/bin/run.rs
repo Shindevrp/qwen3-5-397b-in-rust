@@ -15,6 +15,7 @@ use qwen3_5_397b_in_rust::model::pipeline::{
 };
 use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
 use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
+use qwen3_5_397b_in_rust::tokenizer::StreamingDecoder;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -229,6 +230,8 @@ fn chat_loop(
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
         let mut sample_history = tokens.clone();
+        let mut stream = StreamingDecoder::new(tokenizer);
+        let mut stdout = std::io::stdout();
 
         for _step in 0..n_predict {
             let token = if use_argmax {
@@ -243,14 +246,21 @@ fn chat_loop(
             sample_history.push(token);
             last_token_id = token;
 
+            // Stream the response as it is generated.
+            {
+                let chunk = stream.push(token)?;
+                print!("{chunk}");
+                stdout.flush()?;
+            }
+
             if stop_ids.contains(&token) {
                 break;
             }
         }
+        println!();
 
-        // skip_special_tokens strips <|im_end|> but keeps literal <think> text.
+        // Full text for history (stream may have withheld a partial char).
         let text = tokenizer.decode(&gen_tokens, true)?;
-        println!("{text}");
         history.push(Message::assistant(text));
     }
 
@@ -280,24 +290,29 @@ fn run_completion(
     if use_argmax {
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
+        let mut stream = StreamingDecoder::new(tokenizer);
+        let mut stdout = std::io::stdout();
 
         for _step in 0..n_predict {
             let (_hidden, next_token) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
             gen_tokens.push(next_token);
             last_token_id = next_token;
 
+            let chunk = stream.push(next_token)?;
+            print!("{chunk}");
+            stdout.flush()?;
+
             if stop_ids.contains(&next_token) {
                 break;
             }
         }
-
-        eprintln!("Generated {} tokens (greedy)", gen_tokens.len());
-        let text = tokenizer.decode(&gen_tokens, true)?;
-        print!("{text}");
+        println!();
     } else {
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
         let mut history: Vec<u32> = tokens.clone();
+        let mut stream = StreamingDecoder::new(tokenizer);
+        let mut stdout = std::io::stdout();
 
         eprintln!(
             "Sampling: temp={:.2} top_k={} top_p={:.2} repeat_penalty={:.1}",
@@ -314,14 +329,15 @@ fn run_completion(
             history.push(token);
             last_token_id = token;
 
+            let chunk = stream.push(token)?;
+            print!("{chunk}");
+            stdout.flush()?;
+
             if stop_ids.contains(&token) {
                 break;
             }
         }
-
-        eprintln!("Generated {} tokens", gen_tokens.len());
-        let text = tokenizer.decode(&gen_tokens, true)?;
-        print!("{text}");
+        println!();
     }
 
     Ok(())

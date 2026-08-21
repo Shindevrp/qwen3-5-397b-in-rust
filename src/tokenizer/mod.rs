@@ -41,6 +41,50 @@ impl QwenTokenizer {
     }
 }
 
+/// Incremental decoder for streaming generation.
+///
+/// Keeps every generated id, re-decodes the full sequence on each `push`,
+/// and returns only the text not yet returned. A trailing U+FFFD (from an
+/// incomplete multi-byte UTF-8 sequence split across tokens) is withheld
+/// until more bytes complete it, so partial characters never reach stdout.
+pub struct StreamingDecoder<'a> {
+    tokenizer: &'a QwenTokenizer,
+    ids: Vec<u32>,
+    /// Number of chars of the decoded string already handed out.
+    printed_chars: usize,
+}
+
+impl<'a> StreamingDecoder<'a> {
+    pub fn new(tokenizer: &'a QwenTokenizer) -> Self {
+        Self { tokenizer, ids: Vec::new(), printed_chars: 0 }
+    }
+
+    /// Feed one generated token; returns the new text chunk to display
+    /// (possibly empty while a multi-byte character is still incomplete).
+    pub fn push(&mut self, id: u32) -> Result<String> {
+        self.ids.push(id);
+        let full = self.tokenizer.decode(&self.ids, true)?;
+
+        let total_chars = full.chars().count();
+        // Withhold a trailing replacement char: the underlying bytes are an
+        // incomplete UTF-8 sequence that the next token may complete.
+        let available = if full.chars().last() == Some('\u{FFFD}') {
+            total_chars.saturating_sub(1)
+        } else {
+            total_chars
+        };
+
+        if available <= self.printed_chars {
+            return Ok(String::new());
+        }
+
+        let chunk: String =
+            full.chars().skip(self.printed_chars).take(available - self.printed_chars).collect();
+        self.printed_chars = available;
+        Ok(chunk)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +228,54 @@ mod tests {
 
         let ids = tok.encode("图文", false).unwrap();
         assert_eq!(ids, vec![img_id, vid_id]);
+    }
+
+    /// Tokenizer whose vocab covers "hello world" plus a special EOS token.
+    fn streaming_tok() -> QwenTokenizer {
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "model": {
+                "type": "WordLevel",
+                "unk_token": "<|endoftext|>",
+                "vocab": {
+                    "<|endoftext|>": 0,
+                    "hello": 1,
+                    "world": 2
+                }
+            },
+            "post_processor": null,
+            "decoder": null
+        }"#;
+        let f = write_temp_tokenizer(tokenizer_json);
+        QwenTokenizer::from_file(f.path()).unwrap()
+    }
+
+    #[test]
+    fn streaming_decoder_increments() {
+        let tok = streaming_tok();
+        let mut sd = StreamingDecoder::new(&tok);
+
+        assert_eq!(sd.push(1).unwrap(), "hello");
+        assert_eq!(sd.push(2).unwrap(), " world");
+        // Re-decoding yields no duplicate output for repeated pushes.
+        assert_eq!(sd.push(2).unwrap(), " world");
+    }
+
+    #[test]
+    fn streaming_decoder_skips_special_tokens() {
+        let tok = streaming_tok();
+        let mut sd = StreamingDecoder::new(&tok);
+
+        assert_eq!(sd.push(1).unwrap(), "hello");
+        // Special token is stripped by skip_special_tokens=true → empty chunk.
+        assert_eq!(sd.push(0).unwrap(), "");
+        assert_eq!(sd.push(2).unwrap(), " world");
     }
 }
