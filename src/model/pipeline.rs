@@ -1352,9 +1352,64 @@ fn moe_fields_full(
          dq(&moe.shexp_gate_w), dq(&moe.shexp_up_w), dq(&moe.shexp_down_w),
          dq(&moe.shexp_gate_inp_w), moe.n_ff_shexp)
     } else {
-        (vec![], vec![], vec![], 0, 0,
-         vec![], vec![], vec![], vec![], 0)
+    (vec![], vec![], vec![], 0, 0,
+     vec![], vec![], vec![], vec![], 0)
     }
+}
+
+// ---- Phase 15: batch inference ---------------------------------------------
+//
+// Sequences are fully independent (each owns its GenerationState), so the
+// whole forward pass runs per-sequence under rayon. Nested parallelism is
+// fine: rayon's work-stealing interleaves the per-layer expert/dequant jobs
+// of different sequences on the same pool instead of oversubscribing.
+
+/// Prefill multiple independent sequences in parallel.
+///
+/// `states[i]` is advanced by `prompts[i]`; returns the final hidden state
+/// of each sequence. Errors if ANY sequence would overflow its context.
+pub fn prefill_batch(
+    states: &mut [GenerationState],
+    prompts: &[&[u32]],
+    model: &ModelWeights,
+) -> Result<Vec<Vec<f32>>, String> {
+    assert_eq!(states.len(), prompts.len(), "one state per prompt required");
+    use rayon::prelude::*;
+    states
+        .par_iter_mut()
+        .zip(prompts.par_iter())
+        .map(|(state, tokens)| prefill(state, tokens, model))
+        .collect()
+}
+
+/// One greedy decode step for every sequence, in parallel.
+pub fn generate_token_batch(
+    states: &mut [GenerationState],
+    last_tokens: &[u32],
+    model: &ModelWeights,
+) -> Result<Vec<u32>, String> {
+    assert_eq!(states.len(), last_tokens.len());
+    use rayon::prelude::*;
+    states
+        .par_iter_mut()
+        .zip(last_tokens.par_iter())
+        .map(|(state, &tok)| generate_token(state, tok, model).map(|(_, next)| next))
+        .collect()
+}
+
+/// One decode step returning full logits for every sequence (for sampling).
+pub fn generate_token_logits_batch(
+    states: &mut [GenerationState],
+    last_tokens: &[u32],
+    model: &ModelWeights,
+) -> Result<Vec<Vec<f32>>, String> {
+    assert_eq!(states.len(), last_tokens.len());
+    use rayon::prelude::*;
+    states
+        .par_iter_mut()
+        .zip(last_tokens.par_iter())
+        .map(|(state, &tok)| generate_token_logits(state, tok, model).map(|(_, logits)| logits))
+        .collect()
 }
 
 #[cfg(test)]

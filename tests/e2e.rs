@@ -5,7 +5,7 @@ use qwen3_5_397b_in_rust::gguf::writer::{GgufBuilder, TensorSpec};
 use qwen3_5_397b_in_rust::gguf::{GGmlType, Value};
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, prefill, GenerationState, ModelWeights,
+    generate_token, generate_token_batch, prefill, prefill_batch, GenerationState, ModelWeights,
 };
 use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
 
@@ -355,4 +355,84 @@ fn e2e_sampling() {
 
     assert_eq!(generated.len(), 20);
     println!("Sampled tokens: {generated:?}");
+}
+
+/// Load the tiny synthetic model from an in-memory GGUF.
+fn load_tiny_model() -> (tempfile::NamedTempFile, ModelWeights) {
+    let cfg = TinyConfig::small();
+    let gguf_bytes = build_tiny_gguf(&cfg);
+    let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+    tmp.as_file().write_all(&gguf_bytes).expect("write gguf");
+    tmp.as_file().sync_all().expect("sync");
+    let loader = ModelLoader::open(tmp.path()).expect("open gguf");
+    let model = ModelWeights::load(&loader).expect("load weights");
+    (tmp, model)
+}
+
+#[test]
+fn e2e_batch_matches_sequential() {
+    let (_tmp, model) = load_tiny_model();
+
+    // Distinct prompts of different lengths.
+    let prompts: Vec<Vec<u32>> = vec![vec![0], vec![1, 2], vec![3, 4, 5, 6]];
+
+    // Sequential reference: greedy decode each sequence one at a time.
+    let mut sequential = Vec::new();
+    for p in &prompts {
+        let mut state = GenerationState::new(&model);
+        prefill(&mut state, p, &model).expect("prefill");
+        let mut last = *p.last().unwrap();
+        let mut seq_gen = Vec::new();
+        for _ in 0..8 {
+            let (_h, next) = generate_token(&mut state, last, &model).expect("generate");
+            seq_gen.push(next);
+            last = next;
+        }
+        sequential.push(seq_gen);
+    }
+
+    // Batch: prefill + lockstep greedy decode.
+    let mut states: Vec<GenerationState> =
+        prompts.iter().map(|_| GenerationState::new(&model)).collect();
+    let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
+    prefill_batch(&mut states, &refs, &model).expect("prefill_batch");
+
+    let mut last_tokens: Vec<u32> = prompts.iter().map(|v| *v.last().unwrap()).collect();
+    let mut batched: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    for _step in 0..8 {
+        let next =
+            generate_token_batch(&mut states, &last_tokens, &model).expect("generate_batch");
+        for (j, &t) in next.iter().enumerate() {
+            batched[j].push(t);
+        }
+        last_tokens = next;
+    }
+
+    assert_eq!(batched, sequential, "batch output must match sequential");
+
+    // Positions advanced identically too.
+    for (state, p) in states.iter().zip(&prompts) {
+        assert_eq!(state.pos, p.len() + 8);
+    }
+}
+
+#[test]
+fn e2e_batch_overflow_is_an_error() {
+    // Tiny context so a long prompt overflows.
+    let mut cfg = TinyConfig::small();
+    cfg.context_length = 8;
+    let gguf_bytes = build_tiny_gguf(&cfg);
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    tmp.as_file().write_all(&gguf_bytes).expect("write");
+    tmp.as_file().sync_all().expect("sync");
+
+    let loader = ModelLoader::open(tmp.path()).expect("open");
+    let model = ModelWeights::load(&loader).expect("load");
+
+    let prompts: Vec<Vec<u32>> = vec![vec![0, 1], vec![2, 3, 4, 5, 6, 7, 8, 9, 10]];
+    let mut states: Vec<GenerationState> =
+        prompts.iter().map(|_| GenerationState::new(&model)).collect();
+    let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
+    let err = prefill_batch(&mut states, &refs, &model).unwrap_err();
+    assert!(err.contains("context overflow"), "{err}");
 }

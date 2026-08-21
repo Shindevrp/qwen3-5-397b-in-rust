@@ -1,17 +1,20 @@
 //! End-to-end inference: load GGUF + tokenizer, encode prompt, generate tokens with sampling.
 //!
-//! Two modes:
+//! Three modes:
 //! - raw completion (default): encode the prompt as-is
 //! - interactive chat (`--chat`): Qwen3.5 ChatML template with multi-turn history
+//! - batch (`--batch FILE`): one prompt per line, sequences run in parallel
 
 use std::env;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use qwen3_5_397b_in_rust::chat::{render_chat, ChatRenderOptions, Message, Role};
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, generate_token_logits, prefill, GenerationState, ModelWeights,
+    generate_token, generate_token_batch, generate_token_logits, generate_token_logits_batch,
+    prefill, prefill_batch, GenerationState, ModelWeights,
 };
 use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
 use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
@@ -32,6 +35,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("  --chat             Interactive multi-turn chat (Qwen3.5 template)");
         eprintln!("  --system TEXT      System prompt (chat mode)");
         eprintln!("  --no-think         Disable thinking mode (chat mode)");
+        eprintln!("Batch mode:");
+        eprintln!("  --batch FILE       One prompt per line; sequences run in parallel");
         std::process::exit(1);
     }
 
@@ -45,6 +50,7 @@ fn main() -> anyhow::Result<()> {
     let mut chat_mode = false;
     let mut system_prompt: Option<String> = None;
     let mut enable_thinking = true;
+    let mut batch_file: Option<PathBuf> = None;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -93,6 +99,12 @@ fn main() -> anyhow::Result<()> {
             "--no-think" => {
                 enable_thinking = false;
             }
+            "--batch" => {
+                i += 1;
+                if i < args.len() {
+                    batch_file = Some(PathBuf::from(&args[i]));
+                }
+            }
             other if prompt.is_empty() && !chat_mode => {
                 prompt = other.to_string();
             }
@@ -116,6 +128,29 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter_map(|t| tokenizer.token_to_id(t))
         .collect();
+
+    if let Some(path) = batch_file {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        let prompts: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        if prompts.is_empty() {
+            anyhow::bail!("batch file {} has no prompts", path.display());
+        }
+        return run_batch(
+            &model,
+            &tokenizer,
+            &prompts,
+            &cfg,
+            n_predict,
+            use_argmax,
+            &stop_ids,
+        );
+    }
 
     if chat_mode {
         chat_loop(
@@ -339,6 +374,117 @@ fn run_completion(
         }
         println!();
     }
+
+    Ok(())
+}
+
+/// Phase 15: batch inference — prefill and decode multiple independent
+/// sequences in parallel (rayon over per-sequence `GenerationState`s).
+///
+/// Sequences that hit a stop token leave the batch immediately (lockstep
+/// steps shrink as sequences finish). Output is printed once per sequence.
+fn run_batch(
+    model: &ModelWeights,
+    tokenizer: &QwenTokenizer,
+    prompts: &[String],
+    cfg: &SamplerConfig,
+    n_predict: usize,
+    use_argmax: bool,
+    stop_ids: &[u32],
+) -> anyhow::Result<()> {
+    let max_ctx = model.cfg.context_length as usize;
+
+    // Encode all prompts up-front; skip ones that cannot fit.
+    let mut token_prompts: Vec<Vec<u32>> = Vec::new();
+    for (i, p) in prompts.iter().enumerate() {
+        let tokens = tokenizer.encode(p, false)?;
+        if tokens.len() + n_predict > max_ctx {
+            eprintln!(
+                "[seq {i}] skipped: {} tokens + {n_predict} > context {max_ctx}",
+                tokens.len()
+            );
+            continue;
+        }
+        token_prompts.push(tokens);
+    }
+    if token_prompts.is_empty() {
+        anyhow::bail!("no prompts fit the context window");
+    }
+    let n_total = token_prompts.len();
+
+    // One state per sequence; prefill all of them in parallel.
+    let t0 = Instant::now();
+    let mut states: Vec<GenerationState> =
+        (0..n_total).map(|_| GenerationState::new(model)).collect();
+    let prompt_refs: Vec<&[u32]> = token_prompts.iter().map(|v| v.as_slice()).collect();
+    prefill_batch(&mut states, &prompt_refs, model).map_err(|e| anyhow::anyhow!(e))?;
+    let prefill_ms = t0.elapsed().as_millis();
+    eprintln!("[batch] prefilled {n_total} sequences in {prefill_ms} ms");
+
+    // Parallel slot arrays; `order[j]` is the original sequence index of slot j.
+    let mut order: Vec<usize> = (0..n_total).collect();
+    let mut last_tokens: Vec<u32> =
+        token_prompts.iter().map(|v| *v.last().unwrap()).collect();
+    let mut histories: Vec<Vec<u32>> = token_prompts.clone();
+    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); n_total];
+
+    let t1 = Instant::now();
+    let mut total_tokens = 0usize;
+    for _step in 0..n_predict {
+        if states.is_empty() {
+            break;
+        }
+
+        // One lockstep decode step across every active sequence.
+        let step_tokens: Vec<u32> = if use_argmax {
+            generate_token_batch(&mut states, &last_tokens, model)
+                .map_err(|e| anyhow::anyhow!(e))?
+        } else {
+            let logits = generate_token_logits_batch(&mut states, &last_tokens, model)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            logits
+                .iter()
+                .zip(&histories)
+                .map(|(lg, h)| sample(lg, cfg, h))
+                .collect()
+        };
+
+        // Record outputs; retire finished sequences via swap_remove so the
+        // next step only pays for the survivors. A swapped-in element is
+        // re-examined because `j` does not advance on removal.
+        let mut j = 0;
+        while j < states.len() {
+            let tok = step_tokens[j];
+            histories[j].push(tok);
+            generated[order[j]].push(tok);
+            total_tokens += 1;
+
+            if stop_ids.contains(&tok) {
+                states.swap_remove(j);
+                last_tokens.swap_remove(j);
+                histories.swap_remove(j);
+                order.swap_remove(j);
+            } else {
+                last_tokens[j] = tok;
+                j += 1;
+            }
+        }
+    }
+    let decode_ms = t1.elapsed().as_millis();
+    let secs = decode_ms as f64 / 1000.0;
+
+    println!();
+    for (i, toks) in generated.iter().enumerate() {
+        let text = tokenizer.decode(toks, true)?;
+        println!("[seq {i}] {}", text.trim());
+    }
+    eprintln!(
+        "[batch] {} sequences, {} tokens decoded in {} ms ({:.1} tok/s aggregate)",
+        n_total,
+        total_tokens,
+        decode_ms,
+        if secs > 0.0 { total_tokens as f64 / secs } else { f64::INFINITY }
+    );
 
     Ok(())
 }
