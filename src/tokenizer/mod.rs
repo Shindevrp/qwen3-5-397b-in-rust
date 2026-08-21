@@ -68,7 +68,7 @@ impl<'a> StreamingDecoder<'a> {
         let total_chars = full.chars().count();
         // Withhold a trailing replacement char: the underlying bytes are an
         // incomplete UTF-8 sequence that the next token may complete.
-        let available = if full.chars().last() == Some('\u{FFFD}') {
+        let available = if full.ends_with('\u{FFFD}') {
             total_chars.saturating_sub(1)
         } else {
             total_chars
