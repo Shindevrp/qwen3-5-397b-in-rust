@@ -622,20 +622,56 @@ pub fn forward_pass(
 // ---------------------------------------------------------------------------
 
 /// Per-layer KV cache for full-attention layers.
+///
+/// Memory is paged: only `capacity_tokens` positions are allocated up front
+/// (a small window, not the full context). `ensure_capacity` grows the
+/// allocation geometrically as generation proceeds, so memory tracks actual
+/// usage instead of `context_length`.
 pub struct LayerKvCache {
-    pub k: Vec<f32>,  // [n_ctx, n_kv_heads * head_size]
-    pub v: Vec<f32>,  // [n_ctx, n_kv_heads * head_size]
+    pub k: Vec<f32>,  // [capacity_tokens, n_kv_heads * head_size]
+    pub v: Vec<f32>,  // [capacity_tokens, n_kv_heads * head_size]
     pub n_used: usize, // number of positions currently in use
+    capacity_tokens: usize,
+    kv_dim: usize,
 }
+
+/// Initial per-layer KV allocation (tokens). Grown on demand.
+pub const KV_INITIAL_CAPACITY_TOKENS: usize = 1024;
 
 impl LayerKvCache {
     pub fn new(n_ctx: usize, n_kv_heads: usize, head_size: usize) -> Self {
+        Self::with_capacity(n_ctx.min(KV_INITIAL_CAPACITY_TOKENS), n_kv_heads, head_size)
+    }
+
+    pub fn with_capacity(capacity_tokens: usize, n_kv_heads: usize, head_size: usize) -> Self {
         let kv_dim = n_kv_heads * head_size;
         Self {
-            k: vec![0.0; n_ctx * kv_dim],
-            v: vec![0.0; n_ctx * kv_dim],
+            k: vec![0.0; capacity_tokens * kv_dim],
+            v: vec![0.0; capacity_tokens * kv_dim],
             n_used: 0,
+            capacity_tokens,
+            kv_dim,
         }
+    }
+
+    /// Allocated token slots.
+    pub fn capacity_tokens(&self) -> usize {
+        self.capacity_tokens
+    }
+
+    /// Grow K/V allocations (geometric doubling) until `tokens` positions fit.
+    /// Existing entries are preserved — indexing is by absolute position.
+    pub fn ensure_capacity(&mut self, tokens: usize) {
+        if tokens <= self.capacity_tokens {
+            return;
+        }
+        let mut new_cap = self.capacity_tokens.max(1);
+        while new_cap < tokens {
+            new_cap *= 2;
+        }
+        self.k.resize(new_cap * self.kv_dim, 0.0);
+        self.v.resize(new_cap * self.kv_dim, 0.0);
+        self.capacity_tokens = new_cap;
     }
 }
 
@@ -682,11 +718,13 @@ impl GenerationState {
 
 /// Prefill: process all prompt tokens at once, populating the KV cache
 /// and recurrent states. Returns the hidden state after the last token.
+///
+/// Errors if the tokens would exceed the model's context length.
 pub fn prefill(
     state: &mut GenerationState,
     token_ids: &[u32],
     model: &ModelWeights,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, String> {
     let cfg = &model.cfg;
     let n_embd = cfg.embedding_length as usize;
     let n_heads = cfg.attention_head_count as usize;
@@ -694,6 +732,15 @@ pub fn prefill(
     let head_size = cfg.attention_key_length as usize;
     let n_ff = cfg.expert_feed_forward_length as usize;
     let eps = cfg.attention_layer_norm_rms_epsilon;
+    let n_ctx = cfg.context_length as usize;
+
+    if state.pos + token_ids.len() > n_ctx {
+        return Err(format!(
+            "context overflow: pos {} + {} tokens > context_length {n_ctx}",
+            state.pos,
+            token_ids.len()
+        ));
+    }
 
     let rope_cfg = RopeConfig {
         freq_base: cfg.rope_freq_base,
@@ -826,6 +873,7 @@ pub fn prefill(
             let pos = [state.pos as i32, 0, 0, 0];
             let cache = &mut state.kv_caches[full_attn_idx - 1];
             let nc = cache.n_used;
+            cache.ensure_capacity(nc + n_tokens);
 
             hidden = crate::model::kernels::full_layer_forward(
                 &hidden,
@@ -871,16 +919,16 @@ pub fn prefill(
     }
 
     state.pos += n_tokens;
-    hidden
+    Ok(hidden)
 }
 
 /// Decode a single token using KV cache and recurrent states.
-/// Returns `(hidden_state, next_token_id)`.
+/// Returns `(hidden_state, next_token_id)` or an error on context overflow.
 pub fn generate_token(
     state: &mut GenerationState,
     token_id: u32,
     model: &ModelWeights,
-) -> (Vec<f32>, u32) {
+) -> Result<(Vec<f32>, u32), String> {
     let cfg = &model.cfg;
     let n_embd = cfg.embedding_length as usize;
     let n_heads = cfg.attention_head_count as usize;
@@ -889,6 +937,13 @@ pub fn generate_token(
     let n_ff = cfg.expert_feed_forward_length as usize;
     let n_vocab = model.tok_embd.n_elements / n_embd;
     let eps = cfg.attention_layer_norm_rms_epsilon;
+
+    if state.pos + 1 > cfg.context_length as usize {
+        return Err(format!(
+            "context overflow: pos {} + 1 > context_length {}",
+            state.pos, cfg.context_length
+        ));
+    }
 
     let rope_cfg = RopeConfig {
         freq_base: cfg.rope_freq_base,
@@ -1014,6 +1069,7 @@ pub fn generate_token(
             let pos = [state.pos as i32, 0, 0, 0];
             let cache = &mut state.kv_caches[full_attn_idx - 1];
             let nc = cache.n_used;
+            cache.ensure_capacity(nc + 1);
 
             hidden = crate::model::kernels::full_layer_forward(
                 &hidden,
@@ -1063,7 +1119,7 @@ pub fn generate_token(
     let output_norm_dq = dq(&model.output_norm_w);
     let output_weight_dq = dq(&model.output_weight);
     let next_token = lm_head_argmax(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
-    (hidden, next_token)
+    Ok((hidden, next_token))
 }
 
 /// Same as `generate_token` but returns raw logits instead of argmax token.
@@ -1072,7 +1128,7 @@ pub fn generate_token_logits(
     state: &mut GenerationState,
     token_id: u32,
     model: &ModelWeights,
-) -> (Vec<f32>, Vec<f32>) {
+) -> Result<(Vec<f32>, Vec<f32>), String> {
     let cfg = &model.cfg;
     let n_embd = cfg.embedding_length as usize;
     let n_heads = cfg.attention_head_count as usize;
@@ -1081,6 +1137,13 @@ pub fn generate_token_logits(
     let n_ff = cfg.expert_feed_forward_length as usize;
     let n_vocab = model.tok_embd.n_elements / n_embd;
     let eps = cfg.attention_layer_norm_rms_epsilon;
+
+    if state.pos + 1 > cfg.context_length as usize {
+        return Err(format!(
+            "context overflow: pos {} + 1 > context_length {}",
+            state.pos, cfg.context_length
+        ));
+    }
 
     let rope_cfg = RopeConfig {
         freq_base: cfg.rope_freq_base,
@@ -1206,6 +1269,7 @@ pub fn generate_token_logits(
             let pos = [state.pos as i32, 0, 0, 0];
             let cache = &mut state.kv_caches[full_attn_idx - 1];
             let nc = cache.n_used;
+            cache.ensure_capacity(nc + 1);
 
             hidden = crate::model::kernels::full_layer_forward(
                 &hidden,
@@ -1255,7 +1319,7 @@ pub fn generate_token_logits(
     let output_norm_dq = dq(&model.output_norm_w);
     let output_weight_dq = dq(&model.output_weight);
     let logits = lm_head_logits(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
-    (hidden, logits)
+    Ok((hidden, logits))
 }
 
 // Helper to extract MoE fields from a delta-net layer
@@ -1367,5 +1431,111 @@ mod tests {
         // Shouldn't panic; token is in vocab range
         assert!((next_token as usize) < n_vocab, "next_token {next_token} >= n_vocab {n_vocab}");
         assert_eq!(hidden.len(), n_embd);
+    }
+
+    /// Bare model: all layers full-attention (`full_attention_interval = 1`),
+    /// zero-filled global weights. Enough to exercise KV-cache state
+    /// management without running layer forwards.
+    fn bare_model(block_count: u32, context_length: u32) -> ModelWeights {
+        let n_embd = 32usize;
+        let embd = vec![0.1f32; 16 * n_embd];
+        let embd_bytes: Vec<u8> = embd.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let ones: Vec<u8> = vec![1.0f32; n_embd].iter().flat_map(|f| f.to_le_bytes()).collect();
+        ModelWeights {
+            cfg: crate::model::config::Qwen3_5Config {
+                block_count,
+                embedding_length: n_embd as u32,
+                attention_head_count: 4,
+                attention_head_count_kv: 2,
+                attention_key_length: 8,
+                attention_value_length: 8,
+                attention_layer_norm_rms_epsilon: 1e-6,
+                expert_count: 0,
+                expert_used_count: 0,
+                expert_feed_forward_length: 64,
+                expert_shared_feed_forward_length: 0,
+                rope_dimension_count: 8,
+                rope_freq_base: 1e7,
+                context_length,
+                ssm_state_size: 0,
+                ssm_group_count: 0,
+                ssm_time_step_rank: 0,
+                ssm_conv_kernel: 0,
+                ssm_inner_size: None,
+                full_attention_interval: 1,
+                rope_sections: [0; 4],
+                key_dim: 0,
+                value_dim: 0,
+                conv_dim: 0,
+                head_k_dim: 0,
+                head_v_dim: 0,
+                ba_dim: 0,
+                full_attn_q_fused_dim: 0,
+            },
+            tok_embd: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes.clone(), 16 * n_embd),
+            output_norm_w: RawTensor::new(crate::gguf::GGmlType::F32, ones.clone(), n_embd),
+            output_weight: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes, 16 * n_embd),
+            full_attn_layers: vec![],
+            delta_net_layers: vec![],
+        }
+    }
+
+    #[test]
+    fn kv_cache_starts_small_and_grows_geometrically() {
+        let mut cache = LayerKvCache::new(262_144, 2, 8);
+        // Initial window: min(ctx, 1024) tokens, NOT the full 262K context.
+        assert_eq!(cache.capacity_tokens(), 1024);
+        assert_eq!(cache.k.len(), 1024 * 2 * 8);
+
+        // Within capacity: no reallocation.
+        cache.ensure_capacity(1000);
+        assert_eq!(cache.capacity_tokens(), 1024);
+
+        // Growth: geometric doubling to the next power-of-two multiple.
+        cache.ensure_capacity(1025);
+        assert_eq!(cache.capacity_tokens(), 2048);
+        cache.ensure_capacity(3000);
+        assert_eq!(cache.capacity_tokens(), 4096);
+
+        // Data written before growth survives (absolute-position indexing).
+        let mut fresh = LayerKvCache::with_capacity(4, 1, 4);
+        fresh.k[..4].copy_from_slice(&[7.5, 8.5, 9.5, 10.5]);
+        fresh.ensure_capacity(100);
+        assert_eq!(&fresh.k[..4], &[7.5, 8.5, 9.5, 10.5]);
+        assert_eq!(fresh.capacity_tokens(), 128);
+    }
+
+    #[test]
+    fn generation_state_allocates_window_not_full_context() {
+        let model = bare_model(2, 262_144);
+        let state = GenerationState::new(&model);
+
+        assert_eq!(state.kv_caches.len(), 2);
+        for cache in &state.kv_caches {
+            // 1024 tokens × kv_dim 16 × f32 ≈ 64 KB per tensor per layer,
+            // vs ~16 MB if the full 262K context were preallocated.
+            let bytes = cache.k.len() * 4;
+            assert_eq!(cache.capacity_tokens(), 1024);
+            assert!(bytes <= 128 * 1024, "initial allocation too large: {bytes} bytes");
+        }
+    }
+
+    #[test]
+    fn context_overflow_is_an_error_not_a_panic() {
+        let model = bare_model(2, 32);
+
+        // Prefill past the limit → Err from the guard.
+        let mut state = GenerationState::new(&model);
+        let tokens: Vec<u32> = (0..33).collect();
+        let err = prefill(&mut state, &tokens, &model).unwrap_err();
+        assert!(err.contains("context overflow"), "{err}");
+
+        // Decode at a full context → Err from the guard, not an index panic.
+        let mut state = GenerationState::new(&model);
+        state.pos = 32;
+        let err = generate_token_logits(&mut state, 0, &model).unwrap_err();
+        assert!(err.contains("context overflow"), "{err}");
+        let err = generate_token(&mut state, 0, &model).unwrap_err();
+        assert!(err.contains("context overflow"), "{err}");
     }
 }

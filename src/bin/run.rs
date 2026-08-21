@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     let mut state = GenerationState::new(&model);
 
     eprintln!("Prefilling {} tokens ...", tokens.len());
-    prefill(&mut state, &tokens, &model);
+    prefill(&mut state, &tokens, &model).map_err(|e| anyhow::anyhow!(e))?;
 
     let eot_id: Option<u32> = tokenizer
         .token_to_id("\u{2023}")
@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         let mut gen_tokens = Vec::new();
 
         for _step in 0..n_predict {
-            let (_hidden, next_token) = generate_token(&mut state, last_token_id, &model);
+            let (_hidden, next_token) = generate_token(&mut state, last_token_id, &model).map_err(|e| anyhow::anyhow!(e))?;
             gen_tokens.push(next_token);
             last_token_id = next_token;
 
@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
         );
 
         for _step in 0..n_predict {
-            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, &model);
+            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, &model).map_err(|e| anyhow::anyhow!(e))?;
 
             // Apply repetition penalty with prompt + generated so far
             let token = sample(&logits, &cfg, &history);

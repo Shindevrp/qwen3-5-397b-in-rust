@@ -290,14 +290,15 @@ fn e2e_prefill_and_generate() {
     let mut state = GenerationState::new(&model);
 
     // Prefill
-    prefill(&mut state, &prompt_tokens, &model);
+    prefill(&mut state, &prompt_tokens, &model).expect("prefill");
     assert_eq!(state.pos, prompt_tokens.len());
 
     // Generate a few tokens
     let mut last_token = *prompt_tokens.last().unwrap();
     let mut generated = Vec::new();
     for _step in 0..10 {
-        let (_hidden, next_token) = generate_token(&mut state, last_token, &model);
+        let (_hidden, next_token) =
+            generate_token(&mut state, last_token, &model).expect("generate_token");
         assert!(
             (next_token as usize) < cfg.n_vocab,
             "generated token {next_token} out of vocab range {n_vocab}",
@@ -327,7 +328,7 @@ fn e2e_sampling() {
 
     let prompt_tokens: Vec<u32> = vec![0];
     let mut state = GenerationState::new(&model);
-    prefill(&mut state, &prompt_tokens, &model);
+    prefill(&mut state, &prompt_tokens, &model).expect("prefill");
 
     let cfg_sampler = SamplerConfig {
         temperature: 2.0,
@@ -343,7 +344,8 @@ fn e2e_sampling() {
     for _step in 0..20 {
         let (_hidden, logits) = qwen3_5_397b_in_rust::model::pipeline::generate_token_logits(
             &mut state, last_token, &model,
-        );
+        )
+        .expect("generate_token_logits");
         let token = sample(&logits, &cfg_sampler, &history);
         assert!((token as usize) < cfg.n_vocab);
         generated.push(token);
