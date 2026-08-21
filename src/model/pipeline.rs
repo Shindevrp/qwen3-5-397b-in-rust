@@ -4,6 +4,7 @@
 //! kernel-level layer structs, and drives the token-by-token forward pass
 //! through both recurrent (delta-net) and full-attention layers.
 
+use rayon::prelude::*;
 use crate::model::config::Qwen3_5Config;
 use crate::model::kernels::{
     DeltaNetLayerWeights, FullAttnLayerWeights, RopeConfig,
@@ -150,6 +151,30 @@ pub struct ModelWeights {
 /// (weights are validated at GGUF load time).
 fn dq(rt: &RawTensor) -> Vec<f32> {
     rt.dequant().expect("dequant failed (tensor corrupted?)")
+}
+
+/// Parallel dequantization of two `RawTensor`s.
+fn dq2(a: &RawTensor, b: &RawTensor) -> (Vec<f32>, Vec<f32>) {
+    let mut ra = None;
+    let mut rb = None;
+    rayon::scope(|s| {
+        s.spawn(|_| { ra = Some(dq(a)); });
+        s.spawn(|_| { rb = Some(dq(b)); });
+    });
+    (ra.unwrap(), rb.unwrap())
+}
+
+/// Parallel dequantization of three `RawTensor`s.
+fn dq3(a: &RawTensor, b: &RawTensor, c: &RawTensor) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut ra = None;
+    let mut rb = None;
+    let mut rc = None;
+    rayon::scope(|s| {
+        s.spawn(|_| { ra = Some(dq(a)); });
+        s.spawn(|_| { rb = Some(dq(b)); });
+        s.spawn(|_| { rc = Some(dq(c)); });
+    });
+    (ra.unwrap(), rb.unwrap(), rc.unwrap())
 }
 
 impl ModelWeights {
@@ -424,18 +449,10 @@ pub fn forward_pass(
                 n_ff_shexp = 0;
             };
 
-            let dn_attn_norm_w = dq(&layer.attn_norm_w);
-            let dn_wqkv = dq(&layer.wqkv);
-            let dn_wqkv_gate = dq(&layer.wqkv_gate);
-            let dn_conv_kernel = dq(&layer.conv_kernel);
-            let dn_alpha_bias = dq(&layer.alpha_bias);
-            let dn_ssm_a = dq(&layer.ssm_a);
-            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
-            let dn_ssm_out = dq(&layer.ssm_out);
-            let dn_post_norm_w = dq(&layer.post_norm_w);
-            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let dn_ffn_up_w = dq(&layer.ffn_up_w);
-            let dn_ffn_down_w = dq(&layer.ffn_down_w);
+            let (dn_attn_norm_w, dn_wqkv, dn_wqkv_gate) = dq3(&layer.attn_norm_w, &layer.wqkv, &layer.wqkv_gate);
+            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) = dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
+            let (dn_ssm_norm_w, dn_ssm_out, dn_post_norm_w) = dq3(&layer.ssm_norm_w, &layer.ssm_out, &layer.post_norm_w);
+            let (dn_ffn_gate_w, dn_ffn_up_w, dn_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = DeltaNetLayerWeights {
                 attn_norm_w: &dn_attn_norm_w,
@@ -517,17 +534,10 @@ pub fn forward_pass(
                 n_ff_shexp = 0;
             };
 
-            let fa_attn_norm_w = dq(&layer.attn_norm_w);
-            let fa_wq = dq(&layer.wq);
-            let fa_wk = dq(&layer.wk);
-            let fa_wv = dq(&layer.wv);
-            let fa_wo = dq(&layer.wo);
-            let fa_q_norm_w = dq(&layer.q_norm_w);
-            let fa_k_norm_w = dq(&layer.k_norm_w);
-            let fa_post_norm_w = dq(&layer.post_norm_w);
-            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let fa_ffn_up_w = dq(&layer.ffn_up_w);
-            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+            let (fa_attn_norm_w, fa_wq, fa_wk) = dq3(&layer.attn_norm_w, &layer.wq, &layer.wk);
+            let (fa_wv, fa_wo, fa_q_norm_w) = dq3(&layer.wv, &layer.wo, &layer.q_norm_w);
+            let (fa_k_norm_w, fa_post_norm_w) = dq2(&layer.k_norm_w, &layer.post_norm_w);
+            let (fa_ffn_gate_w, fa_ffn_up_w, fa_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = FullAttnLayerWeights {
                 attn_norm_w: &fa_attn_norm_w,
@@ -695,14 +705,17 @@ pub fn prefill(
     };
     let rope_sections = cfg.rope_sections;
 
-    // Embed all prompt tokens at once
+    // Embed all prompt tokens at once — parallelized across tokens
     let n_tokens = token_ids.len();
     let tok_embd_dq = dq(&model.tok_embd);
     let mut hidden = vec![0.0f32; n_tokens * n_embd];
-    for (t, &tid) in token_ids.iter().enumerate() {
-        let emb = embed_tokens(tid, &tok_embd_dq, n_embd);
-        hidden[t * n_embd..(t + 1) * n_embd].copy_from_slice(&emb);
-    }
+    hidden
+        .par_chunks_mut(n_embd)
+        .zip(token_ids.par_iter())
+        .for_each(|(chunk, &tid)| {
+            let emb = embed_tokens(tid, &tok_embd_dq, n_embd);
+            chunk.copy_from_slice(&emb);
+        });
 
     let mut full_attn_idx = 0;
     let mut delta_net_idx = 0;
@@ -717,17 +730,10 @@ pub fn prefill(
                 moe_fields(layer, cfg);
 
             let dn_attn_norm_w = dq(&layer.attn_norm_w);
-            let dn_wqkv = dq(&layer.wqkv);
-            let dn_wqkv_gate = dq(&layer.wqkv_gate);
-            let dn_conv_kernel = dq(&layer.conv_kernel);
-            let dn_alpha_bias = dq(&layer.alpha_bias);
-            let dn_ssm_a = dq(&layer.ssm_a);
-            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
-            let dn_ssm_out = dq(&layer.ssm_out);
-            let dn_post_norm_w = dq(&layer.post_norm_w);
-            let dn_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let dn_ffn_up_w = dq(&layer.ffn_up_w);
-            let dn_ffn_down_w = dq(&layer.ffn_down_w);
+            let (dn_wqkv, dn_wqkv_gate, dn_conv_kernel) = dq3(&layer.wqkv, &layer.wqkv_gate, &layer.conv_kernel);
+            let (dn_alpha_bias, dn_ssm_a, dn_ssm_norm_w) = dq3(&layer.alpha_bias, &layer.ssm_a, &layer.ssm_norm_w);
+            let (dn_ssm_out, dn_post_norm_w) = dq2(&layer.ssm_out, &layer.post_norm_w);
+            let (dn_ffn_gate_w, dn_ffn_up_w, dn_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = DeltaNetLayerWeights {
                 attn_norm_w: &dn_attn_norm_w,
@@ -788,17 +794,10 @@ pub fn prefill(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
-            let fa_attn_norm_w = dq(&layer.attn_norm_w);
-            let fa_wq = dq(&layer.wq);
-            let fa_wk = dq(&layer.wk);
-            let fa_wv = dq(&layer.wv);
-            let fa_wo = dq(&layer.wo);
-            let fa_q_norm_w = dq(&layer.q_norm_w);
-            let fa_k_norm_w = dq(&layer.k_norm_w);
-            let fa_post_norm_w = dq(&layer.post_norm_w);
-            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let fa_ffn_up_w = dq(&layer.ffn_up_w);
-            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+            let (fa_attn_norm_w, fa_wq, fa_wk) = dq3(&layer.attn_norm_w, &layer.wq, &layer.wk);
+            let (fa_wv, fa_wo, fa_q_norm_w) = dq3(&layer.wv, &layer.wo, &layer.q_norm_w);
+            let (fa_k_norm_w, fa_post_norm_w) = dq2(&layer.k_norm_w, &layer.post_norm_w);
+            let (fa_ffn_gate_w, fa_ffn_up_w, fa_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = FullAttnLayerWeights {
                 attn_norm_w: &fa_attn_norm_w,
@@ -983,17 +982,10 @@ pub fn generate_token(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
-            let fa_attn_norm_w = dq(&layer.attn_norm_w);
-            let fa_wq = dq(&layer.wq);
-            let fa_wk = dq(&layer.wk);
-            let fa_wv = dq(&layer.wv);
-            let fa_wo = dq(&layer.wo);
-            let fa_q_norm_w = dq(&layer.q_norm_w);
-            let fa_k_norm_w = dq(&layer.k_norm_w);
-            let fa_post_norm_w = dq(&layer.post_norm_w);
-            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let fa_ffn_up_w = dq(&layer.ffn_up_w);
-            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+            let (fa_attn_norm_w, fa_wq, fa_wk) = dq3(&layer.attn_norm_w, &layer.wq, &layer.wk);
+            let (fa_wv, fa_wo, fa_q_norm_w) = dq3(&layer.wv, &layer.wo, &layer.q_norm_w);
+            let (fa_k_norm_w, fa_post_norm_w) = dq2(&layer.k_norm_w, &layer.post_norm_w);
+            let (fa_ffn_gate_w, fa_ffn_up_w, fa_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = FullAttnLayerWeights {
                 attn_norm_w: &fa_attn_norm_w,
@@ -1182,17 +1174,10 @@ pub fn generate_token_logits(
                  shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
                 moe_fields_full(layer, cfg);
 
-            let fa_attn_norm_w = dq(&layer.attn_norm_w);
-            let fa_wq = dq(&layer.wq);
-            let fa_wk = dq(&layer.wk);
-            let fa_wv = dq(&layer.wv);
-            let fa_wo = dq(&layer.wo);
-            let fa_q_norm_w = dq(&layer.q_norm_w);
-            let fa_k_norm_w = dq(&layer.k_norm_w);
-            let fa_post_norm_w = dq(&layer.post_norm_w);
-            let fa_ffn_gate_w = dq(&layer.ffn_gate_w);
-            let fa_ffn_up_w = dq(&layer.ffn_up_w);
-            let fa_ffn_down_w = dq(&layer.ffn_down_w);
+            let (fa_attn_norm_w, fa_wq, fa_wk) = dq3(&layer.attn_norm_w, &layer.wq, &layer.wk);
+            let (fa_wv, fa_wo, fa_q_norm_w) = dq3(&layer.wv, &layer.wo, &layer.q_norm_w);
+            let (fa_k_norm_w, fa_post_norm_w) = dq2(&layer.k_norm_w, &layer.post_norm_w);
+            let (fa_ffn_gate_w, fa_ffn_up_w, fa_ffn_down_w) = dq3(&layer.ffn_gate_w, &layer.ffn_up_w, &layer.ffn_down_w);
 
             let layer_ref = FullAttnLayerWeights {
                 attn_norm_w: &fa_attn_norm_w,

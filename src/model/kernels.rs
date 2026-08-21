@@ -7,6 +7,7 @@
 
 use crate::gguf::GGmlType;
 use crate::model::quant::{QuantError, QK_K, fp16_to_f32};
+use rayon::prelude::*;
 
 pub const QK8_0: usize = 32;
 
@@ -966,8 +967,11 @@ pub fn moe_ffn(
     let mut output = vec![0.0f32; n_tokens * n_embd];
 
     // Per-token: router logits → softmax → top-k → expert FFN → weighted sum
-    for t in 0..n_tokens {
-        let x = &input[t * n_embd..(t + 1) * n_embd];
+    // Tokens are independent — parallelize across tokens when n_tokens > 1.
+    output
+        .par_chunks_mut(n_embd)
+        .zip(input.par_chunks(n_embd))
+        .for_each(|(out_chunk, x)| {
 
         // 1. Router logits: logits[e] = sum_i router_w[e, i] * x[i]
         let mut logits = vec![0.0f32; n_expert];
@@ -999,40 +1003,54 @@ pub fn moe_ffn(
         }
 
         // 5. For each selected expert: gate_up → SwiGLU → down → accumulate
-        for (slot, &e) in idx.iter().enumerate() {
-            let w_e = sel_weights[slot];
+        //    Expert FFNs are independent — parallelize across selected experts.
+        let expert_outputs: Vec<(f32, Vec<f32>)> = idx
+            .par_iter()
+            .map(|&e| {
+                let w_e = probs[e] / w_sum;
 
-            // gate_up = gate_up_w[e] @ x  → [2 * n_ff]
-            let gw_base = e * 2 * n_ff * n_embd;
-            let mut gate_up = vec![0.0f32; 2 * n_ff];
-            for f in 0..2 * n_ff {
-                let mut acc = 0.0f32;
-                for i in 0..n_embd {
-                    acc += gate_up_w[gw_base + f * n_embd + i] * x[i];
+                // gate_up = gate_up_w[e] @ x  → [2 * n_ff]
+                let gw_base = e * 2 * n_ff * n_embd;
+                let mut gate_up = vec![0.0f32; 2 * n_ff];
+                for f in 0..2 * n_ff {
+                    let mut acc = 0.0f32;
+                    for i in 0..n_embd {
+                        acc += gate_up_w[gw_base + f * n_embd + i] * x[i];
+                    }
+                    gate_up[f] = acc;
                 }
-                gate_up[f] = acc;
-            }
 
-            // SwiGLU: silu(gate) * up
-            let mut ff_out = vec![0.0f32; n_ff];
-            for f in 0..n_ff {
-                let g = gate_up[f];
-                let u = gate_up[n_ff + f];
-                let s = 1.0f32 / (1.0f32 + (-g).exp());
-                ff_out[f] = g * s * u;
-            }
-
-            // down = down_w[e] @ ff_out  → [n_embd], accumulate weighted
-            let dw_base = e * n_embd * n_ff;
-            for j in 0..n_embd {
-                let mut acc = 0.0f32;
+                // SwiGLU: silu(gate) * up
+                let mut ff_out = vec![0.0f32; n_ff];
                 for f in 0..n_ff {
-                    acc += down_w[dw_base + j * n_ff + f] * ff_out[f];
+                    let g = gate_up[f];
+                    let u = gate_up[n_ff + f];
+                    let s = 1.0f32 / (1.0f32 + (-g).exp());
+                    ff_out[f] = g * s * u;
                 }
-                output[t * n_embd + j] += acc * w_e;
+
+                // down = down_w[e] @ ff_out  → [n_embd]
+                let dw_base = e * n_embd * n_ff;
+                let mut down_out = vec![0.0f32; n_embd];
+                for j in 0..n_embd {
+                    let mut acc = 0.0f32;
+                    for f in 0..n_ff {
+                        acc += down_w[dw_base + j * n_ff + f] * ff_out[f];
+                    }
+                    down_out[j] = acc;
+                }
+
+                (w_e, down_out)
+            })
+            .collect();
+
+        // Accumulate weighted expert outputs
+        for (w_e, down_out) in &expert_outputs {
+            for j in 0..n_embd {
+                out_chunk[j] += down_out[j] * w_e;
             }
         }
-    }
+    });
 
     output
 }

@@ -522,6 +522,7 @@ dependencies = [
  "anyhow",
  "byteorder",
  "memmap2",
+ "rayon",
  "tempfile",
  "thiserror 1.0.69",
  "tokenizers",
