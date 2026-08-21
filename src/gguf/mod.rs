@@ -14,6 +14,7 @@ pub use value::{Value, ValueType};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
 use memmap2::Mmap;
@@ -27,7 +28,7 @@ mod tests;
 
 #[derive(Debug)]
 pub struct Gguf {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     pub header: Header,
     pub metadata: Metadata,
     pub tensors: Vec<TensorMeta>,
@@ -39,7 +40,7 @@ pub struct Gguf {
 impl Gguf {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Gguf, GgufError> {
         let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let mut r = Reader::new(&mmap);
 
         let header = r.read_header()?;
@@ -72,6 +73,11 @@ impl Gguf {
     pub fn data_slice(&self, tensor: &TensorMeta) -> &[u8] {
         let start = self.data_offset + tensor.offset as usize;
         self.mmap.get(start..).unwrap_or(&[])
+    }
+
+    /// Get an Arc clone of the mmap for zero-copy tensor access.
+    pub fn mmap_arc(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mmap)
     }
 
     pub fn len(&self) -> usize {

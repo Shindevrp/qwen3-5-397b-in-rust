@@ -201,16 +201,22 @@ impl ModelLoader {
             .map_err(|source| LoaderError::Quant { name: name.to_string(), source })
     }
 
-    /// Load a named tensor as raw quantized bytes (no dequantization).
+    /// Load a named tensor as raw quantized bytes — zero-copy mmap reference.
     pub fn raw_tensor(&self, name: &str) -> Result<quant::RawTensor, LoaderError> {
-        let (_, meta) = self
+        let (si, meta) = self
             .by_name
             .get(name)
             .ok_or_else(|| LoaderError::TensorNotFound { name: name.to_string() })?;
-        let data = self.data_slice(name)?;
-        Ok(quant::RawTensor::new(
+        let shard = &self.shards[*si];
+        let expected = quant::tensor_size(meta.ggml_type, meta.n_elements())
+            .map_err(|source| LoaderError::Quant { name: name.to_string(), source })?;
+        let start = shard.gguf.data_offset + meta.offset as usize;
+        let mmap = shard.gguf.mmap_arc();
+        Ok(quant::RawTensor::from_mmap(
+            mmap,
             meta.ggml_type,
-            data.to_vec(),
+            start,
+            expected as usize,
             meta.n_elements() as usize,
         ))
     }

@@ -6,26 +6,47 @@
 //! only types implemented here; everything else is rejected.
 
 use crate::gguf::GGmlType;
+use std::sync::Arc;
+use memmap2::Mmap;
 
 pub const QK_K: usize = 256;
 
-/// Raw quantized tensor stored as-is from the GGUF file.
-/// Avoids dequantizing all weights into f32 upfront.
+/// Raw quantized tensor — zero-copy reference into mmap'd GGUF data.
+/// Holds an Arc<Mmap> so the underlying mapping stays alive.
 #[derive(Clone)]
 pub struct RawTensor {
     pub ty: GGmlType,
-    pub data: Vec<u8>,
     pub n_elements: usize,
+    mmap: Arc<Mmap>,
+    pub offset: usize,
+    pub len: usize,
 }
 
 impl RawTensor {
+    /// Create a zero-copy reference into mmap'd GGUF data.
+    pub fn from_mmap(mmap: Arc<Mmap>, ty: GGmlType, offset: usize, len: usize, n_elements: usize) -> Self {
+        Self { ty, n_elements, mmap, offset, len }
+    }
+
+    /// Create an owned RawTensor from a byte vector (for tests / synthetic models).
+    /// Copies data into a temp file and mmaps it to keep the API uniform.
     pub fn new(ty: GGmlType, data: Vec<u8>, n_elements: usize) -> Self {
-        Self { ty, data, n_elements }
+        let len = data.len();
+        let tmp = tempfile::tempfile().expect("create tempfile for RawTensor");
+        use std::io::Write;
+        (&tmp).write_all(&data).expect("write to tempfile");
+        let mmap = Arc::new(unsafe { Mmap::map(&tmp).expect("mmap tempfile") });
+        Self { ty, n_elements, mmap, offset: 0, len }
+    }
+
+    /// Access the raw quantized bytes.
+    pub fn data(&self) -> &[u8] {
+        &self.mmap[self.offset..self.offset + self.len]
     }
 
     /// Dequantize to f32 on demand.
     pub fn dequant(&self) -> Result<Vec<f32>, QuantError> {
-        dequantize(self.ty, &self.data, self.n_elements as u64)
+        dequantize(self.ty, self.data(), self.n_elements as u64)
     }
 
     /// Row size in bytes for this tensor's quantization type and inner dimension.
