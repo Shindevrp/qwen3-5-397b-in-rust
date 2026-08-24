@@ -102,6 +102,7 @@ flowchart TB
     class User,Run,Bench,Fetch,KernCheck cli;
     class Tokenizer,GGUF,HF,Chat,Lib lib;
     class Config,Quant,SIMD,Kernels,Loader,Pipeline,Sampler,Synth,Model model;
+    linkStyle default stroke:#4b5563,stroke-width:2px;
 ```
 
 **How it fits together**
@@ -156,6 +157,7 @@ graph LR
     class CLI cli;
     class Lib,GGUF,HF,Tokenizer,Chat lib;
     class Model,Config,Quant,Kernels,Loader,Pipeline,Sampler model;
+    linkStyle default stroke:#4b5563,stroke-width:2px;
 ```
 
 ## Data Flow
@@ -260,6 +262,7 @@ flowchart TB
     class L,A0,A1,A2,A3,A4,A5 delta;
     class F,B0,B1,B2,B3,B4 full;
     class R1,R2,N1,N2,FFN,OUT shared;
+    linkStyle default stroke:#4b5563,stroke-width:2px;
     linkStyle 9,10,11,12 stroke:#737373,stroke-width:3px;
 ```
 
@@ -316,6 +319,7 @@ flowchart LR
     classDef shared fill:#F5F5F5,stroke:#737373,stroke-width:2px,color:#262626;
     class X,RT,SL,GV1,SW,GV2,WS,SH,GA,OUT model;
     class MM,GU,DN shared;
+    linkStyle default stroke:#4b5563,stroke-width:2px;
 ```
 
 ### Validation pyramid
@@ -334,6 +338,11 @@ flowchart TB
         E2E["synth.rs models, scheduler, speculative"]
     end
     T1 --> T2 --> E2E
+
+    classDef model fill:#FFF4E6,stroke:#EA580C,stroke-width:2px,color:#7C2D12;
+    classDef shared fill:#F5F5F5,stroke:#737373,stroke-width:2px,color:#262626;
+    class T1,T2,T3,PY,KC,CV,E2E model;
+    linkStyle default stroke:#4b5563,stroke-width:2px;
 ```
 
 ## Project Structure
