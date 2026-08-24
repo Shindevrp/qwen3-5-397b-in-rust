@@ -96,9 +96,9 @@ flowchart TB
     Fetch --> GGUF
     KernCheck --> Kernels
 
-    classDef cli fill:#e1f5fe,stroke:#0277bd;
-    classDef lib fill:#f3e5f5,stroke:#7b1fa2;
-    classDef model fill:#fff3e0,stroke:#ef6c00;
+    classDef cli fill:#EAF4FF,stroke:#2563EB,stroke-width:2px,color:#172554;
+    classDef lib fill:#F3EEFF,stroke:#7C3AED,stroke-width:2px,color:#3B0764;
+    classDef model fill:#FFF4E6,stroke:#EA580C,stroke-width:2px,color:#7C2D12;
     class User,Run,Bench,Fetch,KernCheck cli;
     class Tokenizer,GGUF,HF,Chat,Lib lib;
     class Config,Quant,SIMD,Kernels,Loader,Pipeline,Sampler,Synth,Model model;
@@ -250,11 +250,19 @@ flowchart TB
     R2 --> N2["post_norm"] --> FFN
     FFN["FFN: router 512→top-10 + shared expert"] --> OUT(("+ residual → next layer"))
 
-    classDef dn fill:#c8e6c9,stroke:#2e7d32;
-    classDef fa fill:#ffe0b2,stroke:#ef6c00;
-    class L,A0,A1,A2,A3,A4,A5,R1,N1 dn;
-    class F,B0,B1,B2,B3,B4,R2,N2 fa;
+    classDef delta fill:#ECFDF3,stroke:#16A34A,stroke-width:2px,color:#14532D;
+    classDef full fill:#ECFEFF,stroke:#0891B2,stroke-width:2px,color:#164E63;
+    classDef shared fill:#F5F5F5,stroke:#737373,stroke-width:2px,color:#262626;
+    class L,A0,A1,A2,A3,A4,A5 delta;
+    class F,B0,B1,B2,B3,B4 full;
+    class R1,R2,N1,N2,FFN,OUT shared;
+    linkStyle 9,10,11,12 stroke:#737373,stroke-width:3px;
 ```
+
+**Legend**
+* <span style="background:#ECFDF3; border:2px solid #16A34A; padding:2px 6px;">Green</span> DeltaNet / Linear Attention · 45 layers
+* <span style="background:#ECFEFF; border:2px solid #0891B2; padding:2px 6px;">Teal</span> Full Attention · 15 layers
+* <span style="background:#F5F5F5; border:2px solid #737373; padding:2px 6px;">Gray</span> Shared Computation
 
 ### Decode step anatomy
 
