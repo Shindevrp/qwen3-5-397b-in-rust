@@ -150,8 +150,12 @@ graph LR
     Quant --> Kernels
     Sampler --> Pipeline
 
-    classDef core fill:#bbdefb,stroke:#1565c0;
-    class CLI,Lib,Lib core;
+    classDef cli fill:#EAF4FF,stroke:#2563EB,stroke-width:2px,color:#172554;
+    classDef lib fill:#F3EEFF,stroke:#7C3AED,stroke-width:2px,color:#3B0764;
+    classDef model fill:#FFF4E6,stroke:#EA580C,stroke-width:2px,color:#7C2D12;
+    class CLI cli;
+    class Lib,GGUF,HF,Tokenizer,Chat lib;
+    class Model,Config,Quant,Kernels,Loader,Pipeline,Sampler model;
 ```
 
 ## Data Flow
@@ -308,8 +312,10 @@ flowchart LR
     GA --> WS
     WS --> OUT["FFN output"]
 
-    classDef mmap fill:#ffccbc,stroke:#d84315;
-    class MM,GU,DN mmap;
+    classDef model fill:#FFF4E6,stroke:#EA580C,stroke-width:2px,color:#7C2D12;
+    classDef shared fill:#F5F5F5,stroke:#737373,stroke-width:2px,color:#262626;
+    class X,RT,SL,GV1,SW,GV2,WS,SH,GA,OUT model;
+    class MM,GU,DN shared;
 ```
 
 ### Validation pyramid
