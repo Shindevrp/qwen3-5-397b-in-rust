@@ -1,0 +1,34 @@
+rms 1 4096 0.000001
+rms 2 512 0.00001
+gemv Q8_0 4096 6 gemv_x1.bin
+gemv Q4_K 4096 6 gemv_x2.bin
+gemv Q5_K 4096 6 gemv_x3.bin
+gemv Q6_K 4096 6 gemv_x4.bin
+gemv F32 1024 8 gemv_x5.bin
+gemm Q8_0 256 4 3 gemm_x1.bin
+gemm Q4_K 256 4 3 gemm_x2.bin
+gemm Q5_K 256 4 3 gemm_x3.bin
+gemm Q6_K 256 4 3 gemm_x4.bin
+gemm F32 128 3 4 gemm_x5.bin
+attn 1 4 2 16 6 8 1
+attn 2 4 2 16 3 3 0
+attn 3 8 8 32 1 12 1
+delta 1 16 16 2 3
+delta 2 32 32 4 2
+rope 1 64 64 11 11 10 0 5 2 7 0 4096 10000000.0 1.0 0.0 1.0
+rope 2 80 64 11 11 10 0 3 5 9 0 4096 10000000.0 1.0 0.0 1.0
+rope 3 64 64 4 3 2 1 1 2 3 4 2048 100000.0 1.0 0.0 1.0
+swiglu 1 64
+swiglu 2 256
+rph 1 512 64
+rph 2 512 128
+topk 1 128 8
+topk 2 64 4
+conv 1 16 4 8
+conv 2 32 3 12
+moe 1 16 12 8 2 3
+moe 2 32 24 16 4 1
+full_layer 1 64 4 2 32 48 3 8,8,0,0
+full_layer 2 64 8 4 64 64 2 11,11,10,0
+delta_layer 1 32 64 64 4 8 8 8 2 4
+delta_layer 2 64 128 256 4 16 16 16 4 8

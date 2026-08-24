@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("  --top-p P          Top-p nucleus sampling, 1.0=disabled (default: 0.9)");
         eprintln!("  --repeat-penalty R Repetition penalty (default: 1.0)");
         eprintln!("  --argmax           Use greedy decoding (no sampling)");
+        eprintln!("  --kv-q8            Store KV cache as Q8_0 (~3.8x less memory)");
         eprintln!("Chat mode:");
         eprintln!("  --chat             Interactive multi-turn chat (Qwen3.5 template)");
         eprintln!("  --system TEXT      System prompt (chat mode)");
@@ -51,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     let mut system_prompt: Option<String> = None;
     let mut enable_thinking = true;
     let mut batch_file: Option<PathBuf> = None;
+    let mut kv_q8 = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -86,6 +88,9 @@ fn main() -> anyhow::Result<()> {
             }
             "--argmax" => {
                 use_argmax = true;
+            }
+            "--kv-q8" => {
+                kv_q8 = true;
             }
             "--chat" => {
                 chat_mode = true;
@@ -148,6 +153,7 @@ fn main() -> anyhow::Result<()> {
             &cfg,
             n_predict,
             use_argmax,
+            kv_q8,
             &stop_ids,
         );
     }
@@ -159,6 +165,7 @@ fn main() -> anyhow::Result<()> {
             &cfg,
             n_predict,
             use_argmax,
+            kv_q8,
             system_prompt,
             enable_thinking,
             &stop_ids,
@@ -167,7 +174,7 @@ fn main() -> anyhow::Result<()> {
         if prompt.is_empty() {
             prompt = "Hello, world!".to_string();
         }
-        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, &stop_ids)
+        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, kv_q8, &stop_ids)
     }
 }
 
@@ -208,6 +215,7 @@ fn chat_loop(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
     system_prompt: Option<String>,
     enable_thinking: bool,
     stop_ids: &[u32],
@@ -259,8 +267,11 @@ fn chat_loop(
         eprintln!("[prompt: {} tokens]", tokens.len());
 
         // Fresh state each turn: re-prefill the whole conversation.
-        let mut state = GenerationState::new(model);
+        let mut state = if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) };
         prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
+        // Phase 24: dequantize MoE experts up front (parallel) so decode
+        // never pays first-touch dequantization cost.
+        state.warm_moe_cache(model);
 
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
@@ -311,16 +322,20 @@ fn run_completion(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     eprintln!("Prompt: {prompt}");
     let tokens = tokenizer.encode(prompt, false)?;
     eprintln!("Input tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
 
-    let mut state = GenerationState::new(model);
+    let mut state = if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) };
 
     eprintln!("Prefilling {} tokens ...", tokens.len());
     prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
+    // Phase 24: dequantize MoE experts up front (parallel) so decode
+    // never pays first-touch dequantization cost.
+    state.warm_moe_cache(model);
 
     if use_argmax {
         let mut last_token_id = *tokens.last().unwrap();
@@ -383,6 +398,7 @@ fn run_completion(
 ///
 /// Sequences that hit a stop token leave the batch immediately (lockstep
 /// steps shrink as sequences finish). Output is printed once per sequence.
+#[allow(clippy::too_many_arguments)]
 fn run_batch(
     model: &ModelWeights,
     tokenizer: &QwenTokenizer,
@@ -390,6 +406,7 @@ fn run_batch(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     let max_ctx = model.cfg.context_length as usize;
@@ -415,9 +432,14 @@ fn run_batch(
     // One state per sequence; prefill all of them in parallel.
     let t0 = Instant::now();
     let mut states: Vec<GenerationState> =
-        (0..n_total).map(|_| GenerationState::new(model)).collect();
+        (0..n_total).map(|_| if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) }).collect();
     let prompt_refs: Vec<&[u32]> = token_prompts.iter().map(|v| v.as_slice()).collect();
     prefill_batch(&mut states, &prompt_refs, model).map_err(|e| anyhow::anyhow!(e))?;
+    // Phase 24: parallel warm-up of every sequence's MoE weight cache.
+    {
+        use rayon::prelude::*;
+        states.par_iter_mut().for_each(|s| s.warm_moe_cache(model));
+    }
     let prefill_ms = t0.elapsed().as_millis();
     eprintln!("[batch] prefilled {n_total} sequences in {prefill_ms} ms");
 

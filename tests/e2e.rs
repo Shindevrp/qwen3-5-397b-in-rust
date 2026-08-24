@@ -2,7 +2,7 @@
 //! pipeline (see `src/model/synth.rs` for the model factory).
 
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, generate_token_batch, prefill, prefill_batch, GenerationState, ModelWeights,
+    generate_token, generate_token_batch, prefill, prefill_batch, prefill_chunked, GenerationState, ModelWeights,
 };
 use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
 use qwen3_5_397b_in_rust::model::synth::{build_gguf, SynthConfig};
@@ -162,4 +162,26 @@ fn e2e_batch_overflow_is_an_error() {
     let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
     let err = prefill_batch(&mut states, &refs, &model).unwrap_err();
     assert!(err.contains("context overflow"), "{err}");
+}
+
+#[test]
+fn e2e_prefill_chunked_then_generate() {
+    let cfg = SynthConfig::tiny();
+    let (_tmp, model) = load_synth(&cfg);
+
+    let prompt_tokens: Vec<u32> = vec![0, 1, 2, 3, 4, 5];
+    let mut state = GenerationState::new(&model);
+
+    // Chunked prefill with chunk_size=2
+    prefill_chunked(&mut state, &prompt_tokens, &model, 2).expect("prefill_chunked");
+    assert_eq!(state.pos, 6);
+
+    // Generate a few tokens to verify state is usable
+    let mut last_token = 5u32;
+    for _ in 0..3 {
+        let (_hidden, next_token) =
+            generate_token(&mut state, last_token, &model).expect("generate after chunked prefill");
+        last_token = next_token;
+    }
+    assert_eq!(state.pos, 9);
 }

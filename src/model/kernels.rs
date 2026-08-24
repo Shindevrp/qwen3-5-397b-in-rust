@@ -6,7 +6,7 @@
 //! float accumulation order, which is noted where relevant).
 
 use crate::gguf::GGmlType;
-use crate::model::quant::{QuantError, QK_K, fp16_to_f32};
+use crate::model::quant::{QuantError, QK_K, fp16_to_f32, tensor_size};
 use rayon::prelude::*;
 
 pub const QK8_0: usize = 32;
@@ -441,6 +441,57 @@ pub fn gemv(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Res
     Ok(out)
 }
 
+/// Row-parallel matrix-vector product: same as `gemv` but parallelises across
+/// output rows using rayon. The activation is quantized once (shared read-only)
+/// and each output row is computed independently on a separate thread.
+///
+/// For `n_out >= 8` this gives near-linear scaling with core count.
+pub fn gemv_parallel(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Result<Vec<f32>, QuantError> {
+    assert_eq!(x.len(), n_in);
+    let row_bytes = crate::model::quant::tensor_size(ty, n_in as u64)? as usize;
+    assert!(w.len() >= n_out * row_bytes);
+
+    // For small row counts the thread overhead isn't worth it — fall back to
+    // serial gemv. Threshold chosen so that the 64-128 row projections in
+    // Qwen3.5 attention layers always parallelise, while tiny FFN-gate inner
+    // dims don't.
+    if n_out < 8 {
+        return gemv(ty, w, n_in, n_out, x);
+    }
+
+    // Pre-quantize activation once (shared across all row threads).
+    let act: Vec<u8> = match ty {
+        GGmlType::F32 => vec![], // not used for F32 path
+        GGmlType::Q8_0 => quantize_row_q8_0(x),
+        _ => quantize_row_q8_k(x), // Q4_K, Q5_K, Q6_K all use Q8_K activation
+    };
+
+    let mut out = vec![0.0f32; n_out];
+
+    out.par_chunks_mut(1)
+        .enumerate()
+        .for_each(|(r, slot)| {
+            let row_start = r * row_bytes;
+            let row = &w[row_start..row_start + row_bytes];
+            slot[0] = match ty {
+                GGmlType::F32 => {
+                    let mut sum = 0.0f32;
+                    for (i, c) in row.chunks_exact(4).enumerate() {
+                        sum += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * x[i];
+                    }
+                    sum
+                }
+                GGmlType::Q8_0 => vec_dot_q8_0_q8_0(n_in, row, &act),
+                GGmlType::Q4_K => vec_dot_q4_k_q8_k(n_in, row, &act),
+                GGmlType::Q5_K => vec_dot_q5_k_q8_k(n_in, row, &act),
+                GGmlType::Q6_K => vec_dot_q6_k_q8_k(n_in, row, &act),
+                _ => unreachable!(),
+            };
+        });
+
+    Ok(out)
+}
+
 /// Batched matrix-vector product: `out[row * n_batch + b] = dot(w_row, x[b])`.
 ///
 /// `x` has `n_in * n_batch` floats laid out as `n_batch` contiguous vectors.
@@ -623,6 +674,110 @@ pub fn attention_forward(
 }
 
 // ---- Delta-net linear attention (autoregressive) --------------------------
+
+/// Flash-attention-style scaled dot-product attention (Phase 26).
+///
+/// Same contract as `attention_forward`, but processes K/V in fixed-size
+/// blocks with an **online softmax**: a running (max, sum, accumulator) triple
+/// is rescaled per block, so each K/V tile is read exactly once and stays in
+/// L1/L2 instead of requiring a full-length score row plus a second sweep.
+/// Numerically equivalent up to float rounding (verified by crossval tests).
+///
+/// Layout (ggml row-major): `ne[0] = head_dim, ne[1] = tokens, ne[2] = heads`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_forward_flash(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    n_kv: usize,
+    scale: f32,
+    causal: bool,
+) -> Vec<f32> {
+    const BLOCK: usize = 64;
+    assert!(n_heads.is_multiple_of(n_kv_heads), "n_heads must be a multiple of n_kv_heads");
+    let gqa = n_heads / n_kv_heads;
+    let kv_head_stride = head_dim;
+    let kv_tok_stride = head_dim * n_kv_heads;
+
+    let mut out = vec![0.0f32; n_q * n_heads * head_dim];
+    let mut block_scores = vec![0.0f32; BLOCK];
+    let mut acc = vec![0.0f32; head_dim];
+
+    for qt in 0..n_q {
+        let q_base = qt * n_heads * head_dim;
+        let o_base = qt * n_heads * head_dim;
+        for qh in 0..n_heads {
+            let kv_h = qh / gqa;
+            let qh_base = q_base + qh * head_dim;
+            let oh_base = o_base + qh * head_dim;
+            let kv_h_base = kv_h * kv_head_stride;
+
+            let max_kv = if causal {
+                if n_q > 1 { qt.min(n_kv - 1) } else { n_kv - 1 }
+            } else {
+                n_kv - 1
+            };
+
+            // Online softmax state.
+            let mut run_max = f32::NEG_INFINITY;
+            let mut run_sum = 0.0f32;
+            for val in acc.iter_mut() {
+                *val = 0.0;
+            }
+
+            let mut b_start = 0usize;
+            while b_start <= max_kv {
+                let b_end = (b_start + BLOCK).min(max_kv + 1);
+
+                // Scores for this block; track block max.
+                let mut b_max = f32::NEG_INFINITY;
+                for (bi, t) in (b_start..b_end).enumerate() {
+                    let k_base = kv_h_base + t * kv_tok_stride;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[qh_base + d] * k[k_base + d];
+                    }
+                    let s = dot * scale;
+                    block_scores[bi] = s;
+                    if s > b_max {
+                        b_max = s;
+                    }
+                }
+
+                // Rescale running state into the new max, accumulate block.
+                let new_max = if b_max > run_max { b_max } else { run_max };
+                let corr = (run_max - new_max).exp();
+                run_sum *= corr;
+                for val in acc.iter_mut() {
+                    *val *= corr;
+                }
+                run_max = new_max;
+
+                for (bi, t) in (b_start..b_end).enumerate() {
+                    let p = (block_scores[bi] - run_max).exp();
+                    run_sum += p;
+                    let v_base = kv_h_base + t * kv_tok_stride;
+                    for d in 0..head_dim {
+                        acc[d] += p * v[v_base + d];
+                    }
+                }
+
+                b_start += BLOCK;
+            }
+
+            let inv_l = 1.0 / run_sum;
+            for d in 0..head_dim {
+                out[oh_base + d] = acc[d] * inv_l;
+            }
+        }
+    }
+    out
+}
+
 
 /// Delta-net autoregressive linear attention (GDA mode).
 ///
@@ -1020,6 +1175,27 @@ pub fn conv1d_silu(
 ///
 /// This is a scalar f32 port of `build_moe_ffn` from llama-graph.cpp for
 /// Qwen3.5 MoE (softmax gating, SwiGLU activation, weight normalization).
+//
+// Bundled MoE parameters to reduce argument counts across the codebase.
+pub struct MoEParams<'a> {
+    pub router_w: &'a [f32],
+    pub gate_up_w: &'a [f32],
+    pub down_w: &'a [f32],
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub shexp_gate_w: &'a [f32],
+    pub shexp_up_w: &'a [f32],
+    pub shexp_down_w: &'a [f32],
+    pub shexp_gate_inp_w: &'a [f32],
+    pub n_ff_shexp: usize,
+}
+
+impl<'a> MoEParams<'a> {
+    pub fn is_moe(&self) -> bool {
+        self.n_expert > 0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn moe_ffn(
     input: &[f32],
@@ -1129,6 +1305,112 @@ pub fn moe_ffn(
     output
 }
 
+/// Router: logits → softmax → top-k → normalized selection weights.
+///
+/// Returns `(indices, weights)` of the `k` selected experts, weights summing
+/// to 1. Shared by the dense and streaming MoE paths so routing decisions are
+/// bit-identical between them.
+fn route_topk(x: &[f32], router_w: &[f32], n_embd: usize, n_expert: usize, k: usize) -> (Vec<usize>, Vec<f32>) {
+    // 1. Router logits
+    let mut logits = vec![0.0f32; n_expert];
+    for e in 0..n_expert {
+        let mut acc = 0.0f32;
+        let row = &router_w[e * n_embd..(e + 1) * n_embd];
+        for i in 0..n_embd {
+            acc += row[i] * x[i];
+        }
+        logits[e] = acc;
+    }
+    // 2. Softmax (f64 accumulation, matching the dense path)
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
+    let sum_exp: f64 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|&e| (e / sum_exp) as f32).collect();
+    // 3. Top-k + normalize
+    let mut idx: Vec<usize> = (0..n_expert).collect();
+    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.truncate(k);
+    let mut wts: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+    let s: f32 = wts.iter().sum::<f32>().max(1e-6);
+    for w in &mut wts {
+        *w /= s;
+    }
+    (idx, wts)
+}
+
+/// Streaming MoE FFN over **raw quantized expert weights** (Phase 30).
+///
+/// Instead of dequantizing every expert's matrices (impossible for 512-expert
+/// models — tens of GB per layer), this slices each *selected* expert's rows
+/// directly out of the mmap-backed byte buffers and runs the existing
+/// quantized GEMV against them. Memory cost is one expert's activations at a
+/// time; the hot pages stay in the OS page cache across tokens.
+///
+/// Layouts (ggml row-major, ne[0] fastest):
+/// - `gate_up_bytes`: `[n_expert, 2*n_ff, n_embd]` quantized, expert stride
+///   = `2*n_ff * row_bytes(n_embd)`
+/// - `down_bytes`:    `[n_expert, n_embd, n_ff]` quantized, expert stride
+///   = `n_embd * row_bytes(n_ff)`
+///
+/// `input` is a single token's hidden vector `[n_embd]`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ffn_stream(
+    input: &[f32],
+    router_w: &[f32],
+    gate_up_bytes: &[u8],
+    down_bytes: &[u8],
+    ty: GGmlType,
+    n_embd: usize,
+    n_ff: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Result<Vec<f32>, QuantError> {
+    assert_eq!(input.len(), n_embd);
+    assert_eq!(router_w.len(), n_expert * n_embd);
+    assert!(n_expert_used <= n_expert);
+
+    let rb_in = tensor_size(ty, n_embd as u64)? as usize; // gate_up row bytes
+    let rb_ff = tensor_size(ty, n_ff as u64)? as usize; // down row bytes
+    let gu_rows = 2 * n_ff;
+    let gu_stride = gu_rows * rb_in;
+    let dn_stride = n_embd * rb_ff;
+
+    let mut out = vec![0.0f32; n_embd];
+    let (idx, wts) = route_topk(input, router_w, n_embd, n_expert, n_expert_used);
+
+    for (&e, &w_e) in idx.iter().zip(&wts) {
+        // Slice this expert's raw rows out of the mmap'd buffers.
+        let gu_off = e * gu_stride;
+        if gu_off + gu_stride > gate_up_bytes.len() || e * dn_stride + dn_stride > down_bytes.len() {
+            return Err(QuantError::BadLength {
+                expected: ((e + 1) * gu_stride) as u64,
+                bytes: gate_up_bytes.len(),
+            });
+        }
+        let gate_up_w = &gate_up_bytes[gu_off..gu_off + gu_stride];
+        let down_w = &down_bytes[e * dn_stride..e * dn_stride + dn_stride];
+
+        // gate_up projection [2*n_ff] straight from quantized bytes.
+        let gate_up = gemv_parallel(ty, gate_up_w, n_embd, gu_rows, input)?;
+
+        // SwiGLU
+        let mut act = vec![0.0f32; n_ff];
+        for f in 0..n_ff {
+            let g = gate_up[f];
+            let u = gate_up[n_ff + f];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            act[f] = g * s * u;
+        }
+
+        // Down projection + weighted accumulate.
+        let down_out = gemv_parallel(ty, down_w, n_ff, n_embd, &act)?;
+        for j in 0..n_embd {
+            out[j] += down_out[j] * w_e;
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Shared expert FFN (shexp)
 // ---------------------------------------------------------------------------
@@ -1161,9 +1443,10 @@ pub fn shared_expert_ffn(
 
     let mut output = vec![0.0f32; n_tokens * n_embd];
 
-    for t in 0..n_tokens {
-        let x = &input[t * n_embd..(t + 1) * n_embd];
-
+    output
+        .par_chunks_mut(n_embd)
+        .zip(input.par_chunks(n_embd))
+        .for_each(|(out_chunk, x)| {
         // Gate + up projections
         let mut gate_out = vec![0.0f32; n_ff_shexp];
         let mut up_out = vec![0.0f32; n_ff_shexp];
@@ -1206,9 +1489,9 @@ pub fn shared_expert_ffn(
 
         // Gated output
         for j in 0..n_embd {
-            output[t * n_embd + j] = sig_gate * ffn_out[j];
+            out_chunk[j] = sig_gate * ffn_out[j];
         }
-    }
+    });
 
     output
 }
@@ -1286,7 +1569,7 @@ pub fn full_layer_forward(
     shexp_down_w: &[f32],
     shexp_gate_inp_w: &[f32],
     n_ff_shexp: usize,
-    mut kv_cache: Option<KvCacheMut<'_>>,
+    mut kv_cache: Option<KvStoreMut<'_>>,
 ) -> Vec<f32> {
     let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
 
@@ -1398,20 +1681,27 @@ pub fn full_layer_forward(
     // When using cache: write new K,V to cache, then attend over full cache
     // When no cache: attend over current tokens only (self-attention)
     let (k_for_attn, v_for_attn, n_kv_for_attn) = if let Some(ref mut cache) = kv_cache {
-        // Write k_cur (n_rope, already RoPE'd) and v_cur to cache
-        let nc = cache.n_cached;
-        for t in 0..n_tokens {
-            let k_src = t * kv_dim;
-            let v_src = t * kv_dim;
-            let k_dst = (nc + t) * kv_dim;
-            let v_dst = (nc + t) * kv_dim;
-            cache.k[k_dst..k_dst + kv_dim].copy_from_slice(&k_rope[k_src..k_src + kv_dim]);
-            cache.v[v_dst..v_dst + kv_dim].copy_from_slice(&v_cur[v_src..v_src + kv_dim]);
+        match cache {
+            KvStoreMut::F32(c) => {
+                // Write k_cur (n_rope, already RoPE'd) and v_cur to cache
+                let nc = c.n_cached;
+                for t in 0..n_tokens {
+                    let k_src = t * kv_dim;
+                    let v_src = t * kv_dim;
+                    let k_dst = (nc + t) * kv_dim;
+                    let v_dst = (nc + t) * kv_dim;
+                    c.k[k_dst..k_dst + kv_dim].copy_from_slice(&k_rope[k_src..k_src + kv_dim]);
+                    c.v[v_dst..v_dst + kv_dim].copy_from_slice(&v_cur[v_src..v_src + kv_dim]);
+                }
+                let n_kv_total = nc + n_tokens;
+                (c.k[..n_kv_total * kv_dim].to_vec(),
+                 c.v[..n_kv_total * kv_dim].to_vec(),
+                 n_kv_total)
+            }
+            KvStoreMut::Q8 { .. } => {
+                panic!("f32 reference forward_pass_full_attn supports F32 KV backing only")
+            }
         }
-        let n_kv_total = nc + n_tokens;
-        (cache.k[..n_kv_total * kv_dim].to_vec(),
-         cache.v[..n_kv_total * kv_dim].to_vec(),
-         n_kv_total)
     } else {
         (k_rope.clone(), v_cur.clone(), n_tokens)
     };
@@ -1556,6 +1846,296 @@ pub fn full_layer_forward(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18 – Quantized full-attention layer forward (row-parallel gemv)
+// ---------------------------------------------------------------------------
+
+/// Quantized variant of `full_layer_forward` that accepts raw quantized weight
+/// bytes for the large projection matrices and uses `gemv_parallel` for
+/// row-parallel matmul.  Small weight vectors (norms, RoPE) stay as `&[f32]`.
+///
+/// This eliminates per-token dequant allocations and adds multi-core matmul.
+#[allow(clippy::too_many_arguments)]
+pub fn full_layer_forward_q(
+    input: &[f32],              // [n_tokens * n_embd]
+    // Attention norm (small, kept as f32)
+    attn_norm_w: &[f32],        // [n_embd]
+    // QKV projections — quantized
+    wq: (&[u8], GGmlType),     // quantized [2*n_heads*head_size, n_embd]
+    wk: (&[u8], GGmlType),     // quantized [n_kv_heads*head_size, n_embd]
+    wv: (&[u8], GGmlType),     // quantized [n_kv_heads*head_size, n_embd]
+    wo: (&[u8], GGmlType),     // quantized [n_embd, n_heads*head_size]
+    // Q/K norm weights (per-head, small)
+    q_norm_w: &[f32],           // [head_size]
+    k_norm_w: &[f32],           // [head_size]
+    // RoPE positions
+    pos: [i32; 4],
+    rope_cfg: &RopeConfig,
+    // Post-attention norm
+    post_norm_w: &[f32],        // [n_embd]
+    // Dense FFN weights — quantized
+    ffn_gate_w: (&[u8], GGmlType), // quantized [n_ff, n_embd]
+    ffn_up_w: (&[u8], GGmlType),   // quantized [n_ff, n_embd]
+    ffn_down_w: (&[u8], GGmlType), // quantized [n_embd, n_ff]
+    // Dimensions
+    n_embd: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_size: usize,
+    n_ff: usize,
+    n_tokens: usize,
+    eps: f32,
+    rope_sections: [i32; 4],
+    // MoE FFN (fused F32 from load time — keeps existing parallel expert path)
+    moe_router_w: &[f32],
+    moe_gate_up_w: &[f32],
+    moe_down_w: &[f32],
+    n_expert: usize,
+    n_expert_used: usize,
+    // Shared expert (shexp)
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_ff_shexp: usize,
+    // Streaming MoE (Phase 30): raw quantized expert weights; take priority
+    // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
+    moe_gate_up_q: (&[u8], GGmlType),
+    moe_down_q: (&[u8], GGmlType),
+    mut kv_cache: Option<KvStoreMut<'_>>,
+) -> Vec<f32> {
+    let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
+
+    // 1. Attention norm (per-token)
+    let mut normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&input[t * n_embd..(t + 1) * n_embd], attn_norm_w, eps);
+        normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 2. QKV projections via row-parallel quantized gemv
+    let n_q_full = 2 * n_heads * head_size;
+    let q_full = gemv_parallel_tokens(&normed, wq, n_embd, n_q_full, n_tokens);
+    let n_k = n_kv_heads * head_size;
+    let k_cur = gemv_parallel_tokens(&normed, wk, n_embd, n_k, n_tokens);
+    let v_cur = gemv_parallel_tokens(&normed, wv, n_embd, n_kv_heads * head_size, n_tokens);
+
+    // 3. Split Q_full into Q and gate
+    let q_size = n_heads * head_size;
+    let mut q_flat = vec![0.0f32; n_tokens * q_size];
+    let mut gate_flat = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            q_flat[t * q_size + i] = q_full[t * n_q_full + i];
+            gate_flat[t * q_size + i] = q_full[t * n_q_full + q_size + i];
+        }
+    }
+
+    // 4. QK norm (per-head)
+    let mut q_normed = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(&q_flat[t * q_size..(t + 1) * q_size], q_norm_w, head_size, eps);
+        q_normed[t * q_size..(t + 1) * q_size].copy_from_slice(&h_out);
+    }
+    let mut k_normed = vec![0.0f32; n_tokens * n_k];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(&k_cur[t * n_k..(t + 1) * n_k], k_norm_w, head_size, eps);
+        k_normed[t * n_k..(t + 1) * n_k].copy_from_slice(&h_out);
+    }
+
+    // 5. RoPE on Q and K
+    let mut q_rope = vec![0.0f32; n_tokens * q_size];
+    let mut k_rope = vec![0.0f32; n_tokens * n_k];
+    for t in 0..n_tokens {
+        for h in 0..n_heads {
+            let base = t * q_size + h * head_size;
+            let slice = &q_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            q_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+        for h in 0..n_kv_heads {
+            let base = t * n_k + h * head_size;
+            let slice = &k_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            k_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+    }
+
+    // 6. KV cache write
+    let kv_dim = n_kv_heads * head_size;
+    let row_bytes = KvStoreMut::q8_row_bytes(kv_dim);
+    if let Some(ref mut cache) = kv_cache {
+        match cache {
+            KvStoreMut::F32(c) => {
+                let nc = c.n_cached;
+                for t in 0..n_tokens {
+                    c.k[(nc + t) * kv_dim..(nc + t + 1) * kv_dim]
+                        .copy_from_slice(&k_rope[t * kv_dim..(t + 1) * kv_dim]);
+                    c.v[(nc + t) * kv_dim..(nc + t + 1) * kv_dim]
+                        .copy_from_slice(&v_cur[t * kv_dim..(t + 1) * kv_dim]);
+                }
+            }
+            KvStoreMut::Q8 { k, v, n_cached, .. } => {
+                let nc = *n_cached;
+                for t in 0..n_tokens {
+                    KvStoreMut::pack_row(k, (nc + t) * row_bytes, &k_rope[t * kv_dim..(t + 1) * kv_dim]);
+                    KvStoreMut::pack_row(v, (nc + t) * row_bytes, &v_cur[t * kv_dim..(t + 1) * kv_dim]);
+                }
+            }
+        }
+    }
+
+    // 7. Full attention (Q @ K^T → softmax → @ V) — Phase 26 flash kernel
+    let scale = 1.0f32 / (head_size as f32).sqrt();
+    let (k_for_attn, v_for_attn, n_kv_for_attn): (Vec<f32>, Vec<f32>, usize) = if let Some(ref cache) = kv_cache {
+        match cache {
+            KvStoreMut::F32(c) => {
+                let n_kv_total = c.n_cached + n_tokens;
+                (c.k[..n_kv_total * kv_dim].to_vec(),
+                 c.v[..n_kv_total * kv_dim].to_vec(),
+                 n_kv_total)
+            }
+            KvStoreMut::Q8 { k, v, n_cached, .. } => {
+                // Dequantize-on-read: transient scratch for attention only.
+                let n_kv_total = *n_cached + n_tokens;
+                let mut kd = vec![0.0f32; n_kv_total * kv_dim];
+                let mut vd = vec![0.0f32; n_kv_total * kv_dim];
+                for p in 0..n_kv_total {
+                    KvStoreMut::unpack_row(k, p * row_bytes, &mut kd[p * kv_dim..(p + 1) * kv_dim]);
+                    KvStoreMut::unpack_row(v, p * row_bytes, &mut vd[p * kv_dim..(p + 1) * kv_dim]);
+                }
+                (kd, vd, n_kv_total)
+            }
+        }
+    } else {
+        (k_rope.clone(), v_cur.clone(), n_tokens)
+    };
+    let attn_out = attention_forward_flash(
+        &q_rope, &k_for_attn, &v_for_attn,
+        n_heads, n_kv_heads, head_size,
+        n_tokens, n_kv_for_attn, scale, true,
+    );
+
+    // 8. Gate sigmoid + multiply
+    let mut gated = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            let g = gate_flat[t * q_size + i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            gated[t * q_size + i] = attn_out[t * q_size + i] * s;
+        }
+    }
+
+    // 9. Output projection: gated @ wo^T → [n_embd] — row-parallel quantized
+    let attn_residual = gemv_parallel_tokens(&gated, wo, q_size, n_embd, n_tokens);
+
+    // 10. Residual connection
+    let mut residual1 = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        residual1[i] = input[i] + attn_residual[i];
+    }
+
+    // 10. Post-attention norm (per-token)
+    let mut post_normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&residual1[t * n_embd..(t + 1) * n_embd], post_norm_w, eps);
+        post_normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 11. FFN: dense SwiGLU (quantized) or MoE (streaming or F32-fused)
+    let ffn_out = if n_expert > 0 && !moe_gate_up_q.0.is_empty() {
+        // Phase 30 streaming path: per-token routing + per-expert quantized
+        // GEMV directly on mmap-backed byte slices. O(active experts) memory.
+        let mut moe_out = vec![0.0f32; n_tokens * n_embd];
+        for t in 0..n_tokens {
+            let row = moe_ffn_stream(
+                &post_normed[t * n_embd..(t + 1) * n_embd],
+                moe_router_w, moe_gate_up_q.0, moe_down_q.0, moe_gate_up_q.1,
+                n_embd, n_ff, n_expert, n_expert_used,
+            ).expect("moe_ffn_stream");
+            moe_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+        }
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed, shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w,
+                n_embd, n_ff_shexp, n_tokens,
+            );
+            for i in 0..n_tokens * n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else if n_expert > 0 {
+        let mut moe_out = moe_ffn(
+            &post_normed, moe_router_w, moe_gate_up_w, moe_down_w,
+            n_embd, n_ff, n_expert, n_expert_used, n_tokens,
+        );
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed, shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w,
+                n_embd, n_ff_shexp, n_tokens,
+            );
+            for i in 0..n_tokens * n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else {
+        // Dense SwiGLU: gate + up → silu(gate)*up → down — all quantized
+        let ffn_gate_out = gemv_parallel_tokens(&post_normed, ffn_gate_w, n_embd, n_ff, n_tokens);
+        let ffn_up_out = gemv_parallel_tokens(&post_normed, ffn_up_w, n_embd, n_ff, n_tokens);
+        // SwiGLU
+        let mut ffn_act = vec![0.0f32; n_tokens * n_ff];
+        for i in 0..n_tokens * n_ff {
+            let g = ffn_gate_out[i];
+            let u = ffn_up_out[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[i] = g * s * u;
+        }
+        // down projection — quantized
+        gemv_parallel_tokens(&ffn_act, ffn_down_w, n_ff, n_embd, n_tokens)
+    };
+
+    // 12. Final residual
+    let mut output = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        output[i] = residual1[i] + ffn_out[i];
+    }
+
+    output
+}
+
+/// Helper: run quantized gemv for each token position.
+/// `input` is `[n_tokens, n_in]`, weight is `(&[u8], GGmlType)`, output is `[n_tokens, n_out]`.
+fn gemv_parallel_tokens(
+    input: &[f32],
+    weight: (&[u8], GGmlType),
+    n_in: usize,
+    n_out: usize,
+    n_tokens: usize,
+) -> Vec<f32> {
+    let (w_data, w_ty) = weight;
+    let mut out = vec![0.0f32; n_tokens * n_out];
+    // For single-token decode (the common case), just call gemv_parallel directly.
+    // For multi-token prefill, parallelise across tokens as well.
+    if n_tokens == 1 {
+        let result = gemv_parallel(w_ty, w_data, n_in, n_out, input)
+            .expect("gemv_parallel failed");
+        out.copy_from_slice(&result);
+    } else {
+        out.par_chunks_mut(n_out)
+            .zip(input.par_chunks(n_in))
+            .for_each(|(out_row, in_row)| {
+                let result = gemv_parallel(w_ty, w_data, n_in, n_out, in_row)
+                    .expect("gemv_parallel failed");
+                out_row.copy_from_slice(&result);
+            });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3d – End-to-end forward pass (embed → layers → LM head → argmax)
 // ---------------------------------------------------------------------------
 
@@ -1618,6 +2198,74 @@ pub struct KvCacheMut<'a> {
     pub k: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
     pub v: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
     pub n_cached: usize,   // number of positions already cached
+}
+
+/// Backing storage variant for a layer's KV cache (Phase 25).
+///
+/// `F32` stores K/V as raw f32 rows. `Q8` stores each token row packed as
+/// Q8_0 blocks ((kv_dim/32) blocks × (2-byte f16 scale + 32 i8 values)),
+/// cutting durable cache memory ~3.8x at the cost of a dequantize-on-read
+/// scratch buffer during attention.
+pub enum KvStoreMut<'a> {
+    F32(KvCacheMut<'a>),
+    Q8 {
+        k: &'a mut [u8],       // [capacity_tokens * row_bytes]
+        v: &'a mut [u8],       // [capacity_tokens * row_bytes]
+        n_cached: usize,
+        kv_dim: usize,
+    },
+}
+
+impl<'a> KvStoreMut<'a> {
+    /// Number of positions already cached.
+    pub fn n_cached(&self) -> usize {
+        match self {
+            KvStoreMut::F32(c) => c.n_cached,
+            KvStoreMut::Q8 { n_cached, .. } => *n_cached,
+        }
+    }
+
+    /// Packed byte length of one Q8_0 row covering `n` elements
+    /// ((n/32) blocks × (2-byte f16 scale + 32 i8 values) = 34 bytes/block).
+    pub fn q8_row_bytes(n: usize) -> usize {
+        n.div_ceil(QK8_0) * (2 + QK8_0)
+    }
+
+    /// Pack one f32 row into Q8_0 blocks written at `byte_off`.
+    /// Rows whose length is not a multiple of 32 are zero-padded.
+    pub(crate) fn pack_row(dst: &mut [u8], byte_off: usize, src: &[f32]) {
+        let packed = if src.len().is_multiple_of(QK8_0) {
+            quantize_row_q8_0(src)
+        } else {
+            let mut padded = src.to_vec();
+            padded.resize(src.len().next_multiple_of(QK8_0), 0.0);
+            quantize_row_q8_0(&padded)
+        };
+        dst[byte_off..byte_off + packed.len()].copy_from_slice(&packed);
+    }
+
+    /// Unpack one Q8_0 row from `src` at `byte_off` into `dst`.
+    /// Handles rows shorter than a whole number of blocks.
+    pub(crate) fn unpack_row(src: &[u8], byte_off: usize, dst: &mut [f32]) {
+        const BLOCK_BYTES: usize = 2 + QK8_0;
+        let n = dst.len();
+        let blocks = n.div_ceil(QK8_0);
+        for b in 0..blocks {
+            let base = byte_off + b * BLOCK_BYTES;
+            // Layout per block: f16 d | QK8_0 i8 quants (matches quant.rs).
+            let scale = f16_from_le_bytes([src[base], src[base + 1]]);
+            for j in 0..QK8_0 {
+                let idx = b * QK8_0 + j;
+                if idx < n {
+                    dst[idx] = scale * (src[base + 2 + j] as i8 as f32);
+                }
+            }
+        }
+    }
+}
+
+fn f16_from_le_bytes(b: [u8; 2]) -> f32 {
+    crate::model::quant::fp16_to_f32(u16::from_le_bytes(b))
 }
 
 /// All weights needed for a single full-attention layer.
@@ -1985,6 +2633,217 @@ pub fn delta_net_layer_forward(
             out[j] = acc;
         }
         out
+    };
+
+    // 15. Final residual
+    let mut output = vec![0.0f32; n_embd];
+    for i in 0..n_embd {
+        output[i] = residual1[i] + ffn_out[i];
+    }
+
+    output
+}
+
+/// Quantized delta-net layer forward: same flow as `delta_net_layer_forward` but
+/// large projection matrices (wqkv, wqkv_gate, ssm_out, ffn_gate/up/down) stay
+/// in quantized form and are computed via `gemv_parallel`. Small norms/params stay f32.
+/// MoE weights stay fused-F32 from load time.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn delta_net_layer_forward_q(
+    input: &[f32],               // [n_embd]
+    // Attention norm (small, kept as f32)
+    attn_norm_w: &[f32],
+    // Quantized projections
+    wqkv: (&[u8], GGmlType),           // [conv_dim, n_embd]
+    wqkv_gate: (&[u8], GGmlType),      // [ba_dim, n_embd]
+    conv_kernel: &[f32],                // [conv_dim, conv_kernel_size] — small
+    alpha_bias: &[f32],                 // [n_heads_v] — small
+    ssm_a: &[f32],                      // [n_heads_v] — small
+    ssm_norm_w: &[f32],                 // [s_v * n_heads_v] — small
+    ssm_out: (&[u8], GGmlType),         // [n_embd, v_size]
+    post_norm_w: &[f32],
+    // Dense FFN — quantized
+    ffn_gate_w: (&[u8], GGmlType),     // [n_ff, n_embd]
+    ffn_up_w: (&[u8], GGmlType),       // [n_ff, n_embd]
+    ffn_down_w: (&[u8], GGmlType),     // [n_embd, n_ff]
+    // MoE FFN (fused F32)
+    moe_router_w: &[f32],
+    moe_gate_up_w: &[f32],
+    moe_down_w: &[f32],
+    n_expert: usize,
+    n_expert_used: usize,
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_ff_shexp: usize,
+    // Streaming MoE (Phase 30): raw quantized expert weights; take priority
+    // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
+    moe_gate_up_q: (&[u8], GGmlType),
+    moe_down_q: (&[u8], GGmlType),
+    // Dimensions
+    n_embd: usize,
+    n_ff: usize,
+    conv_dim: usize,
+    conv_kernel_size: usize,
+    ba_dim: usize,
+    s_k: usize,
+    s_v: usize,
+    n_heads_k: usize,
+    n_heads_v: usize,
+    eps: f32,
+    conv_state: &mut [f32],
+    ssm_state: &mut [f32],
+) -> Vec<f32> {
+    let q_size = s_k * n_heads_k;
+    let k_size = s_k * n_heads_k;
+    let v_size = s_v * n_heads_v;
+
+    // 1. Attention norm (per-token, f32)
+    let normed = rms_norm(input, attn_norm_w, eps);
+
+    // 2. QKV projection — quantized gemv
+    let qkv = gemv_parallel(wqkv.1, wqkv.0, n_embd, conv_dim, &normed)
+        .expect("gemv wqkv");
+
+    // 3. Gate projection — quantized gemv
+    let gate_proj = gemv_parallel(wqkv_gate.1, wqkv_gate.0, n_embd, ba_dim, &normed)
+        .expect("gemv wqkv_gate");
+
+    // 4. Process alpha/beta from gate_proj
+    let ratio = n_heads_v / n_heads_k;
+    let mut alpha = vec![0.0f32; n_heads_v];
+    let mut beta = vec![0.0f32; n_heads_v];
+    for hi in 0..n_heads_k {
+        for j in 0..ratio {
+            let v_hi = hi * ratio + j;
+            beta[v_hi] = gate_proj[hi * ratio + j];
+            alpha[v_hi] = gate_proj[n_heads_k * ratio + hi * ratio + j];
+        }
+    }
+
+    // 5. Decay gate: softplus(alpha + bias) * ssm_a
+    let mut decay_gate = vec![0.0f32; n_heads_v];
+    for v_hi in 0..n_heads_v {
+        let sp = (alpha[v_hi] + alpha_bias[v_hi]).exp().ln_1p();
+        decay_gate[v_hi] = sp * ssm_a[v_hi];
+    }
+
+    // 6. Conv1d: slide over [conv_state | qkv] concatenated
+    let (conv_out, new_conv_state) = conv1d_silu(
+        &qkv, conv_kernel, conv_state,
+        conv_dim, 1, conv_kernel_size,
+    );
+    conv_state.copy_from_slice(&new_conv_state);
+
+    // 7. Split conv output → q_conv, k_conv, v_conv
+    let q_conv_raw = &conv_out[0..q_size];
+    let k_conv_raw = &conv_out[q_size..q_size + k_size];
+    let v_conv = conv_out[q_size + k_size..q_size + k_size + v_size].to_vec();
+
+    // 8. Repeat Q and K to match V-head count when n_heads_k != n_heads_v
+    let ratio = n_heads_v / n_heads_k;
+    let q_conv = {
+        let mut out = vec![0.0f32; s_k * n_heads_v];
+        for hi in 0..n_heads_k {
+            for r in 0..ratio {
+                let dst_hi = hi * ratio + r;
+                for d in 0..s_k {
+                    out[dst_hi * s_k + d] = q_conv_raw[hi * s_k + d];
+                }
+            }
+        }
+        out
+    };
+    let k_conv = {
+        let mut out = vec![0.0f32; s_k * n_heads_v];
+        for hi in 0..n_heads_k {
+            for r in 0..ratio {
+                let dst_hi = hi * ratio + r;
+                for d in 0..s_k {
+                    out[dst_hi * s_k + d] = k_conv_raw[hi * s_k + d];
+                }
+            }
+        }
+        out
+    };
+
+    // 9. Delta-net autoregressive
+    let attn_out = delta_net_autoregressive(
+        &q_conv, &k_conv, &v_conv,
+        &decay_gate, &beta, ssm_state,
+        s_k, s_v, n_heads_v, eps,
+    );
+
+    // 10. Gated norm: rms_norm(attn_out) * silu(gate)
+    let normed_attn = rms_norm(&attn_out, ssm_norm_w, eps);
+    let mut gated_attn = vec![0.0f32; v_size];
+    for i in 0..v_size {
+        let v_hi = i / s_v;
+        let s = 1.0f32 / (1.0f32 + (-alpha[v_hi]).exp());
+        gated_attn[i] = normed_attn[i] * s;
+    }
+
+    // 11. Output projection — quantized gemv (ssm_out: [n_embd, v_size])
+    let attn_residual = gemv_parallel(ssm_out.1, ssm_out.0, v_size, n_embd, &gated_attn)
+        .expect("gemv ssm_out");
+
+    // 12. Residual
+    let mut residual1 = vec![0.0f32; n_embd];
+    for i in 0..n_embd {
+        residual1[i] = input[i] + attn_residual[i];
+    }
+
+    // 13. Post-attention norm (f32)
+    let post_normed = rms_norm(&residual1, post_norm_w, eps);
+
+    // 14. FFN: dense SwiGLU (quantized), streaming MoE, or F32-fused MoE
+    let ffn_out = if n_expert > 0 && !moe_gate_up_q.0.is_empty() {
+        let row = moe_ffn_stream(
+            &post_normed, moe_router_w, moe_gate_up_q.0, moe_down_q.0,
+            moe_gate_up_q.1, n_embd, n_ff, n_expert, n_expert_used,
+        ).expect("moe_ffn_stream");
+        let mut moe_out = row;
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed, shexp_gate_w, shexp_up_w, shexp_down_w,
+                shexp_gate_inp_w, n_embd, n_ff_shexp, 1,
+            );
+            for i in 0..n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else if n_expert > 0 {
+        let mut moe_out = moe_ffn(
+            &post_normed, moe_router_w, moe_gate_up_w, moe_down_w,
+            n_embd, n_ff, n_expert, n_expert_used, 1,
+        );
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed, shexp_gate_w, shexp_up_w, shexp_down_w,
+                shexp_gate_inp_w, n_embd, n_ff_shexp, 1,
+            );
+            for i in 0..n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else {
+        // Dense SwiGLU: quantized gate/up → silu(gate)*up → quantized down
+        let ffn_gate_out = gemv_parallel(ffn_gate_w.1, ffn_gate_w.0, n_embd, n_ff, &post_normed)
+            .expect("gemv ffn_gate");
+        let ffn_up_out = gemv_parallel(ffn_up_w.1, ffn_up_w.0, n_embd, n_ff, &post_normed)
+            .expect("gemv ffn_up");
+        let mut ffn_act = vec![0.0f32; n_ff];
+        for i in 0..n_ff {
+            let g = ffn_gate_out[i];
+            let u = ffn_up_out[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[i] = g * s * u;
+        }
+        gemv_parallel(ffn_down_w.1, ffn_down_w.0, n_ff, n_embd, &ffn_act)
+            .expect("gemv ffn_down")
     };
 
     // 15. Final residual

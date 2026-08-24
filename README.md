@@ -1,0 +1,434 @@
+# qwen3-5-397b-in-rust
+
+<div align="center">
+
+<h1>Qwen3.5-397B-A17B — CPU-only inference in safe Rust</h1>
+<h3>A 397-billion-parameter model. One CPU. 10–14 GB RSS.</h3>
+
+<p>Qwen3.5-397B-A17B inference in safe Rust. No CUDA. No BLAS. No framework.</p>
+
+<p>
+<a href="https://github.com/shinde/qwen3-5-397b-in-rust/actions"><img src="https://img.shields.io/badge/tests-106%20passing-brightgreen?style=flat-square" alt="tests"></a>
+<img src="https://img.shields.io/badge/clippy-0%20warnings-success?style=flat-square" alt="clippy">
+<img src="https://img.shields.io/badge/rust-safe%20%2B%20SIMD-orange?style=flat-square" alt="rust">
+<a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20aarch64-lightgrey?style=flat-square" alt="platform"></a>
+</p>
+
+<table>
+<tr>
+<td align="center"><b>397 B</b><br><sub>parameters</sub></td>
+<td align="center"><b>240 GB</b><br><sub>checkpoint on disk</sub></td>
+<td align="center"><b>~10–14 GB</b><br><sub>RSS ceiling, mmap-streamed</sub></td>
+<td align="center"><b>13 888</b><br><sub>lines of Rust</sub></td>
+<td align="center"><b>0</b><br><sub>GPUs</sub></td>
+</tr>
+</table>
+
+<p><b>The same model runs in 12 GB and would run in 224 GB — identical tokens, different clocks.</b><br>
+More memory only buys speed, because the OS page cache is the expert cache:</p>
+
+<table>
+<tr><th align="left">machine</th><th align="right">free RAM</th><th align="left">what is going on</th></tr>
+<tr><td align="left">small laptop</td><td align="right">~10 GB</td><td>every token streams ~9 GB of active experts off NVMe</td></tr>
+<tr><td align="left">this laptop</td><td align="right">13 GB</td><td>hot experts stay cached between tokens; cold ones stream</td></tr>
+<tr><td align="left">workstation</td><td align="right">64 GB+</td><td>a large slice of routed experts becomes resident</td></tr>
+<tr><td align="left">server</td><td align="right">256 GB</td><td>dense layers resident too; disk wait disappears</td></tr>
+</table>
+</div>
+
+---
+
+## Project Overview
+
+This repository implements a CPU-only inference engine for **Qwen3.5-397B-A17B** in safe Rust. The model is shipped as 7-shard Q4_K_M GGUF (~240 GB). Rather than requiring the full checkpoint in RAM, the engine mmmaps the shards, streams only the experts that fire per token, and uses delta-net recurrence for 45 of 60 layers to keep sequence memory O(1).
+
+The implementation is verified against the production checkpoint header and validated with a three-tier golden reference, path parity, and end-to-end synthetic tests.
+
+### Key Features
+
+| Feature | Detail |
+|---|---|
+| **Memory streaming** | `memmap2` zero-copy access; OS page cache as expert cache |
+| **Streaming MoE** | Top-10 of 512 experts per layer; only touched rows are read |
+| **Hybrid attention** | 45 delta-net recurrent layers + 15 full-attention layers (`full_attention_interval=4`) |
+| **Quantized kernels** | Q8_0 / Q4_K / Q5_K / Q6_K / F32 with AVX2+FMA / NEON dispatch |
+| **Paged KV + optional Q8** | Geometric growth cache, absolute-position indexed |
+| **Speculative verification** | Greedy draft accept/reject with state snapshotting |
+| **Chat & batching** | Qwen3.5 ChatML template, continuous batching, chunked prefill |
+| **Test pyramid** | 106 tests, numpy golden references, scalar/SIMD parity |
+
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph User["User / CLI"]
+        Run["bin/run.rs<br/>completion / chat / batch"]
+        Bench["bin/bench.rs<br/>micro & e2e timings"]
+        Fetch["bin/fetch.rs<br/>HF download + SHA-256"]
+        KernCheck["bin/kern_check.rs<br/>numpy ↔ Rust parity"]
+    end
+
+    subgraph Lib["qwen3-5-397b-in-rust"]
+        Tokenizer["tokenizer/<br/>tokenizers crate"]
+        GGUF["gguf/*<br/>v3 parser, metadata, multi-shard"]
+        HF["hf.rs<br/>HF Hub helpers"]
+        Chat["chat.rs<br/>Qwen3.5 ChatML template"]
+        Model["model/*"]
+    end
+
+    subgraph Model["model"]
+        Config["config.rs<br/>Qwen3_5Config + validation"]
+        Quant["quant.rs<br/>Q8/Q4K/Q5K/Q6K codecs"]
+        SIMD["simd.rs<br/>AVX2/NEON dispatch"]
+        Kernels["kernels.rs<br/>norms, GEMV/GEMM, IMRoPE, flash attn, delta-net, MoE"]
+        Loader["loader.rs<br/>shard assembly → ModelWeights"]
+        Pipeline["pipeline.rs<br/>prefill, decode, scheduler, verify_draft, timing"]
+        Sampler["sampler.rs<br/>temp/top-k/top-p/repeat"]
+        Synth["synth.rs<br/>synthetic GGUF factory"]
+    end
+
+    Run --> Tokenizer
+    Run --> GGUF
+    Run --> Chat
+    Run --> Model
+    Bench --> Model
+    Fetch --> HF
+    Fetch --> GGUF
+    KernCheck --> Kernels
+
+    classDef cli fill:#e1f5fe,stroke:#0277bd;
+    classDef lib fill:#f3e5f5,stroke:#7b1fa2;
+    classDef model fill:#fff3e0,stroke:#ef6c00;
+    class User,Run,Bench,Fetch,KernCheck cli;
+    class Tokenizer,GGUF,HF,Chat,Lib lib;
+    class Config,Quant,SIMD,Kernels,Loader,Pipeline,Sampler,Synth,Model model;
+```
+
+**How it fits together**
+
+* **Fetch** resolves a HuggingFace repo, lists GGUF files, downloads with resume and SHA-256 verification, and optionally pulls `tokenizer.json`.
+* **GGUF** parses v3 headers, metadata, tensor descriptors, and discovers split shards. `memmap2` provides zero-copy `&[u8]` slices.
+* **Loader** assembles the shards into `ModelWeights` with `Arc<Mmap>`-backed raw tensors.
+* **Config** builds a typed `Qwen3_5Config` from metadata and validates invariants (arch name, rope sections `[11,11,10,0]`, derived dims).
+* **Pipeline** drives token-by-token forward passes: embed → 60 layers → LM head → sample. GenerationState holds paged KV, conv/SSM buffers, and timing.
+* **Kernels** implement numeric primitives with scalar reference paths and SIMD-optimized dispatches. Quantized GEMV runs block-wise against packed weights without full dequantization.
+* **Streaming MoE** routes top-10 experts, slices only those expert rows from mmap, and accumulates weighted outputs with a resident shared expert.
+
+## Component / Service Relationships
+
+```mermaid
+graph LR
+    CLI["bin/*"]
+    Lib["src/lib.rs"]
+    GGUF["gguf/"]
+    HF["hf.rs"]
+    Tokenizer["tokenizer/"]
+    Chat["chat.rs"]
+    Model["model/"]
+
+    CLI --> Lib
+    Lib --> GGUF
+    Lib --> HF
+    Lib --> Tokenizer
+    Lib --> Chat
+    Lib --> Model
+
+    Model --> GGUF
+
+    subgraph Detail["model/* dependencies"]
+        Config
+        Quant
+        Kernels
+        Loader
+        Pipeline
+        Sampler
+    end
+
+    Config --> Pipeline
+    Loader --> Pipeline
+    Kernels --> Pipeline
+    Quant --> Kernels
+    Sampler --> Pipeline
+
+    classDef core fill:#bbdefb,stroke:#1565c0;
+    class CLI,Lib,Lib core;
+```
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+    participant U as CLI
+    participant F as fetch.rs
+    participant HF as HuggingFace Hub
+    participant G as gguf loader
+    participant M as ModelWeights (mmap)
+    participant P as Pipeline
+    participant T as Tokenizer
+    participant S as Sampler
+
+    U->>F: fetch repo
+    F->>HF: download shards + tokenizer.json
+    HF-->>F: bytes
+    U->>G: open shard 00001
+    G->>M: mmap + shard discovery
+    U->>T: load tokenizer.json
+    U->>P: prefill prompt
+    P->>M: embed + 60 layers
+    loop decode
+        P->>M: delta-net / flash attn / MoE streaming
+        P->>S: logits → sample
+        S-->>U: token
+    end
+```
+
+## Major Pipelines
+
+### 1. Fetch & Verify Pipeline
+
+Inputs: repo_id, optional file, output directory  
+Processing: list GGUF files, resolve URL, streaming download with `.part` resume, SHA-256 check, tokenizer fetch  
+Outputs: GGUF shards on disk, `tokenizer.json`  
+Dependencies: `hf.rs`, `ureq`, `memmap2`
+
+### 2. Load & Validate Pipeline
+
+Inputs: first shard path  
+Processing: GGUF header parse → metadata → `Qwen3_5Config::from_metadata` → invariant validation → shard discovery → `ModelLoader` → `ModelWeights`  
+Outputs: validated config + mmap-backed tensors  
+Key files: `src/gguf/*`, `src/model/config.rs`, `src/model/loader.rs`
+
+### 3. Prefill → Decode Pipeline
+
+Inputs: token ids  
+Processing:
+* `embed_tokens` f32 gather
+* For each of 60 layers:
+  * Delta-net branch if `layer % 4 != 0` else flash attention
+  * RMSNorm → projection → gating → recurrence / attention
+  * Post-norm → MoE / SwiGLU with top-10 routing, streaming GEMV
+* LM head RMSNorm → logits → sample
+
+Outputs: generated token stream, `GenerationState` with timings  
+See `src/model/pipeline.rs` and the anatomy diagram below.
+
+### 4. Chat Pipeline
+
+`chat.rs` implements the text-only Qwen3.5 ChatML template: `<|im_start|>{role}\n{content}<|im_end|>\n`, thinking-mode toggle, system prompt, truncation.
+
+### 5. Batch & Speculative Pipelines
+
+* Batch: lockstep parallel decode via scheduler
+* Speculative: `verify_draft` snapshots conv/SSM/KV buffers, verifies `[ctx]+draft` in one batched pass, rolls back and re-drives accepted tokens.
+
+## Detailed Workflows — Model Architecture
+
+### Two kinds of attention
+
+```mermaid
+flowchart TB
+    subgraph L["layer_idx % 4 != 0 · 45 layers · delta-net"]
+    direction TB
+    A0["attn_norm RMSNorm"] --> A1["wqkv projection GEMV"]
+    A1 --> A2["wqkv_gate → β sigmoid<br/>α decay gates"]
+    A2 --> A3["conv1d k=4 + SiLU"]
+    A3 --> A4["delta-net recurrence<br/>state 128×128 per head<br/>FIXED SIZE"]
+    A4 --> A5["gated RMSNorm → ssm_out"]
+    end
+
+    subgraph F["layer_idx % 4 == 0 · 15 layers · full attention"]
+    direction TB
+    B0["attn_norm RMSNorm"] --> B1["wq wk wv"]
+    B1 --> B2["QK-norm per head<br/>IMRoPE [11,11,10,0]"]
+    B2 --> B3["flash attention<br/>online softmax, GQA 16:1<br/>paged KV"]
+    B3 --> B4["sigmoid gate × wo"]
+    end
+
+    A5 --> R1(("+ residual"))
+    B4 --> R2(("+ residual"))
+    R1 --> N1["post_norm"] --> FFN
+    R2 --> N2["post_norm"] --> FFN
+    FFN["FFN: router 512→top-10 + shared expert"] --> OUT(("+ residual → next layer"))
+
+    classDef dn fill:#c8e6c9,stroke:#2e7d32;
+    classDef fa fill:#ffe0b2,stroke:#ef6c00;
+    class L,A0,A1,A2,A3,A4,A5,R1,N1 dn;
+    class F,B0,B1,B2,B3,B4,R2,N2 fa;
+```
+
+### Decode step anatomy
+
+```mermaid
+sequenceDiagram
+    participant T as token id
+    participant P as pipeline
+    participant D as delta-net ×45
+    participant FA as full-attn ×15
+    participant M as MoE
+    participant H as LM head
+
+    T->>P: embed_tokens
+    loop layer 0..60
+        P->>D: recurrent branch if i%4≠0
+        D-->>P: conv_state, ssm_state updated
+        P->>FA: attention branch if i%4=0
+        FA->>FA: append K,V to paged cache
+        FA-->>P: attends over prefix
+        Note over P,M: post_norm → FFN
+        P->>M: route_topk → 10 experts
+        M->>M: gemv on raw mmap bytes
+        M-->>P: Σ wₑ·expertₑ + σ(gate)·shared
+    end
+    P->>H: rms_norm → logits → argmax/sample
+```
+
+### Streaming MoE
+
+```mermaid
+flowchart LR
+    X["x ∈ R⁴⁰⁹⁶"] --> RT["route_topk<br/>softmax → top-10"]
+    RT --> SL["slice expert rows"]
+    subgraph MM["mmap-backed bytes"]
+        GU["gate_up_w Q4_K"]
+        DN["down_w Q4_K"]
+    end
+    SL --> GV1["gemv_parallel"]
+    GV1 --> SW["SwiGLU"]
+    SW --> GV2["gemv_parallel"]
+    GV2 --> WS["Σ wₑ·yₑ"]
+    SH["shared expert resident"] --> GA["σ(gate)"]
+    GA --> WS
+    WS --> OUT["FFN output"]
+
+    classDef mmap fill:#ffccbc,stroke:#d84315;
+    class MM,GU,DN mmap;
+```
+
+### Validation pyramid
+
+```mermaid
+flowchart TB
+    subgraph T1["Tier 1 · golden references"]
+        PY["tests/golden/*.py numpy kernels"]
+        KC["kern_check"]
+        PY --> KC
+    end
+    subgraph T2["Tier 2 · path parity"]
+        CV["opt ↔ naive parity"]
+    end
+    subgraph T3["Tier 3 · end-to-end"]
+        E2E["synth.rs models, scheduler, speculative"]
+    end
+    T1 --> T2 --> E2E
+```
+
+## Project Structure
+
+```
+src/
+├── gguf/            GGUF v3 reader/writer, metadata, tensor, header
+├── hf.rs            HF Hub helpers, resumable download, SHA-256
+├── tokenizer/       tokenizer.json loader
+├── chat.rs          Qwen3.5 ChatML template
+├── model/
+│   ├── config.rs    metadata → typed config + validator
+│   ├── quant.rs     Q8_0/Q4_K/Q5_K/Q6_K/F32 codecs
+│   ├── simd.rs      AVX2+FMA / NEON dispatch
+│   ├── kernels.rs   norms, GEMV/GEMM, IMRoPE, flash attn, delta-net, MoE
+│   ├── loader.rs    shard assembly → ModelWeights
+│   ├── pipeline.rs  prefill/decode, paged KV, scheduler, verify_draft, timing
+│   ├── sampler.rs   temperature/top-k/top-p/repeat-penalty
+│   └── synth.rs     synthetic GGUF factory
+└── bin/
+    ├── run.rs       completion / chat / batch CLI
+    ├── bench.rs     micro & e2e benchmarks
+    ├── kern_check.rs numpy harness
+    └── fetch.rs     downloader
+tests/
+├── e2e.rs
+└── golden/          python generators + checkers
+ref/                 llama.cpp / ggml reference sources
+```
+
+## Configuration & Invariants
+
+`Qwen3_5Config` is built from GGUF metadata and validates:
+
+* `general.architecture` = `qwen35moe` or `qwen3_5moe`
+* `full_attention_interval = 4`, `block_count = 60`
+* `expert_count = 512`, `expert_used_count = 10`
+* `rope_sections = [11,11,10,0]`
+* Derived dims: `conv_dim = 2*key_dim + value_dim`, `ba_dim = 2*ssm_time_step_rank`
+
+Production metadata is pinned in `validate_accepts_real_397b_metadata`.
+
+## Local Development / Setup
+
+```bash
+git clone https://github.com/shinde/qwen3-5-397b-in-rust.git
+cd qwen3-5-397b-in-rust
+cargo build --release
+cargo test   # 106 tests, no checkpoint required
+```
+
+Requirements: Linux x86-64/aarch64, Rust ≥1.80, 8 GB RAM for tests, 240 GB storage for model.
+
+## Running the System
+
+Fetch checkpoint:
+```bash
+cargo run --bin fetch -- lmstudio-community/Qwen3.5-397B-A17B-GGUF \
+  --file Qwen3.5-397B-A17B-Q4_K_M-00001-of-00007.gguf \
+  --out ~/models/qwen35-397b
+curl -L -o ~/models/qwen35-397b/tokenizer.json \
+  https://huggingface.co/Qwen/Qwen3.5-397B-A17B/resolve/main/tokenizer.json
+```
+
+Run:
+```bash
+./target/release/run ~/models/.../Qwen3.5-397B-A17B-Q4_K_M-00001-of-00007.gguf \
+  ~/models/.../tokenizer.json "Explain quantum entanglement." --n-predict 128 --kv-q8
+
+# chat
+./target/release/run <model> <tokenizer> --chat --kv-q8
+
+# batch
+./target/release/run <model> <tokenizer> --batch prompts.txt
+```
+
+Flags: `--n-predict`, `--temperature`, `--top-k`, `--top-p`, `--repeat-penalty`, `--argmax`, `--kv-q8`, `--chat`, `--system`, `--no-think`, `--batch`.
+
+## Testing
+
+```bash
+cargo test
+./target/release/bench --e2e --preset tiny --steps 32
+```
+
+Tier 1 golden references, Tier 2 path parity, Tier 3 end-to-end synthetic models.
+
+## Deployment
+
+No container is required. The engine is a single binary; model shards are mmapped from disk. For production, ensure NVMe storage, sufficient RAM for page cache, and run on Linux with AVX2/NEON.
+
+## Troubleshooting
+
+* **First token slow** – cold page cache; subsequent tokens warm.
+* **Output changes with RAM?** – No. Greedy decoding is byte-identical; RAM changes speed only.
+* **Spinning rust** – Runs, but decode bandwidth is disk-bound (~9 GB active reads/token for Q4_K_M).
+* **Missing tensors** – Loader validates and warns on shard boundaries; full model load validates strictly.
+
+## Future Improvements
+
+* Draft-model speculative decoding
+* Persistent prompt cache
+* GPU kernels (contrary to current philosophy)
+* Windows/macOS support
+
+## License
+
+Implementation against public specs. Model weights follow Alibaba Qwen license.
+
+---
+
+*Download note while writing: shard 1 streaming at per-IP cap — see `~/models/qwen35-397b/download.log`*

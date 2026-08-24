@@ -91,7 +91,8 @@ fn usage_e2e() {
          \x20 --preset NAME     tiny | medium (default) | large\n\
          \x20 --steps N         decode steps per timing run (default 128)\n\
          \x20 --batches LIST    comma-separated batch sizes (default 1,2,4,8)\n\
-         \x20 --scale N         multiplier for iteration counts"
+         \x20 --scale N         multiplier for iteration counts\n\
+         \x20 --json            print machine-readable latency summary"
     );
 }
 
@@ -138,6 +139,9 @@ fn e2e_main(args: &[String]) {
             "--scale" => {
                 i += 1;
                 scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--json" => {
+                // Flag consumed directly in the latency section below.
             }
             p if !p.starts_with("--") => model_path = Some(p.to_string()),
             other => {
@@ -243,6 +247,7 @@ fn e2e_main(args: &[String]) {
     let prompt: Vec<u32> = (0..prompt_len).map(|t| (t % n_vocab) as u32).collect();
     let mut state = GenerationState::new(&model);
     prefill(&mut state, &prompt, &model).expect("prefill");
+    let ttft_ms = state.last_timing.total_us as f64 / 1e3;
     let mut last = *prompt.last().unwrap();
 
     // warmup
@@ -251,15 +256,49 @@ fn e2e_main(args: &[String]) {
         last = next;
     }
     let t0 = Instant::now();
+    let mut stage_sums = [0u64; 5]; // embed, delta_net, full_attn, lm_head, total
     for _ in 0..steps {
         let (_h, next) = generate_token(&mut state, last, &model).expect("generate");
         last = next;
+        let t = &state.last_timing;
+        stage_sums[0] += t.embed_us;
+        stage_sums[1] += t.delta_net_us;
+        stage_sums[2] += t.full_attn_us;
+        stage_sums[3] += t.lm_head_us;
+        stage_sums[4] += t.total_us;
     }
     let decode_ms = t0.elapsed().as_secs_f64() * 1e3;
     println!(
         "{steps} steps in {decode_ms:.0} ms -> {:.1} tok/s",
         steps as f64 / decode_ms * 1e3
     );
+
+    // ---- Phase 29: latency breakdown + JSON summary ----
+    let itl_us = decode_ms * 1e3 / steps.max(1) as f64;
+    println!("\nlatency breakdown (avg per decode step):");
+    println!("{:>12} {:>10}", "stage", "us");
+    for (name, us) in [
+        ("embed", stage_sums[0]),
+        ("delta_net", stage_sums[1]),
+        ("full_attn", stage_sums[2]),
+        ("lm_head", stage_sums[3]),
+        ("total", stage_sums[4]),
+    ] {
+        println!("{name:>12} {:>10.1}", us as f64 / steps.max(1) as f64);
+    }
+    println!("TTFT (prefill of {prompt_len}): {ttft_ms:.1} ms | ITL: {itl_us:.1} us");
+
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{{\n  \"ttft_ms\": {ttft_ms:.2},\n  \"itl_us\": {itl_us:.2},\n  \"decode_tokps\": {:.2},\n  \"steps\": {steps},\n  \"stages_us\": {{\"embed\": {}, \"delta_net\": {}, \"full_attn\": {}, \"lm_head\": {}, \"total\": {}}}\n}}",
+            steps as f64 / decode_ms * 1e3,
+            stage_sums[0] / steps.max(1) as u64,
+            stage_sums[1] / steps.max(1) as u64,
+            stage_sums[2] / steps.max(1) as u64,
+            stage_sums[3] / steps.max(1) as u64,
+            stage_sums[4] / steps.max(1) as u64,
+        );
+    }
 
     // ---- batch scaling ----
     println!("\nbatch decode (lockstep, aggregate throughput):");
@@ -304,7 +343,7 @@ fn e2e_main(args: &[String]) {
         let kv: usize = state
             .kv_caches
             .iter()
-            .map(|c| (c.k.len() + c.v.len()) * 4)
+            .map(|c| c.allocated_bytes())
             .sum();
         let conv: usize = state.conv_states.iter().map(|v| v.len() * 4).sum();
         let ssm: usize = state.ssm_states.iter().map(|v| v.len() * 4).sum();
@@ -316,8 +355,7 @@ fn e2e_main(args: &[String]) {
     println!(
         "  fresh:      {:>8.2} MiB (kv capacity {} tokens/layer)",
         state_bytes(&empty) as f64 / (1024.0 * 1024.0),
-        empty.kv_caches.first().map(|c| c.k.len()).unwrap_or(0)
-            / (c.attention_head_count_kv as usize * c.attention_key_length as usize).max(1)
+        empty.kv_caches.first().map(|c| c.capacity_tokens()).unwrap_or(0)
     );
     let filled_prompt: Vec<u32> = (0..1024.min(n_ctx / 2)).map(|t| (t % n_vocab) as u32).collect();
     let mut filled = GenerationState::new(&model);

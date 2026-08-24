@@ -117,7 +117,7 @@ impl Qwen3_5Config {
         let ba_dim = ssm_time_step_rank * 2;
         let full_attn_q_fused_dim = attention_key_length * attention_head_count * 2;
 
-        Ok(Self {
+        let cfg = Self {
             block_count,
             embedding_length,
             attention_head_count,
@@ -146,7 +146,97 @@ impl Qwen3_5Config {
             head_v_dim,
             ba_dim,
             full_attn_q_fused_dim,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validate numeric invariants that must hold for correct inference.
+    // Float comparisons here are validity bounds (>=, <=, == on config
+    // constants), not ordering logic — silence the partial-ord lint.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    pub fn validate(&self) -> Result<(), GgufError> {
+        macro_rules! check {
+            ($cond:expr, $msg:expr) => {
+                if !($cond) {
+                    return Err(GgufError::Io($msg.to_string()));
+                }
+            };
+        }
+
+        check!(self.block_count > 0, "block_count must be > 0");
+        check!(self.embedding_length > 0, "embedding_length must be > 0");
+        check!(self.attention_head_count > 0, "attention.head_count must be > 0");
+        check!(
+            self.attention_head_count_kv > 0 && self.attention_head_count_kv <= self.attention_head_count,
+            "attention.head_count_kv must be > 0 and <= head_count (GQA)"
+        );
+        check!(
+            self.attention_key_length > 0 && self.attention_key_length == self.attention_value_length,
+            "attention.key_length must be > 0 and == value_length"
+        );
+        check!(
+            self.attention_layer_norm_rms_epsilon > 0.0,
+            "attention.layer_norm_rms_epsilon must be > 0"
+        );
+        check!(self.full_attention_interval > 0, "full_attention_interval must be > 0");
+        check!(self.ssm_state_size > 0, "ssm.state_size must be > 0");
+        check!(self.ssm_group_count > 0, "ssm.group_count must be > 0");
+        check!(self.ssm_time_step_rank > 0, "ssm.time_step_rank must be > 0");
+        check!(self.ssm_conv_kernel > 0, "ssm.conv_kernel must be > 0");
+        check!(self.rope_freq_base > 0.0, "rope.freq_base must be > 0");
+        check!(
+            self.rope_dimension_count > 0 && self.rope_dimension_count.is_multiple_of(2),
+            "rope.dimension_count must be > 0 and even"
+        );
+        check!(self.context_length > 0, "context_length must be > 0");
+
+        // MoE invariants
+        if self.expert_count > 0 {
+            check!(
+                self.expert_used_count > 0 && self.expert_used_count <= self.expert_count,
+                "expert_used_count must be > 0 and <= expert_count when expert_count > 0"
+            );
+            check!(
+                self.expert_feed_forward_length > 0,
+                "expert_feed_forward_length must be > 0 when expert_count > 0"
+            );
+        }
+
+        // Head dimension divisibility: ssm_state_size must be divisible by ssm_group_count
+        check!(
+            self.ssm_state_size.is_multiple_of(self.ssm_group_count),
+            format!(
+                "ssm.state_size ({}) must be divisible by ssm.group_count ({})",
+                self.ssm_state_size, self.ssm_group_count
+            )
+        );
+
+        // ba_dim = 2 * ssm_time_step_rank (beta + alpha projections)
+        let expected_ba = self.ssm_time_step_rank * 2;
+        check!(
+            self.ba_dim == expected_ba,
+            format!("ba_dim ({}) must equal 2 * ssm_time_step_rank ({})", self.ba_dim, expected_ba)
+        );
+
+        // conv_dim = 2 * key_dim + value_dim
+        let expected_conv = self.key_dim * 2 + self.value_dim;
+        check!(
+            self.conv_dim == expected_conv,
+            format!("conv_dim ({}) must equal 2 * key_dim + value_dim ({})", self.conv_dim, expected_conv)
+        );
+
+        // Rope sections sum must not exceed rope_dimension_count
+        let sections_sum: i32 = self.rope_sections.iter().sum();
+        check!(
+            sections_sum >= 0 && (sections_sum as u32) <= self.rope_dimension_count,
+            format!(
+                "rope_sections sum ({}) must be >= 0 and <= rope_dimension_count ({})",
+                sections_sum, self.rope_dimension_count
+            )
+        );
+
+        Ok(())
     }
 }
 
@@ -272,4 +362,50 @@ pub fn validate_tensors(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod real_model_tests {
+    use super::*;
+
+    /// Exact metadata probed remotely from
+    /// lmstudio-community/Qwen3.5-397B-A17B-GGUF Q4_K_M shard 1 header.
+    /// Guards against validate() rejecting the production model.
+    #[test]
+    fn validate_accepts_real_397b_metadata() {
+        let cfg = Qwen3_5Config {
+            block_count: 60,
+            embedding_length: 4096,
+            attention_head_count: 32,
+            attention_head_count_kv: 2,
+            attention_key_length: 256,
+            attention_value_length: 256,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            expert_count: 512,
+            expert_used_count: 10,
+            expert_feed_forward_length: 1024,
+            expert_shared_feed_forward_length: 1024,
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000_000.0,
+            context_length: 262_144,
+            ssm_state_size: 128,
+            ssm_group_count: 16,
+            ssm_time_step_rank: 64,
+            ssm_conv_kernel: 4,
+            ssm_inner_size: Some(8192),
+            full_attention_interval: 4,
+            rope_sections: [11, 11, 10, 0],
+            // Derived by from_metadata; mirror the formulas here.
+            key_dim: 128 * 16,
+            value_dim: 128 * 64,
+            conv_dim: 128 * 16 * 2 + 128 * 64,
+            head_k_dim: 128,
+            head_v_dim: 8192 / 64,
+            ba_dim: 64 * 2,
+            full_attn_q_fused_dim: 256 * 32 * 2,
+        };
+        cfg.validate().expect("real 397B config must pass validation");
+        assert_eq!(cfg.head_v_dim, 128);
+        assert_eq!(cfg.conv_dim, 12288);
+    }
 }
