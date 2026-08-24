@@ -38,6 +38,257 @@ More memory only buys speed, because the OS page cache is the expert cache:</p>
 
 ---
 
+## Contents
+
+**Part I: Getting started**
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Full setup](#full-setup)
+- [Usage](#usage)
+- [Choosing a memory preset](#choosing-a-memory-preset)
+- [Reading the run report](#reading-the-run-report)
+- [Common questions](#common-questions)
+
+**Part II: How it works**
+- [System Architecture](#system-architecture)
+- [Component / Service Relationships](#component--service-relationships)
+- [Data Flow](#data-flow)
+- [Detailed Workflows — Model Architecture](#detailed-workflows---model-architecture)
+
+**Part III: Validation**
+- [Validation pyramid](#validation-pyramid)
+
+**Part IV: Measurements**
+- [Memory ladder](#memory-ladder)
+
+**Part V: Reference**
+- [Project Overview](#project-overview)
+- [Project Structure](#project-structure)
+- [Configuration & Invariants](#configuration--invariants)
+- [Local Development / Setup](#local-development--setup)
+- [Running the System](#running-the-system)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Troubleshooting](#troubleshooting)
+- [Future Improvements](#future-improvements)
+- [License](#license)
+
+---
+
+## Requirements
+
+The gate is storage: the checkpoint is **~240 GB** as 7-shard Q4_K_M GGUF. Everything else is ordinary.
+
+| | | |
+|---|---|---|
+| **OS** | Linux x86-64 / aarch64 | `memmap2`, `mmap`, `getrusage` |
+| **CPU** | AVX2 + FMA or NEON | SIMD dispatch, safe Rust SIMD |
+| **RAM** | 10 GB and up | 10 GB floor; more memory is faster, never different |
+| **Storage** | ~250 GB free | 240 GB checkpoint + tokenizer, ideally NVMe |
+| **Toolchain** | Rust ≥1.80 | Cargo, clippy, no C dependencies |
+
+The tokenizer and config reader are pure Rust and build anywhere. Without a checkpoint you can still do everything in [Quick start](#quick-start).
+
+## Quick start
+
+Clone, build and run the entire test suite. **No checkpoint, no network, no Python**. The whole thing takes about a minute.
+
+```bash
+git clone https://github.com/shinde/qwen3-5-397b-in-rust.git
+cd qwen3-5-397b-in-rust
+cargo build --release
+cargo test
+```
+
+It ends like this, or it fails:
+
+```
+test result: ok. 106 passed; 0 failed
+clippy: 0 warnings
+```
+
+That is the whole engine: every kernel, the streaming MoE, GGUF reader, config validation, tokenizer, and end-to-end oracles over synthetic models checked against NumPy references.
+
+## Full setup
+
+Five steps from an empty directory to generated text. Only step 4 is slow.
+
+### Step 0. clone
+
+```bash
+git clone https://github.com/shinde/qwen3-5-397b-in-rust.git
+cd qwen3-5-397b-in-rust
+```
+
+### Step 1. build
+
+```bash
+cargo build --release
+```
+
+Seconds. Only Rust toolchain required.
+
+### Step 2. verify before downloading anything
+
+```bash
+cargo test
+```
+
+Proves the engine matches its references on synthetic models with the same tensor graph, and needs nothing but the repository.
+
+### Step 3. fetch the checkpoint
+
+**~240 GB, so hours rather than minutes.** Use the provided fetch binary:
+
+```bash
+cargo run --bin fetch -- lmstudio-community/Qwen3.5-397B-A17B-GGUF \
+  --file Qwen3.5-397B-A17B-Q4_K_M-00001-of-00007.gguf \
+  --out ~/models/qwen35-397b
+curl -L -o ~/models/qwen35-397b/tokenizer.json \
+  https://huggingface.co/Qwen/Qwen3.5-397B-A17B/resolve/main/tokenizer.json
+```
+
+The script verifies SHA-256 and shard completeness. A partial download produces wrong tokens.
+
+### Step 4. run
+
+```bash
+./target/release/run ~/models/qwen35-397b/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00007.gguf \
+  ~/models/qwen35-397b/tokenizer.json "The capital of France is" --n-predict 128 --kv-q8
+```
+
+The first token loads the cold page cache, so it is slower than steady state. That cost is paid once per run.
+
+## Usage
+
+### Synopsis
+
+```
+run <model_shard> <tokenizer.json> [prompt] [options]
+```
+
+### Prompt options
+
+- Text on CLI: `--prompt "text"`
+- Text from file: `--prompt-file PATH`
+- Token ids: `--ids 1,2,3`
+
+### Memory options
+
+The engine uses OS page cache as the expert cache. No explicit `--preset` flag; memory is controlled by system RAM and `--kv-q8` for KV compression.
+
+| flag | effect |
+|---|---|
+| `--kv-q8` | quantise KV cache to Q8_0, halves KV memory |
+| `--n-predict` | tokens to generate |
+
+### Worked examples
+
+```bash
+# Smallest possible run, the 10 GB floor
+./target/release/run <model> <tokenizer> --prompt "Hello! My name is" --n-predict 16
+
+# KV compression for longer contexts
+./target/release/run <model> <tokenizer> --prompt-file prompt.txt --n-predict 256 --kv-q8
+
+# Chat mode
+./target/release/run <model> <tokenizer> --chat --kv-q8
+```
+
+## Choosing a memory preset
+
+More RAM only buys speed, because the OS page cache is the expert cache:
+
+```mermaid
+graph LR
+    subgraph Ladder["Memory ladder"]
+        L["~10 GB<br/>every token streams ~9 GB active experts off NVMe"]
+        M["13 GB<br/>hot experts stay cached between tokens"]
+        W["64 GB+<br/>large slice of routed experts resident"]
+        S["256 GB<br/>dense layers resident too; disk wait disappears"]
+    end
+    L --> M --> W --> S
+```
+
+- **10 GB**: floor, runs slowly, byte-identical output.
+- **13 GB**: typical laptop, hot experts cached.
+- **64 GB+**: workstation, substantial resident set.
+- **256 GB**: server, dense layers resident.
+
+Output is identical at every budget; only the clock changes.
+
+## Reading the run report
+
+The engine prints a memory plan, timings per token, and peak RSS.
+
+Key numbers:
+- **PEAK RSS**: from `getrusage`, quote this, not the plan.
+- **I/O share**: disk time vs wall clock, dominated by cold cache.
+- **Tokens/s**: steady state after the first token.
+
+## Common questions
+
+**First token slow** – cold page cache; subsequent tokens warm.
+
+**Output changes with RAM?** – No. Greedy decoding is byte-identical; RAM changes speed only.
+
+**Missing tensors** – Loader validates and warns on shard boundaries.
+
+**Non-ASCII prompt tokenizes oddly** – Use `--prompt-file`, so the shell does not re-encode argv.
+
+## Memory ladder
+
+```mermaid
+graph TD
+    A[Model 397B, 240 GB on disk] --> B[Active per token ~9 GB experts]
+    B --> C{RAM}
+    C -->|~10 GB| D[Stream every token]
+    C -->|13 GB| E[Cache hot experts]
+    C -->|64 GB+| F[Large resident slice]
+    C -->|256 GB| G[Denes resident, disk wait gone]
+    D & E & F & G --> H[Byte-identical output]
+```
+
+## Core Memory & Model Operation
+
+The engine keeps the 240 GB checkpoint on disk and streams only what is needed per token. Memory residency is controlled by the OS page cache, not by explicit buffers.
+
+```mermaid
+flowchart TB
+    Disk[GGUF shards 240 GB on NVMe] --> Mmap[memmap2 zero-copy slices]
+    Mmap --> Loader[ModelLoader → ModelWeights Arc<Mmap>]
+    Loader --> Pipeline[Pipeline prefill / decode]
+    Pipeline --> Embed[embed_tokens]
+    Embed --> Layers[60 layers]
+    subgraph L["Layer mix"]
+        direction TB
+        DN[45 layers<br/>delta-net recurrent<br/>O(1) state, conv k=4]
+        FA[15 layers<br/>full attention<br/>paged KV, IMRoPE]
+        MoE[Top-10 of 512 experts<br/>stream expert rows, shared expert resident]
+    end
+    Layers --> DN
+    Layers --> FA
+    DN --> MoE
+    FA --> MoE
+    MoE --> LM[LM head → logits → sample]
+    LM --> Out[Token stream]
+    PageCache[OS page cache] -.caches hot experts.-> Mmap
+    classDef disk fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D;
+    classDef mem fill:#EAF4FF,stroke:#2563EB,stroke-width:2px,color:#172554;
+    classDef comp fill:#F3EEFF,stroke:#7C3AED,stroke-width:2px,color:#3B0764;
+    class Disk,Mmap,PageCache disk;
+    class Loader,Pipeline,Embed mem;
+    class DN,FA,MoE,LM,Out comp;
+```
+
+**What happens per token**
+- The model stays mmapped; only the 10 experts per MoE layer and the current layer weights touch disk.
+- Delta-net layers keep a fixed 128×128 state per head, so sequence memory is O(1) for 45/60 layers.
+- Full-attention layers grow paged KV, but only 15 of 60 layers do so.
+- The OS page cache acts as the expert cache: hot experts stay resident, cold ones stream. More RAM → more hits → faster, never different output.
+
+---
+
 ## Project Overview
 
 This repository implements a CPU-only inference engine for **Qwen3.5-397B-A17B** in safe Rust. The model is shipped as 7-shard Q4_K_M GGUF (~240 GB). Rather than requiring the full checkpoint in RAM, the engine mmmaps the shards, streams only the experts that fire per token, and uses delta-net recurrence for 45 of 60 layers to keep sequence memory O(1).
