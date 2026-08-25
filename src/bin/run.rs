@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("  --repeat-penalty R Repetition penalty (default: 1.0)");
         eprintln!("  --argmax           Use greedy decoding (no sampling)");
         eprintln!("  --kv-q8            Store KV cache as Q8_0 (~3.8x less memory)");
+        eprintln!("  --memory-bounded   Enable memory-bounded inference mode");
         eprintln!("Chat mode:");
         eprintln!("  --chat             Interactive multi-turn chat (Qwen3.5 template)");
         eprintln!("  --system TEXT      System prompt (chat mode)");
@@ -53,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     let mut enable_thinking = true;
     let mut batch_file: Option<PathBuf> = None;
     let mut kv_q8 = false;
+    let mut memory_bounded = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -91,6 +93,9 @@ fn main() -> anyhow::Result<()> {
             }
             "--kv-q8" => {
                 kv_q8 = true;
+            }
+            "--memory-bounded" => {
+                memory_bounded = true;
             }
             "--chat" => {
                 chat_mode = true;
@@ -154,6 +159,7 @@ fn main() -> anyhow::Result<()> {
             n_predict,
             use_argmax,
             kv_q8,
+            memory_bounded,
             &stop_ids,
         );
     }
@@ -166,6 +172,7 @@ fn main() -> anyhow::Result<()> {
             n_predict,
             use_argmax,
             kv_q8,
+            memory_bounded,
             system_prompt,
             enable_thinking,
             &stop_ids,
@@ -174,7 +181,7 @@ fn main() -> anyhow::Result<()> {
         if prompt.is_empty() {
             prompt = "Hello, world!".to_string();
         }
-        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, kv_q8, &stop_ids)
+        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, kv_q8, memory_bounded, &stop_ids)
     }
 }
 
@@ -216,6 +223,7 @@ fn chat_loop(
     n_predict: usize,
     use_argmax: bool,
     kv_q8: bool,
+    memory_bounded: bool,
     system_prompt: Option<String>,
     enable_thinking: bool,
     stop_ids: &[u32],
@@ -323,6 +331,7 @@ fn run_completion(
     n_predict: usize,
     use_argmax: bool,
     kv_q8: bool,
+    memory_bounded: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     eprintln!("Prompt: {prompt}");
@@ -407,6 +416,7 @@ fn run_batch(
     n_predict: usize,
     use_argmax: bool,
     kv_q8: bool,
+    memory_bounded: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     let max_ctx = model.cfg.context_length as usize;
