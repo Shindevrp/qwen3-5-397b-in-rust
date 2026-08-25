@@ -275,11 +275,19 @@ fn chat_loop(
         eprintln!("[prompt: {} tokens]", tokens.len());
 
         // Fresh state each turn: re-prefill the whole conversation.
-        let mut state = if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) };
+        let mut state = if memory_bounded {
+            GenerationState::new_memory_bounded_kv_q8(model)
+        } else if kv_q8 {
+            GenerationState::new_kv_q8(model)
+        } else {
+            GenerationState::new(model)
+        };
         prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
         // Phase 24: dequantize MoE experts up front (parallel) so decode
         // never pays first-touch dequantization cost.
-        state.warm_moe_cache(model);
+        if !memory_bounded {
+            state.warm_moe_cache(model);
+        }
 
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
@@ -338,13 +346,21 @@ fn run_completion(
     let tokens = tokenizer.encode(prompt, false)?;
     eprintln!("Input tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
 
-    let mut state = if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) };
+    let mut state = if memory_bounded {
+        GenerationState::new_memory_bounded_kv_q8(model)
+    } else if kv_q8 {
+        GenerationState::new_kv_q8(model)
+    } else {
+        GenerationState::new(model)
+    };
 
     eprintln!("Prefilling {} tokens ...", tokens.len());
     prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
     // Phase 24: dequantize MoE experts up front (parallel) so decode
     // never pays first-touch dequantization cost.
-    state.warm_moe_cache(model);
+    if !memory_bounded {
+        state.warm_moe_cache(model);
+    }
 
     if use_argmax {
         let mut last_token_id = *tokens.last().unwrap();
@@ -442,11 +458,19 @@ fn run_batch(
     // One state per sequence; prefill all of them in parallel.
     let t0 = Instant::now();
     let mut states: Vec<GenerationState> =
-        (0..n_total).map(|_| if kv_q8 { GenerationState::new_kv_q8(model) } else { GenerationState::new(model) }).collect();
+        (0..n_total).map(|_| {
+            if memory_bounded {
+                GenerationState::new_memory_bounded_kv_q8(model)
+            } else if kv_q8 {
+                GenerationState::new_kv_q8(model)
+            } else {
+                GenerationState::new(model)
+            }
+        }).collect();
     let prompt_refs: Vec<&[u32]> = token_prompts.iter().map(|v| v.as_slice()).collect();
     prefill_batch(&mut states, &prompt_refs, model).map_err(|e| anyhow::anyhow!(e))?;
     // Phase 24: parallel warm-up of every sequence's MoE weight cache.
-    {
+    if !memory_bounded {
         use rayon::prelude::*;
         states.par_iter_mut().for_each(|s| s.warm_moe_cache(model));
     }

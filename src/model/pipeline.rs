@@ -810,16 +810,26 @@ impl MoeWeightCacheEntry {
 
 impl GenerationState {
     pub fn new(model: &ModelWeights) -> Self {
-        Self::new_impl(model, false)
+        Self::new_impl(model, false, KV_INITIAL_CAPACITY_TOKENS)
     }
 
     /// Like `new` but full-attention layers get Q8_0-packed KV caches
     /// (~3.8x less durable cache memory, small dequantize-on-read cost).
     pub fn new_kv_q8(model: &ModelWeights) -> Self {
-        Self::new_impl(model, true)
+        Self::new_impl(model, true, KV_INITIAL_CAPACITY_TOKENS)
     }
 
-    fn new_impl(model: &ModelWeights, kv_quantized: bool) -> Self {
+    /// Memory-bounded construction with small KV cache.
+    pub fn new_memory_bounded(model: &ModelWeights) -> Self {
+        Self::new_impl(model, false, 64)
+    }
+
+    /// Memory-bounded construction with Q8 KV cache.
+    pub fn new_memory_bounded_kv_q8(model: &ModelWeights) -> Self {
+        Self::new_impl(model, true, 64)
+    }
+
+    fn new_impl(model: &ModelWeights, kv_quantized: bool, kv_init_tokens: usize) -> Self {
         let cfg = &model.cfg;
         let n_ctx = cfg.context_length as usize;
         let n_kv_heads = cfg.attention_head_count_kv as usize;
@@ -829,6 +839,7 @@ impl GenerationState {
         let mut conv_states = Vec::new();
         let mut ssm_states = Vec::new();
 
+        let init_cap = kv_init_tokens.min(n_ctx);
         for i in 0..cfg.block_count as usize {
             if cfg.is_recurrent(i) {
                 let kernel_size = cfg.ssm_conv_kernel as usize;
@@ -838,11 +849,7 @@ impl GenerationState {
                 let n_heads_v = cfg.ssm_time_step_rank as usize;
                 ssm_states.push(vec![0.0f32; s_v * s_v * n_heads_v]);
             } else {
-                let cache = if kv_quantized {
-                    LayerKvCache::new_quantized(n_ctx, n_kv_heads, head_size)
-                } else {
-                    LayerKvCache::new(n_ctx, n_kv_heads, head_size)
-                };
+                let cache = LayerKvCache::with_capacity_impl(init_cap, n_kv_heads, head_size, kv_quantized);
                 kv_caches.push(cache);
             }
         }
