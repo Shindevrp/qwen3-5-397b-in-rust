@@ -53,6 +53,27 @@ impl RawTensor {
     pub fn row_bytes(&self, n_in: usize) -> Result<usize, QuantError> {
         tensor_size(self.ty, n_in as u64).map(|b| b as usize)
     }
+
+    /// Advise kernel that the tensor's pages are no longer needed.
+    /// Page-aligns the range and uses MADV_DONTNEED.
+    pub fn advise_dontneed(&self) -> Result<(), String> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        // 4 KiB page size is standard; alignment is required for madvise.
+        const PAGE: usize = 4096;
+        let start = self.offset;
+        let end = self
+            .offset
+            .checked_add(self.len)
+            .ok_or_else(|| "offset+len overflow".to_string())?;
+        let aligned_start = start & !(PAGE - 1);
+        let aligned_end = (end + PAGE - 1) & !(PAGE - 1);
+        let advise_len = aligned_end - aligned_start;
+        self.mmap
+            .advise_range(memmap2::Advice::DontNeed, aligned_start, advise_len)
+            .map_err(|e| format!("madvise failed: {e}"))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
