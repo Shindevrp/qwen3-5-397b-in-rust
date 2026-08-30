@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use qwen3_5_397b_in_rust::chat::{render_chat, ChatRenderOptions, Message, Role};
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
+use qwen3_5_397b_in_rust::model::memory::MemoryStats;
 use qwen3_5_397b_in_rust::model::pipeline::{
     generate_token, generate_token_batch, generate_token_logits, generate_token_logits_batch,
     prefill, prefill_batch, GenerationState, ModelWeights,
@@ -131,6 +132,7 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("Loading weights ...");
     let model = ModelWeights::load(&loader).map_err(|e| anyhow::anyhow!("{e}"))?;
+    MemoryStats::log("after-model-load");
 
     // End-of-turn ids: <|im_end|> ends an assistant turn in chat mode;
     // <|endoftext|> is the generic EOS fallback.
@@ -356,20 +358,27 @@ fn run_completion(
 
     eprintln!("Prefilling {} tokens ...", tokens.len());
     prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
+    MemoryStats::log("after-prefill");
     // Phase 24: dequantize MoE experts up front (parallel) so decode
     // never pays first-touch dequantization cost.
     if !memory_bounded {
         state.warm_moe_cache(model);
     }
+    MemoryStats::log("after-warmup");
 
     if use_argmax {
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
         let mut stream = StreamingDecoder::new(tokenizer);
         let mut stdout = std::io::stdout();
+        let mut first = true;
 
         for _step in 0..n_predict {
             let (_hidden, next_token) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            if first {
+                MemoryStats::log("after-first-decode");
+                first = false;
+            }
             gen_tokens.push(next_token);
             last_token_id = next_token;
 
@@ -394,8 +403,13 @@ fn run_completion(
             cfg.temperature, cfg.top_k, cfg.top_p, cfg.repeat_penalty
         );
 
+        let mut first = true;
         for _step in 0..n_predict {
             let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            if first {
+                MemoryStats::log("after-first-decode");
+                first = false;
+            }
 
             // Apply repetition penalty with prompt + generated so far
             let token = sample(&logits, cfg, &history);

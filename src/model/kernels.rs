@@ -6,7 +6,8 @@
 //! float accumulation order, which is noted where relevant).
 
 use crate::gguf::GGmlType;
-use crate::model::quant::{QuantError, QK_K, fp16_to_f32, tensor_size};
+use crate::model::memory::MemoryStats;
+use crate::model::quant::{QuantError, QK_K, RawTensor, fp16_to_f32, tensor_size};
 use rayon::prelude::*;
 
 pub const QK8_0: usize = 32;
@@ -1357,9 +1358,9 @@ fn route_topk(x: &[f32], router_w: &[f32], n_embd: usize, n_expert: usize, k: us
 pub fn moe_ffn_stream(
     input: &[f32],
     router_w: &[f32],
-    gate_up_bytes: &[u8],
-    down_bytes: &[u8],
-    ty: GGmlType,
+    gate_tensor: &RawTensor,
+    up_tensor: &RawTensor,
+    down_tensor: &RawTensor,
     n_embd: usize,
     n_ff: usize,
     n_expert: usize,
@@ -1369,45 +1370,65 @@ pub fn moe_ffn_stream(
     assert_eq!(router_w.len(), n_expert * n_embd);
     assert!(n_expert_used <= n_expert);
 
-    let rb_in = tensor_size(ty, n_embd as u64)? as usize; // gate_up row bytes
-    let rb_ff = tensor_size(ty, n_ff as u64)? as usize; // down row bytes
-    let gu_rows = 2 * n_ff;
-    let gu_stride = gu_rows * rb_in;
-    let dn_stride = n_embd * rb_ff;
+    let ty = gate_tensor.ty;
+    debug_assert_eq!(ty, up_tensor.ty);
+    debug_assert_eq!(ty, down_tensor.ty);
+
+    let gate_bytes = gate_tensor.data();
+    let up_bytes = up_tensor.data();
+    let down_bytes = down_tensor.data();
+
+    let rb_in = tensor_size(ty, n_embd as u64)? as usize;
+    let rb_ff = tensor_size(ty, n_ff as u64)? as usize;
+
+    let gate_stride = n_ff * rb_in;
+    let up_stride = n_ff * rb_in;
+    let down_stride = n_embd * rb_ff;
 
     let mut out = vec![0.0f32; n_embd];
     let (idx, wts) = route_topk(input, router_w, n_embd, n_expert, n_expert_used);
 
+    MemoryStats::log("before-expert-eviction");
     for (&e, &w_e) in idx.iter().zip(&wts) {
-        // Slice this expert's raw rows out of the mmap'd buffers.
-        let gu_off = e * gu_stride;
-        if gu_off + gu_stride > gate_up_bytes.len() || e * dn_stride + dn_stride > down_bytes.len() {
+        let gate_off = e * gate_stride;
+        let up_off = e * up_stride;
+        let down_off = e * down_stride;
+
+        if gate_off + gate_stride > gate_bytes.len()
+            || up_off + up_stride > up_bytes.len()
+            || down_off + down_stride > down_bytes.len()
+        {
             return Err(QuantError::BadLength {
-                expected: ((e + 1) * gu_stride) as u64,
-                bytes: gate_up_bytes.len(),
+                expected: ((e + 1) * gate_stride) as u64,
+                bytes: gate_bytes.len(),
             });
         }
-        let gate_up_w = &gate_up_bytes[gu_off..gu_off + gu_stride];
-        let down_w = &down_bytes[e * dn_stride..e * dn_stride + dn_stride];
 
-        // gate_up projection [2*n_ff] straight from quantized bytes.
-        let gate_up = gemv_parallel(ty, gate_up_w, n_embd, gu_rows, input)?;
+        let gate_w = &gate_bytes[gate_off..gate_off + gate_stride];
+        let up_w = &up_bytes[up_off..up_off + up_stride];
+        let down_w = &down_bytes[down_off..down_off + down_stride];
 
-        // SwiGLU
+        let gate_out = gemv_parallel(ty, gate_w, n_embd, n_ff, input)?;
+        let up_out = gemv_parallel(ty, up_w, n_embd, n_ff, input)?;
+
         let mut act = vec![0.0f32; n_ff];
         for f in 0..n_ff {
-            let g = gate_up[f];
-            let u = gate_up[n_ff + f];
+            let g = gate_out[f];
+            let u = up_out[f];
             let s = 1.0f32 / (1.0f32 + (-g).exp());
             act[f] = g * s * u;
         }
 
-        // Down projection + weighted accumulate.
         let down_out = gemv_parallel(ty, down_w, n_ff, n_embd, &act)?;
         for j in 0..n_embd {
             out[j] += down_out[j] * w_e;
         }
+
+        let _ = gate_tensor.advise_range(gate_off, gate_stride);
+        let _ = up_tensor.advise_range(up_off, up_stride);
+        let _ = down_tensor.advise_range(down_off, down_stride);
     }
+    MemoryStats::log("after-expert-eviction");
     Ok(out)
 }
 
@@ -1899,8 +1920,9 @@ pub fn full_layer_forward_q(
     n_ff_shexp: usize,
     // Streaming MoE (Phase 30): raw quantized expert weights; take priority
     // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
-    moe_gate_up_q: (&[u8], GGmlType),
-    moe_down_q: (&[u8], GGmlType),
+    moe_gate_raw: Option<&RawTensor>,
+    moe_up_raw: Option<&RawTensor>,
+    moe_down_raw: Option<&RawTensor>,
     mut kv_cache: Option<KvStoreMut<'_>>,
 ) -> Vec<f32> {
     let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
@@ -2044,14 +2066,17 @@ pub fn full_layer_forward_q(
     }
 
     // 11. FFN: dense SwiGLU (quantized) or MoE (streaming or F32-fused)
-    let ffn_out = if n_expert > 0 && !moe_gate_up_q.0.is_empty() {
+    let ffn_out = if n_expert > 0 && moe_gate_raw.is_some() && moe_up_raw.is_some() {
         // Phase 30 streaming path: per-token routing + per-expert quantized
         // GEMV directly on mmap-backed byte slices. O(active experts) memory.
+        let gate_raw = moe_gate_raw.unwrap();
+        let up_raw = moe_up_raw.unwrap();
+        let down_raw = moe_down_raw.unwrap();
         let mut moe_out = vec![0.0f32; n_tokens * n_embd];
         for t in 0..n_tokens {
             let row = moe_ffn_stream(
                 &post_normed[t * n_embd..(t + 1) * n_embd],
-                moe_router_w, moe_gate_up_q.0, moe_down_q.0, moe_gate_up_q.1,
+                moe_router_w, gate_raw, up_raw, down_raw,
                 n_embd, n_ff, n_expert, n_expert_used,
             ).expect("moe_ffn_stream");
             moe_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
@@ -2679,8 +2704,9 @@ pub fn delta_net_layer_forward_q(
     n_ff_shexp: usize,
     // Streaming MoE (Phase 30): raw quantized expert weights; take priority
     // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
-    moe_gate_up_q: (&[u8], GGmlType),
-    moe_down_q: (&[u8], GGmlType),
+    moe_gate_raw: Option<&RawTensor>,
+    moe_up_raw: Option<&RawTensor>,
+    moe_down_raw: Option<&RawTensor>,
     // Dimensions
     n_embd: usize,
     n_ff: usize,
@@ -2798,10 +2824,13 @@ pub fn delta_net_layer_forward_q(
     let post_normed = rms_norm(&residual1, post_norm_w, eps);
 
     // 14. FFN: dense SwiGLU (quantized), streaming MoE, or F32-fused MoE
-    let ffn_out = if n_expert > 0 && !moe_gate_up_q.0.is_empty() {
+    let ffn_out = if n_expert > 0 && moe_gate_raw.is_some() && moe_up_raw.is_some() {
+        let gate_raw = moe_gate_raw.unwrap();
+        let up_raw = moe_up_raw.unwrap();
+        let down_raw = moe_down_raw.unwrap();
         let row = moe_ffn_stream(
-            &post_normed, moe_router_w, moe_gate_up_q.0, moe_down_q.0,
-            moe_gate_up_q.1, n_embd, n_ff, n_expert, n_expert_used,
+            &post_normed, moe_router_w, gate_raw, up_raw, down_raw,
+            n_embd, n_ff, n_expert, n_expert_used,
         ).expect("moe_ffn_stream");
         let mut moe_out = row;
         if !shexp_gate_w.is_empty() {

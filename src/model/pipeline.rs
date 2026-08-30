@@ -112,7 +112,8 @@ impl TensorNames {
 
 pub struct LoadedMoeFfn {
     pub router_w: RawTensor,      // [n_expert, n_embd]
-    pub gate_up_w: RawTensor,     // [n_expert, 2*n_ff, n_embd] (fused gate+up)
+    pub gate_exps_q: RawTensor,   // [n_expert, n_ff, n_embd] quantized
+    pub up_exps_q: RawTensor,     // [n_expert, n_ff, n_embd] quantized
     pub down_w: RawTensor,        // [n_expert, n_embd, n_ff]
     // Shared expert (shexp)
     pub shexp_gate_w: RawTensor,     // [n_ff_shexp, n_embd]
@@ -241,34 +242,15 @@ impl ModelWeights {
         };
 
         // MoE FFN loader (shared by both layer types)
-        // Fuses gate+up into a single F32 RawTensor at load time.
+        // Keep gate/up quantized, dequant per expert on demand
         let load_moe = |t: &TensorNames| -> Result<Option<LoadedMoeFfn>, String> {
             if n_expert == 0 {
                 return Ok(None);
             }
             let router_w = raw(&t.ffn_gate_inp())?;
-            let gate_exps = raw(&t.ffn_gate_exps())?;
-            let up_exps = raw(&t.ffn_up_exps())?;
+            let gate_exps_q = raw(&t.ffn_gate_exps())?;
+            let up_exps_q = raw(&t.ffn_up_exps())?;
             let down_w = raw(&t.ffn_down_exps())?;
-
-            // Fuse gate+up: dequant both, interleave, store as F32 RawTensor
-            let gate_dq = gate_exps.dequant().map_err(|e| format!("gate_exps: {e}"))?;
-            let up_dq = up_exps.dequant().map_err(|e| format!("up_exps: {e}"))?;
-            let mut fused = vec![0.0f32; n_expert * 2 * n_ff * n_embd];
-            for e in 0..n_expert {
-                let gate_base = e * n_ff * n_embd;
-                let fused_base = e * 2 * n_ff * n_embd;
-                fused[fused_base..fused_base + n_ff * n_embd]
-                    .copy_from_slice(&gate_dq[gate_base..gate_base + n_ff * n_embd]);
-                fused[fused_base + n_ff * n_embd..fused_base + 2 * n_ff * n_embd]
-                    .copy_from_slice(&up_dq[gate_base..gate_base + n_ff * n_embd]);
-            }
-            // Store fused result as F32 RawTensor
-            let gate_up_w = RawTensor::new(
-                crate::gguf::GGmlType::F32,
-                fused.iter().flat_map(|f| f.to_le_bytes()).collect(),
-                n_expert * 2 * n_ff * n_embd,
-            );
 
             // Shared expert (shexp) — loaded when n_ff_shexp > 0
             let (shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w) = if n_ff_shexp > 0 {
@@ -289,7 +271,8 @@ impl ModelWeights {
 
             Ok(Some(LoadedMoeFfn {
                 router_w,
-                gate_up_w,
+                gate_exps_q,
+                up_exps_q,
                 down_w,
                 shexp_gate_w,
                 shexp_up_w,
@@ -459,8 +442,8 @@ pub fn forward_pass(
 
             if let Some(ref moe) = layer.moe_ffn {
                 moe_router_w_dq = dq(&moe.router_w);
-                moe_gate_up_w_dq = dq(&moe.gate_up_w);
-                moe_down_w_dq = dq(&moe.down_w);
+                moe_gate_up_w_dq = vec![];
+                moe_down_w_dq = vec![];
                 n_expert = cfg.expert_count as usize;
                 n_expert_used = cfg.expert_used_count as usize;
                 shexp_gate_w_dq = dq(&moe.shexp_gate_w);
@@ -508,14 +491,9 @@ pub fn forward_pass(
                 &shexp_down_w_dq,
                 &shexp_gate_inp_w_dq,
                 n_ff_shexp,
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.down_w),
                 n_embd,
                 n_ff,
                 conv_dim,
@@ -546,8 +524,8 @@ pub fn forward_pass(
 
             if let Some(ref moe) = layer.moe_ffn {
                 moe_router_w_dq = dq(&moe.router_w);
-                moe_gate_up_w_dq = dq(&moe.gate_up_w);
-                moe_down_w_dq = dq(&moe.down_w);
+                moe_gate_up_w_dq = vec![];
+                moe_down_w_dq = vec![];
                 n_expert = cfg.expert_count as usize;
                 n_expert_used = cfg.expert_used_count as usize;
                 shexp_gate_w_dq = dq(&moe.shexp_gate_w);
@@ -605,14 +583,9 @@ pub fn forward_pass(
                 &shexp_down_w_dq,
                 &shexp_gate_inp_w_dq,
                 n_ff_shexp,
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.down_w),
                 None,
             );
         }
@@ -1024,14 +997,9 @@ pub fn prefill(
                     shexp_down_w,
                     shexp_gate_inp_w,
                     n_ff_shexp,
-                (
-                        layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                        layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                        layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                        layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                    layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.down_w),
                     n_embd,
                     n_ff,
                     conv_dim,
@@ -1099,14 +1067,9 @@ pub fn prefill(
                 shexp_down_w,
                 shexp_gate_inp_w,
                 n_ff_shexp,
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.down_w),
                 Some(cache.kv_store_mut()),
             );
             cache.n_used = nc + n_tokens;
@@ -1215,38 +1178,33 @@ pub fn prefill_chunked(
                 let t_dn = Instant::now();
                 for t in 0..chunk_n {
                     let token_hidden = &chunk_hidden[t * n_embd..(t + 1) * n_embd];
-                    let out = crate::model::kernels::delta_net_layer_forward_q(
-                        token_hidden,
-                        &dn_attn_norm_w,
-                        (layer.wqkv.data(), layer.wqkv.ty),
-                        (layer.wqkv_gate.data(), layer.wqkv_gate.ty),
-                        &dn_conv_kernel,
-                        &dn_alpha_bias,
-                        &dn_ssm_a,
-                        &dn_ssm_norm_w,
-                        (layer.ssm_out.data(), layer.ssm_out.ty),
-                        &dn_post_norm_w,
-                        (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
-                        (layer.ffn_up_w.data(), layer.ffn_up_w.ty),
-                        (layer.ffn_down_w.data(), layer.ffn_down_w.ty),
-                        moe_router_w,
-                        moe_gate_up_w,
-                        moe_down_w,
-                        n_expert,
-                        n_expert_used,
-                        shexp_gate_w,
-                        shexp_up_w,
-                        shexp_down_w,
-                        shexp_gate_inp_w,
-                        n_ff_shexp,
-                (
-                            layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                            layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                            layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                            layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                let out = crate::model::kernels::delta_net_layer_forward_q(
+                    token_hidden,
+                    &dn_attn_norm_w,
+                    (layer.wqkv.data(), layer.wqkv.ty),
+                    (layer.wqkv_gate.data(), layer.wqkv_gate.ty),
+                    &dn_conv_kernel,
+                    &dn_alpha_bias,
+                    &dn_ssm_a,
+                    &dn_ssm_norm_w,
+                    (layer.ssm_out.data(), layer.ssm_out.ty),
+                    &dn_post_norm_w,
+                    (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
+                    (layer.ffn_up_w.data(), layer.ffn_up_w.ty),
+                    (layer.ffn_down_w.data(), layer.ffn_down_w.ty),
+                    moe_router_w,
+                    moe_gate_up_w,
+                    moe_down_w,
+                    n_expert,
+                    n_expert_used,
+                    shexp_gate_w,
+                    shexp_up_w,
+                    shexp_down_w,
+                    shexp_gate_inp_w,
+                    n_ff_shexp,
+                    layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.down_w),
                         n_embd,
                         n_ff,
                         conv_dim,
@@ -1314,14 +1272,9 @@ pub fn prefill_chunked(
                     shexp_down_w,
                     shexp_gate_inp_w,
                     n_ff_shexp,
-                (
-                        layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                        layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                        layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                        layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                    layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                    layer.moe_ffn.as_ref().map(|m| &m.down_w),
                     Some(cache.kv_store_mut()),
                 );
                 cache.n_used = nc + chunk_n;
@@ -1450,14 +1403,9 @@ pub fn generate_token_logits(
                 shexp_down_w,
                 shexp_gate_inp_w,
                 n_ff_shexp,
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.down_w),
                 n_embd,
                 n_ff,
                 conv_dim,
@@ -1523,14 +1471,9 @@ pub fn generate_token_logits(
                 shexp_down_w,
                 shexp_gate_inp_w,
                 n_ff_shexp,
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.gate_up_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.gate_up_w.ty),
-                ),
-                (
-                    layer.moe_ffn.as_ref().map_or(&[][..], |m| m.down_w.data()),
-                    layer.moe_ffn.as_ref().map_or(crate::gguf::GGmlType::F32, |m| m.down_w.ty),
-                ),
+                layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                layer.moe_ffn.as_ref().map(|m| &m.down_w),
                 Some(cache.kv_store_mut()),
             );
             cache.n_used = nc + 1;

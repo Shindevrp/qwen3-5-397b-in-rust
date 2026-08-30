@@ -57,22 +57,35 @@ impl RawTensor {
     /// Advise kernel that the tensor's pages are no longer needed.
     /// Page-aligns the range and uses MADV_DONTNEED.
     pub fn advise_dontneed(&self) -> Result<(), String> {
-        if self.len == 0 {
+        self.advise_range(0, self.len)
+    }
+
+    /// Advise kernel that a sub-range of this tensor is no longer needed.
+    /// `sub_offset` and `sub_len` are relative to the tensor's own offset/len.
+    /// Page-aligns the range and uses MADV_DONTNEED.
+    pub fn advise_range(&self, sub_offset: usize, sub_len: usize) -> Result<(), String> {
+        if sub_len == 0 {
             return Ok(());
         }
-        // 4 KiB page size is standard; alignment is required for madvise.
+        if sub_offset + sub_len > self.len {
+            return Err(format!("subrange out of bounds: {}+{} > {}", sub_offset, sub_len, self.len));
+        }
         const PAGE: usize = 4096;
-        let start = self.offset;
-        let end = self
+        let start = self
             .offset
-            .checked_add(self.len)
+            .checked_add(sub_offset)
+            .ok_or_else(|| "offset overflow".to_string())?;
+        let end = start
+            .checked_add(sub_len)
             .ok_or_else(|| "offset+len overflow".to_string())?;
         let aligned_start = start & !(PAGE - 1);
         let aligned_end = (end + PAGE - 1) & !(PAGE - 1);
         let advise_len = aligned_end - aligned_start;
-        self.mmap
-            .advise_range(memmap2::Advice::DontNeed, aligned_start, advise_len)
-            .map_err(|e| format!("madvise failed: {e}"))
+        unsafe {
+            self.mmap
+                .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, aligned_start, advise_len)
+                .map_err(|e| format!("madvise failed: {e}"))
+        }
     }
 }
 

@@ -103,7 +103,9 @@ mod tests {
             n_ff, n_tokens, eps, rope_sections,
             &[], &[], &[], 0, 0,
             &[], &[], &[], &[], 0,
-            (&[], GGmlType::F32), (&[], GGmlType::F32),
+            None,
+            None,
+            None,
             None,
         );
 
@@ -219,7 +221,9 @@ mod tests {
             (&ffn_down_q8, GGmlType::Q8_0),
             &[], &[], &[], 0, 0,
             &[], &[], &[], &[], 0,
-            (&[], GGmlType::F32), (&[], GGmlType::F32),
+            None,
+            None,
+            None,
             n_embd, n_ff, conv_dim, conv_kernel_size,
             ba_dim, s_k, s_v, n_heads_k, n_heads_v, eps,
             &mut conv_state_q, &mut ssm_state_q,
@@ -666,7 +670,7 @@ mod tests {
     fn moe_stream_matches_dense_q8() {
         use crate::gguf::GGmlType;
         use crate::model::kernels::{moe_ffn, moe_ffn_stream, quantize_row_q8_0};
-        use crate::model::quant::fp16_to_f32;
+        use crate::model::quant::{fp16_to_f32, RawTensor};
 
         let (n_embd, n_ff, n_expert, n_used) = (64usize, 32usize, 8usize, 3usize);
         let rb = |inner: usize| (inner / 32) * 34; // q8_0 row bytes
@@ -687,8 +691,22 @@ mod tests {
             }
             out
         };
-        // gate_up [n_expert, 2*n_ff, n_embd]: contiguous rows of n_embd.
-        let gu_q = pack(&gu_f32, n_expert * 2 * n_ff, n_embd);
+        // Split gate_up into gate and up
+        let gate_f32: Vec<f32> = gu_f32.iter().copied().enumerate().map(|(i, v)| {
+            if i % (2 * n_ff * n_embd) < n_ff * n_embd { v } else { v }
+        }).collect();
+        // Reconstruct gate and up as separate contiguous buffers
+        let mut gate_buf = Vec::with_capacity(n_expert * n_ff * n_embd);
+        let mut up_buf = Vec::with_capacity(n_expert * n_ff * n_embd);
+        for e in 0..n_expert {
+            let base = e * 2 * n_ff * n_embd;
+            for i in 0..n_ff * n_embd {
+                gate_buf.push(gu_f32[base + i]);
+                up_buf.push(gu_f32[base + n_ff * n_embd + i]);
+            }
+        }
+        let gate_q = pack(&gate_buf, n_expert * n_ff, n_embd);
+        let up_q = pack(&up_buf, n_expert * n_ff, n_embd);
         // down [n_expert, n_embd, n_ff]: contiguous rows of n_ff.
         let dn_q = pack(&dn_f32, n_expert * n_embd, n_ff);
 
@@ -706,16 +724,29 @@ mod tests {
             }
             out
         };
-        let gu_dq = unpack(&gu_q, n_expert * 2 * n_ff, n_embd);
+        let gate_dq = unpack(&gate_q, n_expert * n_ff, n_embd);
+        let up_dq = unpack(&up_q, n_expert * n_ff, n_embd);
         let dn_dq = unpack(&dn_q, n_expert * n_embd, n_ff);
+        // Reconstruct combined gate_up for dense reference
+        let mut gu_dq = Vec::with_capacity(n_expert * 2 * n_ff * n_embd);
+        for e in 0..n_expert {
+            let base = e * n_ff * n_embd;
+            gu_dq.extend_from_slice(&gate_dq[base..base + n_ff * n_embd]);
+            gu_dq.extend_from_slice(&up_dq[base..base + n_ff * n_embd]);
+        }
 
         let router_w: Vec<f32> = (0..n_expert * n_embd).map(|_| rnd() * 0.1).collect();
         let x: Vec<f32> = (0..n_embd).map(|_| rnd()).collect();
 
         let dense =
             moe_ffn(&x, &router_w, &gu_dq, &dn_dq, n_embd, n_ff, n_expert, n_used, 1);
+        // Build temporary RawTensor wrappers for the quantized bytes to exercise the
+        // new streaming API with eviction hooks.
+        let gate_tensor = RawTensor::new(GGmlType::Q8_0, gate_q.clone(), n_expert * n_ff * n_embd);
+        let up_tensor = RawTensor::new(GGmlType::Q8_0, up_q.clone(), n_expert * n_ff * n_embd);
+        let dn_tensor = RawTensor::new(GGmlType::Q8_0, dn_q.clone(), n_expert * n_embd * n_ff);
         let stream = moe_ffn_stream(
-            &x, &router_w, &gu_q, &dn_q, GGmlType::Q8_0,
+            &x, &router_w, &gate_tensor, &up_tensor, &dn_tensor,
             n_embd, n_ff, n_expert, n_used,
         )
         .expect("stream");
