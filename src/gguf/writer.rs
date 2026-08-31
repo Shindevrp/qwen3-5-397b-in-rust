@@ -71,7 +71,12 @@ impl GgufBuilder {
             write_value(&mut out, value);
         }
 
-        let index_end = out.len() + self.tensors.iter().map(|t| t.index_entry_len() as usize).sum::<usize>();
+        let index_end = out.len()
+            + self
+                .tensors
+                .iter()
+                .map(|t| t.index_entry_len() as usize)
+                .sum::<usize>();
         let data_start = align_up(index_end as u64, self.alignment);
 
         let mut data_pos = 0u64;

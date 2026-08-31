@@ -56,7 +56,11 @@ pub struct StreamingDecoder<'a> {
 
 impl<'a> StreamingDecoder<'a> {
     pub fn new(tokenizer: &'a QwenTokenizer) -> Self {
-        Self { tokenizer, ids: Vec::new(), printed_chars: 0 }
+        Self {
+            tokenizer,
+            ids: Vec::new(),
+            printed_chars: 0,
+        }
     }
 
     /// Feed one generated token; returns the new text chunk to display
@@ -78,8 +82,11 @@ impl<'a> StreamingDecoder<'a> {
             return Ok(String::new());
         }
 
-        let chunk: String =
-            full.chars().skip(self.printed_chars).take(available - self.printed_chars).collect();
+        let chunk: String = full
+            .chars()
+            .skip(self.printed_chars)
+            .take(available - self.printed_chars)
+            .collect();
         self.printed_chars = available;
         Ok(chunk)
     }

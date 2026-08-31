@@ -26,7 +26,9 @@ mod tests {
     }
 
     fn make_input(n: usize, seed: f32) -> Vec<f32> {
-        (0..n).map(|i| ((i as f32 + seed) * 0.01).sin() * 2.0).collect()
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.01).sin() * 2.0)
+            .collect()
     }
 
     fn make_weights(n: usize, seed: f32) -> Vec<f32> {
@@ -46,7 +48,7 @@ mod tests {
         let eps = 1e-5f32;
         let n_tokens = 1usize;
         let n_q_full = 2 * n_heads * head_size; // 64 (Q + gate fused)
-        let q_size = n_heads * head_size;       // 32
+        let q_size = n_heads * head_size; // 32
 
         let attn_norm_w = make_weights(n_embd, 1.0);
         let wq_f32 = make_weights(n_q_full * n_embd, 2.0);
@@ -75,34 +77,75 @@ mod tests {
 
         // f32 path
         let out_f32 = full_layer_forward(
-            &input, &attn_norm_w,
-            &wq_f32, &wk_f32, &wv_f32, &wo_f32,
-            &q_norm_w, &k_norm_w,
-            pos, &rope_cfg, &post_norm_w,
-            &ffn_gate_w, &ffn_up_w, &ffn_down_w,
-            n_embd, n_heads, n_kv_heads, head_size,
-            n_ff, n_tokens, eps, rope_sections,
-            &[], &[], &[], 0, 0,
-            &[], &[], &[], &[], 0,
+            &input,
+            &attn_norm_w,
+            &wq_f32,
+            &wk_f32,
+            &wv_f32,
+            &wo_f32,
+            &q_norm_w,
+            &k_norm_w,
+            pos,
+            &rope_cfg,
+            &post_norm_w,
+            &ffn_gate_w,
+            &ffn_up_w,
+            &ffn_down_w,
+            n_embd,
+            n_heads,
+            n_kv_heads,
+            head_size,
+            n_ff,
+            n_tokens,
+            eps,
+            rope_sections,
+            &[],
+            &[],
+            &[],
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
             None,
         );
 
         // quantized path
         let out_q = full_layer_forward_q(
-            &input, &attn_norm_w,
+            &input,
+            &attn_norm_w,
             (&wq_q8, GGmlType::Q8_0),
             (&wk_q8, GGmlType::Q8_0),
             (&wv_q8, GGmlType::Q8_0),
             (&wo_q8, GGmlType::Q8_0),
-            &q_norm_w, &k_norm_w,
-            pos, &rope_cfg, &post_norm_w,
+            &q_norm_w,
+            &k_norm_w,
+            pos,
+            &rope_cfg,
+            &post_norm_w,
             (&ffn_gate_q8, GGmlType::Q8_0),
             (&ffn_up_q8, GGmlType::Q8_0),
             (&ffn_down_q8, GGmlType::Q8_0),
-            n_embd, n_heads, n_kv_heads, head_size,
-            n_ff, n_tokens, eps, rope_sections,
-            &[], &[], &[], 0, 0,
-            &[], &[], &[], &[], 0,
+            n_embd,
+            n_heads,
+            n_kv_heads,
+            head_size,
+            n_ff,
+            n_tokens,
+            eps,
+            rope_sections,
+            &[],
+            &[],
+            &[],
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
             None,
             None,
             None,
@@ -198,10 +241,20 @@ mod tests {
         };
 
         let out_f32 = delta_net_layer_forward(
-            &input, &layer_f32,
-            &mut conv_state_f32, &mut ssm_state_f32,
-            n_embd, n_ff, conv_dim, conv_kernel_size,
-            ba_dim, s_k, s_v, n_heads_k, n_heads_v, eps,
+            &input,
+            &layer_f32,
+            &mut conv_state_f32,
+            &mut ssm_state_f32,
+            n_embd,
+            n_ff,
+            conv_dim,
+            conv_kernel_size,
+            ba_dim,
+            s_k,
+            s_v,
+            n_heads_k,
+            n_heads_v,
+            eps,
         );
 
         // quantized path
@@ -219,14 +272,31 @@ mod tests {
             (&ffn_gate_q8, GGmlType::Q8_0),
             (&ffn_up_q8, GGmlType::Q8_0),
             (&ffn_down_q8, GGmlType::Q8_0),
-            &[], &[], &[], 0, 0,
-            &[], &[], &[], &[], 0,
+            &[],
+            &[],
+            &[],
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
             None,
             None,
             None,
-            n_embd, n_ff, conv_dim, conv_kernel_size,
-            ba_dim, s_k, s_v, n_heads_k, n_heads_v, eps,
-            &mut conv_state_q, &mut ssm_state_q,
+            n_embd,
+            n_ff,
+            conv_dim,
+            conv_kernel_size,
+            ba_dim,
+            s_k,
+            s_v,
+            n_heads_k,
+            n_heads_v,
+            eps,
+            &mut conv_state_q,
+            &mut ssm_state_q,
         );
 
         assert_eq!(out_f32.len(), out_q.len(), "output length mismatch");
@@ -263,7 +333,8 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "gemv_parallel mismatch at [{i}]: gemv={:.6}, parallel={:.6}",
-                out_gemv[i], out_par[i],
+                out_gemv[i],
+                out_par[i],
             );
         }
     }
@@ -276,20 +347,29 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.expert_count = 8;
         cfg.expert_used_count = 0;
-        assert!(cfg.validate().is_err(), "should reject expert_used_count=0 with expert_count=8");
+        assert!(
+            cfg.validate().is_err(),
+            "should reject expert_used_count=0 with expert_count=8"
+        );
     }
 
     #[test]
     fn config_validate_catches_kv_heads_exceed_q_heads() {
         let mut cfg = minimal_config();
         cfg.attention_head_count_kv = cfg.attention_head_count + 1;
-        assert!(cfg.validate().is_err(), "should reject head_count_kv > head_count");
+        assert!(
+            cfg.validate().is_err(),
+            "should reject head_count_kv > head_count"
+        );
     }
 
     #[test]
     fn config_validate_accepts_valid() {
         let cfg = minimal_config();
-        assert!(cfg.validate().is_ok(), "minimal valid config should pass validation");
+        assert!(
+            cfg.validate().is_ok(),
+            "minimal valid config should pass validation"
+        );
     }
 
     fn minimal_config() -> crate::model::config::Qwen3_5Config {
@@ -327,10 +407,10 @@ mod tests {
 
     #[test]
     fn timing_populated_on_prefill_and_generate() {
-        use std::io::Write;
-        use crate::model::pipeline::{GenerationState, prefill, generate_token, ModelWeights};
         use crate::model::loader::ModelLoader;
-        use crate::model::synth::{build_gguf, SynthConfig};
+        use crate::model::pipeline::{GenerationState, ModelWeights, generate_token, prefill};
+        use crate::model::synth::{SynthConfig, build_gguf};
+        use std::io::Write;
 
         let cfg = SynthConfig::tiny();
         let gguf_bytes = build_gguf(&cfg);
@@ -352,15 +432,18 @@ mod tests {
         let t2 = &state.last_timing;
         assert!(t2.total_us > 0, "generate total_us should be > 0");
         assert!(t2.embed_us > 0, "generate embed_us should be > 0");
-        assert!(t2.delta_net_us > 0 || t2.full_attn_us > 0, "at least one layer type should have timing > 0");
+        assert!(
+            t2.delta_net_us > 0 || t2.full_attn_us > 0,
+            "at least one layer type should have timing > 0"
+        );
     }
 
     #[test]
     fn prefill_chunked_matches_prefill() {
-        use std::io::Write;
-        use crate::model::pipeline::{GenerationState, prefill, prefill_chunked, ModelWeights};
         use crate::model::loader::ModelLoader;
-        use crate::model::synth::{build_gguf, SynthConfig};
+        use crate::model::pipeline::{GenerationState, ModelWeights, prefill, prefill_chunked};
+        use crate::model::synth::{SynthConfig, build_gguf};
+        use std::io::Write;
 
         let cfg = SynthConfig::tiny();
         let gguf_bytes = build_gguf(&cfg);
@@ -384,9 +467,17 @@ mod tests {
 
         // Results should match within Q8_0 activation quantization tolerance for small dims.
         assert_eq!(hidden1.len(), hidden2.len());
-        let max_diff = hidden1.iter().zip(hidden2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = hidden1
+            .iter()
+            .zip(hidden2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         let max_abs = hidden1.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        let rel = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        let rel = if max_abs > 0.0 {
+            max_diff / max_abs
+        } else {
+            max_diff
+        };
         assert!(
             rel < 0.05,
             "prefill_chunked differs from prefill: max_rel_diff={rel:.9e}, max_abs={max_abs:.9e}, max_diff={max_diff:.9e}"
@@ -405,9 +496,12 @@ mod tests {
         // Q8_0: 1 block → 34 bytes per token per tensor (vs 128 f32).
         assert_eq!(cache.allocated_bytes(), 64 * 34 * 2);
         let f32_ref = LayerKvCache::with_capacity(64, n_kv_heads, head_size);
-        assert!(cache.allocated_bytes() * 3 < f32_ref.allocated_bytes(),
+        assert!(
+            cache.allocated_bytes() * 3 < f32_ref.allocated_bytes(),
             "Q8 KV should be >3x smaller than f32: {} vs {}",
-            cache.allocated_bytes(), f32_ref.allocated_bytes());
+            cache.allocated_bytes(),
+            f32_ref.allocated_bytes()
+        );
 
         // Write through the kernel-facing view, read back via dequant scratch.
         let row: Vec<f32> = (0..kv_dim).map(|i| (i as f32 - 8.0) * 0.25).collect();
@@ -433,17 +527,26 @@ mod tests {
                 _ => panic!("expected Q8 backing"),
             }
         }
-        let max_err = row.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_err = row
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         let scale = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        assert!(max_err / scale < 0.02, "q8 roundtrip err {max_err} vs range {scale}");
+        assert!(
+            max_err / scale < 0.02,
+            "q8 roundtrip err {max_err} vs range {scale}"
+        );
     }
 
     #[test]
     fn kv_q8_generation_matches_f32_within_tolerance() {
-        use std::io::Write;
-        use crate::model::pipeline::{GenerationState, prefill, generate_token_logits, ModelWeights};
         use crate::model::loader::ModelLoader;
-        use crate::model::synth::{build_gguf, SynthConfig};
+        use crate::model::pipeline::{
+            GenerationState, ModelWeights, generate_token_logits, prefill,
+        };
+        use crate::model::synth::{SynthConfig, build_gguf};
+        use std::io::Write;
 
         let cfg = SynthConfig::tiny();
         let gguf_bytes = build_gguf(&cfg);
@@ -464,18 +567,40 @@ mod tests {
         let (_, logits_q8) = generate_token_logits(&mut s_q8, 2, &model).unwrap();
 
         // Same greedy argmax despite quantization noise.
-        let amax_f32 = logits_f32.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-        let amax_q8 = logits_q8.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-        assert_eq!(amax_f32, amax_q8, "greedy token diverged between F32 and Q8 KV");
+        let amax_f32 = logits_f32
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let amax_q8 = logits_q8
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(
+            amax_f32, amax_q8,
+            "greedy token diverged between F32 and Q8 KV"
+        );
 
-        let max_diff = logits_f32.iter().zip(&logits_q8).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = logits_f32
+            .iter()
+            .zip(&logits_q8)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         let max_abs = logits_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        let rel = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        let rel = if max_abs > 0.0 {
+            max_diff / max_abs
+        } else {
+            max_diff
+        };
         assert!(rel < 0.05, "logits differ: rel={rel:.6}");
     }
 
     #[test]
-    fn attention_flash_matches_reference_all_shapes() {        // Shapes: (n_q, n_kv) pairs covering decode, prefill, and
+    fn attention_flash_matches_reference_all_shapes() {
+        // Shapes: (n_q, n_kv) pairs covering decode, prefill, and
         // non-block-aligned lengths around the 64-token flash block size.
         let shapes: &[(usize, usize)] =
             &[(1, 1), (1, 7), (1, 64), (1, 200), (3, 5), (8, 64), (17, 63)];
@@ -500,7 +625,11 @@ mod tests {
                 let b = crate::model::kernels::attention_forward_flash(
                     &q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, n_kv, scale, causal,
                 );
-                let max_err = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                let max_err = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
                 assert!(
                     max_err < 1e-4,
                     "flash mismatch at n_q={n_q} n_kv={n_kv} causal={causal}: {max_err:.3e}"
@@ -510,11 +639,14 @@ mod tests {
     }
 
     /// Build the tiny synth model once for spec-decode tests.
-    fn load_tiny() -> (tempfile::NamedTempFile, crate::model::pipeline::ModelWeights) {
-        use std::io::Write;
-        use crate::model::pipeline::ModelWeights;
+    fn load_tiny() -> (
+        tempfile::NamedTempFile,
+        crate::model::pipeline::ModelWeights,
+    ) {
         use crate::model::loader::ModelLoader;
-        use crate::model::synth::{build_gguf, SynthConfig};
+        use crate::model::pipeline::ModelWeights;
+        use crate::model::synth::{SynthConfig, build_gguf};
+        use std::io::Write;
 
         let gguf_bytes = build_gguf(&SynthConfig::tiny());
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
@@ -527,7 +659,9 @@ mod tests {
 
     #[test]
     fn verify_draft_accepts_self_greedy_continuation() {
-        use crate::model::pipeline::{GenerationState, prefill, generate_token_logits, verify_draft};
+        use crate::model::pipeline::{
+            GenerationState, generate_token_logits, prefill, verify_draft,
+        };
 
         let (_tmp, model) = load_tiny();
         let prompt: Vec<u32> = vec![0, 1, 2];
@@ -541,8 +675,18 @@ mod tests {
         let mut bonus_expected = None;
         for i in 0..(d + 1) {
             let (_, logits) = generate_token_logits(&mut s_ref, ctx, &model).unwrap();
-            let amax = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
-            if i < d { greedy.push(amax); ctx = amax; } else { bonus_expected = Some(amax); }
+            let amax = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            if i < d {
+                greedy.push(amax);
+                ctx = amax;
+            } else {
+                bonus_expected = Some(amax);
+            }
         }
         let _ = &greedy;
 
@@ -550,7 +694,12 @@ mod tests {
         let mut s = GenerationState::new(&model);
         prefill(&mut s, &prompt, &model).unwrap();
         let res = verify_draft(&mut s, 2, &greedy, &model).unwrap();
-        assert_eq!(res.accepted.len(), d, "full acceptance expected, got {:?}", res);
+        assert_eq!(
+            res.accepted.len(),
+            d,
+            "full acceptance expected, got {:?}",
+            res
+        );
         assert_eq!(Some(res.bonus), bonus_expected);
 
         // State must look like we simply decoded d+1 tokens.
@@ -559,7 +708,9 @@ mod tests {
 
     #[test]
     fn verify_draft_rejects_garbage_and_matches_plain_decode() {
-        use crate::model::pipeline::{GenerationState, prefill, generate_token_logits, verify_draft};
+        use crate::model::pipeline::{
+            GenerationState, generate_token_logits, prefill, verify_draft,
+        };
 
         let (_tmp, model) = load_tiny();
         let prompt: Vec<u32> = vec![0, 1, 2];
@@ -568,7 +719,12 @@ mod tests {
         let mut s_plain = GenerationState::new(&model);
         prefill(&mut s_plain, &prompt, &model).unwrap();
         let (_, logits_plain) = generate_token_logits(&mut s_plain, 2, &model).unwrap();
-        let plain_next = logits_plain.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let plain_next = logits_plain
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0 as u32;
 
         // Garbage draft (tokens unlikely to match greedy chain).
         let garbage: Vec<u32> = vec![15, 14, 13];
@@ -577,8 +733,10 @@ mod tests {
         let res = verify_draft(&mut s, 2, &garbage, &model).unwrap();
 
         // Bonus token must equal plain greedy decode regardless of rejection.
-        assert_eq!(res.bonus, plain_next,
-            "rejected draft should still yield the correct next token");
+        assert_eq!(
+            res.bonus, plain_next,
+            "rejected draft should still yield the correct next token"
+        );
 
         // State consistency: whatever was accepted, pos advanced by 1+accepted.
         assert_eq!(s.pos, prompt.len() + 1 + res.accepted.len());
@@ -586,7 +744,9 @@ mod tests {
 
     #[test]
     fn scheduler_matches_sequential_greedy() {
-        use crate::model::pipeline::{BatchScheduler, GenerationState, prefill, generate_token_logits, StepEvent};
+        use crate::model::pipeline::{
+            BatchScheduler, GenerationState, StepEvent, generate_token_logits, prefill,
+        };
 
         let (_tmp, model) = load_tiny();
 
@@ -601,7 +761,12 @@ mod tests {
             let mut out = Vec::new();
             for _ in 0..n_new {
                 let (_, logits) = generate_token_logits(&mut s, ctx, &model).unwrap();
-                let t = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+                let t = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0 as u32;
                 out.push(t);
                 ctx = t;
             }
@@ -615,11 +780,17 @@ mod tests {
         let events = sched.run_until_idle(64).unwrap();
 
         for (i, id) in [id0, id1].iter().enumerate() {
-            let fin = events.iter().find_map(|e| match e {
-                StepEvent::Finished(sid, toks) if sid == id => Some(toks.clone()),
-                _ => None,
-            }).expect("sequence should finish");
-            assert_eq!(fin, ref_out[i], "scheduler output must equal sequential greedy");
+            let fin = events
+                .iter()
+                .find_map(|e| match e {
+                    StepEvent::Finished(sid, toks) if sid == id => Some(toks.clone()),
+                    _ => None,
+                })
+                .expect("sequence should finish");
+            assert_eq!(
+                fin, ref_out[i],
+                "scheduler output must equal sequential greedy"
+            );
         }
     }
 
@@ -632,21 +803,33 @@ mod tests {
 
         // First sequence starts alone.
         let id_a = sched.submit(vec![0, 1, 2], 4);
-        sched.step().unwrap();          // prefill A + decode 1
+        sched.step().unwrap(); // prefill A + decode 1
         assert_eq!(sched.n_active(), 1);
 
         // Second sequence joins after A is mid-generation.
         let id_b = sched.submit(vec![5, 6], 3);
         let events = sched.run_until_idle(64).unwrap();
         assert_eq!(sched.n_active(), 0);
-        assert!(events.iter().any(|e| matches!(e, StepEvent::Prefilled(x) if *x == id_b)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StepEvent::Prefilled(x) if *x == id_b))
+        );
 
-        let fa = events.iter().filter_map(|e| match e {
-            StepEvent::Finished(id, toks) if *id == id_a => Some(toks.len()), _ => None,
-        }).sum::<usize>();
-        let fb = events.iter().filter_map(|e| match e {
-            StepEvent::Finished(id, toks) if *id == id_b => Some(toks.len()), _ => None,
-        }).sum::<usize>();
+        let fa = events
+            .iter()
+            .filter_map(|e| match e {
+                StepEvent::Finished(id, toks) if *id == id_a => Some(toks.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        let fb = events
+            .iter()
+            .filter_map(|e| match e {
+                StepEvent::Finished(id, toks) if *id == id_b => Some(toks.len()),
+                _ => None,
+            })
+            .sum::<usize>();
         assert_eq!(fa, 4);
         assert_eq!(fb, 3);
     }
@@ -660,7 +843,10 @@ mod tests {
         let id = sched.submit(vec![1, 2], 7);
         let events = sched.run_until_idle(64).unwrap();
 
-        let decodes = events.iter().filter(|e| matches!(e, StepEvent::Decoded(i, _) if *i == id)).count();
+        let decodes = events
+            .iter()
+            .filter(|e| matches!(e, StepEvent::Decoded(i, _) if *i == id))
+            .count();
         assert_eq!(decodes, 7);
         assert!(matches!(events.last(), Some(StepEvent::Finished(_, _))));
         assert!(sched.is_idle());
@@ -670,7 +856,7 @@ mod tests {
     fn moe_stream_matches_dense_q8() {
         use crate::gguf::GGmlType;
         use crate::model::kernels::{moe_ffn, moe_ffn_stream, quantize_row_q8_0};
-        use crate::model::quant::{fp16_to_f32, RawTensor};
+        use crate::model::quant::{RawTensor, fp16_to_f32};
 
         let (n_embd, n_ff, n_expert, n_used) = (64usize, 32usize, 8usize, 3usize);
         let rb = |inner: usize| (inner / 32) * 34; // q8_0 row bytes
@@ -692,9 +878,18 @@ mod tests {
             out
         };
         // Split gate_up into gate and up
-        let gate_f32: Vec<f32> = gu_f32.iter().copied().enumerate().map(|(i, v)| {
-            if i % (2 * n_ff * n_embd) < n_ff * n_embd { v } else { v }
-        }).collect();
+        let gate_f32: Vec<f32> = gu_f32
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| {
+                if i % (2 * n_ff * n_embd) < n_ff * n_embd {
+                    v
+                } else {
+                    v
+                }
+            })
+            .collect();
         // Reconstruct gate and up as separate contiguous buffers
         let mut gate_buf = Vec::with_capacity(n_expert * n_ff * n_embd);
         let mut up_buf = Vec::with_capacity(n_expert * n_ff * n_embd);
@@ -738,16 +933,24 @@ mod tests {
         let router_w: Vec<f32> = (0..n_expert * n_embd).map(|_| rnd() * 0.1).collect();
         let x: Vec<f32> = (0..n_embd).map(|_| rnd()).collect();
 
-        let dense =
-            moe_ffn(&x, &router_w, &gu_dq, &dn_dq, n_embd, n_ff, n_expert, n_used, 1);
+        let dense = moe_ffn(
+            &x, &router_w, &gu_dq, &dn_dq, n_embd, n_ff, n_expert, n_used, 1,
+        );
         // Build temporary RawTensor wrappers for the quantized bytes to exercise the
         // new streaming API with eviction hooks.
         let gate_tensor = RawTensor::new(GGmlType::Q8_0, gate_q.clone(), n_expert * n_ff * n_embd);
         let up_tensor = RawTensor::new(GGmlType::Q8_0, up_q.clone(), n_expert * n_ff * n_embd);
         let dn_tensor = RawTensor::new(GGmlType::Q8_0, dn_q.clone(), n_expert * n_embd * n_ff);
         let stream = moe_ffn_stream(
-            &x, &router_w, &gate_tensor, &up_tensor, &dn_tensor,
-            n_embd, n_ff, n_expert, n_used,
+            &x,
+            &router_w,
+            &gate_tensor,
+            &up_tensor,
+            &dn_tensor,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_used,
         )
         .expect("stream");
 
@@ -761,6 +964,9 @@ mod tests {
         // Stream path quantizes activations to Q8_0 inside gemv (the dense
         // reference uses exact f32 dots), so expect percent-level relative
         // agreement, not bit equality.
-        assert!(rel < 0.05, "stream vs dense: abs={max_err:.3} mag={mag:.3} rel={rel:.4}");
+        assert!(
+            rel < 0.05,
+            "stream vs dense: abs={max_err:.3} mag={mag:.3} rel={rel:.4}"
+        );
     }
 }

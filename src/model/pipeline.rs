@@ -4,17 +4,14 @@
 //! kernel-level layer structs, and drives the token-by-token forward pass
 //! through both recurrent (delta-net) and full-attention layers.
 
-use rayon::prelude::*;
-use std::time::Instant;
 use crate::model::config::Qwen3_5Config;
 use crate::model::kernels::{
-    KvCacheMut, KvStoreMut,
-    RopeConfig,
-    embed_tokens,
-    lm_head_argmax, lm_head_logits,
+    KvCacheMut, KvStoreMut, RopeConfig, embed_tokens, lm_head_argmax, lm_head_logits,
 };
 use crate::model::loader::ModelLoader;
 use crate::model::quant::RawTensor;
+use rayon::prelude::*;
+use std::time::Instant;
 
 /// Timing measurements for inference stages.
 #[derive(Debug, Clone, Default)]
@@ -52,7 +49,9 @@ struct TensorNames {
 
 impl TensorNames {
     fn new(layer: usize) -> Self {
-        Self { prefix: format!("blk.{layer}.") }
+        Self {
+            prefix: format!("blk.{layer}."),
+        }
     }
 
     fn name(&self, suffix: &str) -> String {
@@ -60,50 +59,102 @@ impl TensorNames {
     }
 
     // --- shared ---
-    fn attn_norm(&self) -> String { self.name("attn_norm.weight") }
-    fn post_attn_norm(&self) -> String { self.name("post_attention_norm.weight") }
+    fn attn_norm(&self) -> String {
+        self.name("attn_norm.weight")
+    }
+    fn post_attn_norm(&self) -> String {
+        self.name("post_attention_norm.weight")
+    }
 
     // --- full attention ---
-    fn attn_q(&self) -> String { self.name("attn_q.weight") }
-    fn attn_k(&self) -> String { self.name("attn_k.weight") }
-    fn attn_v(&self) -> String { self.name("attn_v.weight") }
-    fn attn_o(&self) -> String { self.name("attn_output.weight") }
-    fn attn_q_norm(&self) -> String { self.name("attn_q_norm.weight") }
-    fn attn_k_norm(&self) -> String { self.name("attn_k_norm.weight") }
+    fn attn_q(&self) -> String {
+        self.name("attn_q.weight")
+    }
+    fn attn_k(&self) -> String {
+        self.name("attn_k.weight")
+    }
+    fn attn_v(&self) -> String {
+        self.name("attn_v.weight")
+    }
+    fn attn_o(&self) -> String {
+        self.name("attn_output.weight")
+    }
+    fn attn_q_norm(&self) -> String {
+        self.name("attn_q_norm.weight")
+    }
+    fn attn_k_norm(&self) -> String {
+        self.name("attn_k_norm.weight")
+    }
 
     // --- delta-net ---
-    fn attn_qkv(&self) -> String { self.name("attn_qkv.weight") }
-    fn attn_gate(&self) -> String { self.name("attn_gate.weight") }
-    fn ssm_conv1d(&self) -> String { self.name("ssm_conv1d.weight") }
-    fn ssm_dt(&self) -> String { self.name("ssm_dt.bias") }
-    fn ssm_a(&self) -> String { self.name("ssm_a") }
-    fn ssm_norm(&self) -> String { self.name("ssm_norm.weight") }
-    fn ssm_out(&self) -> String { self.name("ssm_out.weight") }
+    fn attn_qkv(&self) -> String {
+        self.name("attn_qkv.weight")
+    }
+    fn attn_gate(&self) -> String {
+        self.name("attn_gate.weight")
+    }
+    fn ssm_conv1d(&self) -> String {
+        self.name("ssm_conv1d.weight")
+    }
+    fn ssm_dt(&self) -> String {
+        self.name("ssm_dt.bias")
+    }
+    fn ssm_a(&self) -> String {
+        self.name("ssm_a")
+    }
+    fn ssm_norm(&self) -> String {
+        self.name("ssm_norm.weight")
+    }
+    fn ssm_out(&self) -> String {
+        self.name("ssm_out.weight")
+    }
 
     // --- dense FFN ---
-    fn ffn_gate(&self) -> String { self.name("ffn_gate.weight") }
-    fn ffn_up(&self) -> String { self.name("ffn_up.weight") }
-    fn ffn_down(&self) -> String { self.name("ffn_down.weight") }
+    fn ffn_gate(&self) -> String {
+        self.name("ffn_gate.weight")
+    }
+    fn ffn_up(&self) -> String {
+        self.name("ffn_up.weight")
+    }
+    fn ffn_down(&self) -> String {
+        self.name("ffn_down.weight")
+    }
 
     // --- MoE FFN ---
     #[allow(dead_code)]
-    fn ffn_gate_inp(&self) -> String { self.name("ffn_gate_inp.weight") }
+    fn ffn_gate_inp(&self) -> String {
+        self.name("ffn_gate_inp.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_gate_exps(&self) -> String { self.name("ffn_gate_exps.weight") }
+    fn ffn_gate_exps(&self) -> String {
+        self.name("ffn_gate_exps.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_up_exps(&self) -> String { self.name("ffn_up_exps.weight") }
+    fn ffn_up_exps(&self) -> String {
+        self.name("ffn_up_exps.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_down_exps(&self) -> String { self.name("ffn_down_exps.weight") }
+    fn ffn_down_exps(&self) -> String {
+        self.name("ffn_down_exps.weight")
+    }
 
     // --- shared expert ---
     #[allow(dead_code)]
-    fn ffn_gate_inp_shexp(&self) -> String { self.name("ffn_gate_inp_shexp.weight") }
+    fn ffn_gate_inp_shexp(&self) -> String {
+        self.name("ffn_gate_inp_shexp.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_gate_shexp(&self) -> String { self.name("ffn_gate_shexp.weight") }
+    fn ffn_gate_shexp(&self) -> String {
+        self.name("ffn_gate_shexp.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_up_shexp(&self) -> String { self.name("ffn_up_shexp.weight") }
+    fn ffn_up_shexp(&self) -> String {
+        self.name("ffn_up_shexp.weight")
+    }
     #[allow(dead_code)]
-    fn ffn_down_shexp(&self) -> String { self.name("ffn_down_shexp.weight") }
+    fn ffn_down_shexp(&self) -> String {
+        self.name("ffn_down_shexp.weight")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,10 +162,10 @@ impl TensorNames {
 // ---------------------------------------------------------------------------
 
 pub struct LoadedMoeFfn {
-    pub router_w: RawTensor,      // [n_expert, n_embd]
-    pub gate_exps_q: RawTensor,   // [n_expert, n_ff, n_embd] quantized
-    pub up_exps_q: RawTensor,     // [n_expert, n_ff, n_embd] quantized
-    pub down_w: RawTensor,        // [n_expert, n_embd, n_ff]
+    pub router_w: RawTensor,    // [n_expert, n_embd]
+    pub gate_exps_q: RawTensor, // [n_expert, n_ff, n_embd] quantized
+    pub up_exps_q: RawTensor,   // [n_expert, n_ff, n_embd] quantized
+    pub down_w: RawTensor,      // [n_expert, n_embd, n_ff]
     // Shared expert (shexp)
     pub shexp_gate_w: RawTensor,     // [n_ff_shexp, n_embd]
     pub shexp_up_w: RawTensor,       // [n_ff_shexp, n_embd]
@@ -191,8 +242,12 @@ fn dq2(a: &RawTensor, b: &RawTensor) -> (Vec<f32>, Vec<f32>) {
     let mut ra = None;
     let mut rb = None;
     rayon::scope(|s| {
-        s.spawn(|_| { ra = Some(dq(a)); });
-        s.spawn(|_| { rb = Some(dq(b)); });
+        s.spawn(|_| {
+            ra = Some(dq(a));
+        });
+        s.spawn(|_| {
+            rb = Some(dq(b));
+        });
     });
     (ra.unwrap(), rb.unwrap())
 }
@@ -203,9 +258,15 @@ fn dq3(a: &RawTensor, b: &RawTensor, c: &RawTensor) -> (Vec<f32>, Vec<f32>, Vec<
     let mut rb = None;
     let mut rc = None;
     rayon::scope(|s| {
-        s.spawn(|_| { ra = Some(dq(a)); });
-        s.spawn(|_| { rb = Some(dq(b)); });
-        s.spawn(|_| { rc = Some(dq(c)); });
+        s.spawn(|_| {
+            ra = Some(dq(a));
+        });
+        s.spawn(|_| {
+            rb = Some(dq(b));
+        });
+        s.spawn(|_| {
+            rc = Some(dq(c));
+        });
     });
     (ra.unwrap(), rb.unwrap(), rc.unwrap())
 }
@@ -215,16 +276,23 @@ impl ModelWeights {
         let cfg = loader.cfg.clone();
         let n_embd = cfg.embedding_length as usize;
         let n_vocab = {
-            let meta = loader.tensor_meta("token_embd.weight")
+            let meta = loader
+                .tensor_meta("token_embd.weight")
                 .ok_or("missing token_embd.weight")?;
-            meta.dims[0] as usize
+            (meta.n_elements() / n_embd as u64) as usize
         };
 
         // Global weights — stored as raw quantized bytes
-        let tok_embd = loader.raw_tensor("token_embd.weight").map_err(|e| e.to_string())?;
-        let output_norm_w = loader.raw_tensor("output_norm.weight").map_err(|e| e.to_string())?;
+        let tok_embd = loader
+            .raw_tensor("token_embd.weight")
+            .map_err(|e| e.to_string())?;
+        let output_norm_w = loader
+            .raw_tensor("output_norm.weight")
+            .map_err(|e| e.to_string())?;
         let output_weight = if loader.tensor_meta("output.weight").is_some() {
-            loader.raw_tensor("output.weight").map_err(|e| e.to_string())?
+            loader
+                .raw_tensor("output.weight")
+                .map_err(|e| e.to_string())?
         } else {
             // Weight-tied: output shares token_embd
             tok_embd.clone()
@@ -347,8 +415,12 @@ impl ModelWeights {
 
                 full_attn_layers.push(LoadedFullAttnLayer {
                     attn_norm_w,
-                    wq, wk, wv, wo,
-                    q_norm_w, k_norm_w,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm_w,
+                    k_norm_w,
                     post_norm_w,
                     ffn_gate_w,
                     ffn_up_w,
@@ -384,10 +456,7 @@ impl ModelWeights {
 /// the correct kernel (full-attention or delta-net) based on `is_recurrent`.
 ///
 /// Returns `(hidden_state, next_token_id)`.
-pub fn forward_pass(
-    token_id: u32,
-    model: &ModelWeights,
-) -> (Vec<f32>, u32) {
+pub fn forward_pass(token_id: u32, model: &ModelWeights) -> (Vec<f32>, u32) {
     let cfg = &model.cfg;
     let n_embd = cfg.embedding_length as usize;
     let n_heads = cfg.attention_head_count as usize;
@@ -464,8 +533,10 @@ pub fn forward_pass(
                 n_ff_shexp = 0;
             };
 
-            let (dn_attn_norm_w, dn_conv_kernel, dn_alpha_bias) = dq3(&layer.attn_norm_w, &layer.conv_kernel, &layer.alpha_bias);
-            let (dn_ssm_a, dn_ssm_norm_w, dn_post_norm_w) = dq3(&layer.ssm_a, &layer.ssm_norm_w, &layer.post_norm_w);
+            let (dn_attn_norm_w, dn_conv_kernel, dn_alpha_bias) =
+                dq3(&layer.attn_norm_w, &layer.conv_kernel, &layer.alpha_bias);
+            let (dn_ssm_a, dn_ssm_norm_w, dn_post_norm_w) =
+                dq3(&layer.ssm_a, &layer.ssm_norm_w, &layer.post_norm_w);
 
             hidden = crate::model::kernels::delta_net_layer_forward_q(
                 &hidden,
@@ -546,7 +617,8 @@ pub fn forward_pass(
                 n_ff_shexp = 0;
             };
 
-            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) = dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
+            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) =
+                dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
             let fa_post_norm_w = dq(&layer.post_norm_w);
 
             let pos = [layer_idx as i32, 0, 0, 0];
@@ -642,14 +714,24 @@ impl LayerKvCache {
 
     /// Same as `new` but with Q8_0-packed K/V storage (Phase 25).
     pub fn new_quantized(n_ctx: usize, n_kv_heads: usize, head_size: usize) -> Self {
-        Self::with_capacity_impl(n_ctx.min(KV_INITIAL_CAPACITY_TOKENS), n_kv_heads, head_size, true)
+        Self::with_capacity_impl(
+            n_ctx.min(KV_INITIAL_CAPACITY_TOKENS),
+            n_kv_heads,
+            head_size,
+            true,
+        )
     }
 
     pub fn with_capacity(capacity_tokens: usize, n_kv_heads: usize, head_size: usize) -> Self {
         Self::with_capacity_impl(capacity_tokens, n_kv_heads, head_size, false)
     }
 
-    fn with_capacity_impl(capacity_tokens: usize, n_kv_heads: usize, head_size: usize, quantized: bool) -> Self {
+    fn with_capacity_impl(
+        capacity_tokens: usize,
+        n_kv_heads: usize,
+        head_size: usize,
+        quantized: bool,
+    ) -> Self {
         let kv_dim = n_kv_heads * head_size;
         let backing = if quantized {
             let row = KvStoreMut::q8_row_bytes(kv_dim);
@@ -663,7 +745,12 @@ impl LayerKvCache {
                 v: vec![0.0; capacity_tokens * kv_dim],
             }
         };
-        Self { backing, n_used: 0, capacity_tokens, kv_dim }
+        Self {
+            backing,
+            n_used: 0,
+            capacity_tokens,
+            kv_dim,
+        }
     }
 
     /// Whether this cache stores quantized (Q8_0) rows.
@@ -713,11 +800,7 @@ impl LayerKvCache {
     pub fn kv_store_mut(&mut self) -> KvStoreMut<'_> {
         let nc = self.n_used;
         match &mut self.backing {
-            KvBacking::F32 { k, v } => KvStoreMut::F32(KvCacheMut {
-                k,
-                v,
-                n_cached: nc,
-            }),
+            KvBacking::F32 { k, v } => KvStoreMut::F32(KvCacheMut { k, v, n_cached: nc }),
             KvBacking::Q8 { k, v } => KvStoreMut::Q8 {
                 k,
                 v,
@@ -773,10 +856,16 @@ impl MoeWeightCacheEntry {
     fn as_fields(&self) -> MoeFieldsRef<'_> {
         static EMPTY: [f32; 0] = [];
         (
-            &self.router_w[..], &EMPTY[..], &EMPTY[..],
-            self.n_expert, self.n_expert_used,
-            &self.shexp_gate_w[..], &self.shexp_up_w[..], &self.shexp_down_w[..],
-            &self.shexp_gate_inp_w[..], self.n_ff_shexp,
+            &self.router_w[..],
+            &EMPTY[..],
+            &EMPTY[..],
+            self.n_expert,
+            self.n_expert_used,
+            &self.shexp_gate_w[..],
+            &self.shexp_up_w[..],
+            &self.shexp_down_w[..],
+            &self.shexp_gate_inp_w[..],
+            self.n_ff_shexp,
         )
     }
 }
@@ -822,7 +911,8 @@ impl GenerationState {
                 let n_heads_v = cfg.ssm_time_step_rank as usize;
                 ssm_states.push(vec![0.0f32; s_v * s_v * n_heads_v]);
             } else {
-                let cache = LayerKvCache::with_capacity_impl(init_cap, n_kv_heads, head_size, kv_quantized);
+                let cache =
+                    LayerKvCache::with_capacity_impl(init_cap, n_kv_heads, head_size, kv_quantized);
                 kv_caches.push(cache);
             }
         }
@@ -833,7 +923,14 @@ impl GenerationState {
         let moe_cache: Vec<Option<MoeWeightCacheEntry>> =
             (0..cfg.block_count as usize).map(|_| None).collect();
 
-        Self { kv_caches, conv_states, ssm_states, pos: 0, last_timing: TimingInfo::default(), moe_cache }
+        Self {
+            kv_caches,
+            conv_states,
+            ssm_states,
+            pos: 0,
+            last_timing: TimingInfo::default(),
+            moe_cache,
+        }
     }
 
     /// Number of MoE layers whose weights are currently resident in the cache.
@@ -954,13 +1051,27 @@ pub fn prefill(
             let layer = &model.delta_net_layers[delta_net_idx];
             delta_net_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                  cfg.expert_count as usize, cfg.expert_used_count as usize);
+            let (
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            ) = moe_fields_cached(
+                &mut state.moe_cache[layer_idx],
+                layer.moe_ffn.as_ref(),
+                cfg.expert_count as usize,
+                cfg.expert_used_count as usize,
+            );
 
             let dn_attn_norm_w = dq(&layer.attn_norm_w);
-            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) = dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
+            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) =
+                dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
             let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
             let dn_post_norm_w = dq(&layer.post_norm_w);
 
@@ -1020,12 +1131,26 @@ pub fn prefill(
             let layer = &model.full_attn_layers[full_attn_idx];
             full_attn_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                  cfg.expert_count as usize, cfg.expert_used_count as usize);
+            let (
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            ) = moe_fields_cached(
+                &mut state.moe_cache[layer_idx],
+                layer.moe_ffn.as_ref(),
+                cfg.expert_count as usize,
+                cfg.expert_used_count as usize,
+            );
 
-            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) = dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
+            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) =
+                dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
             let fa_post_norm_w = dq(&layer.post_norm_w);
 
             let t_fa = Instant::now();
@@ -1160,38 +1285,7 @@ pub fn prefill_chunked(
                 let layer = &model.delta_net_layers[delta_net_idx];
                 delta_net_idx += 1;
 
-                let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                     shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                    moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                      cfg.expert_count as usize, cfg.expert_used_count as usize);
-
-                let dn_attn_norm_w = dq(&layer.attn_norm_w);
-                let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) = dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
-                let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
-                let dn_post_norm_w = dq(&layer.post_norm_w);
-
-                let conv_dim = cfg.conv_dim as usize;
-                let conv_kernel_size = cfg.ssm_conv_kernel as usize;
-                let s_v = cfg.head_v_dim as usize;
-                let n_heads_v = cfg.ssm_time_step_rank as usize;
-
-                let t_dn = Instant::now();
-                for t in 0..chunk_n {
-                    let token_hidden = &chunk_hidden[t * n_embd..(t + 1) * n_embd];
-                let out = crate::model::kernels::delta_net_layer_forward_q(
-                    token_hidden,
-                    &dn_attn_norm_w,
-                    (layer.wqkv.data(), layer.wqkv.ty),
-                    (layer.wqkv_gate.data(), layer.wqkv_gate.ty),
-                    &dn_conv_kernel,
-                    &dn_alpha_bias,
-                    &dn_ssm_a,
-                    &dn_ssm_norm_w,
-                    (layer.ssm_out.data(), layer.ssm_out.ty),
-                    &dn_post_norm_w,
-                    (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
-                    (layer.ffn_up_w.data(), layer.ffn_up_w.ty),
-                    (layer.ffn_down_w.data(), layer.ffn_down_w.ty),
+                let (
                     moe_router_w,
                     moe_gate_up_w,
                     moe_down_w,
@@ -1202,9 +1296,54 @@ pub fn prefill_chunked(
                     shexp_down_w,
                     shexp_gate_inp_w,
                     n_ff_shexp,
-                    layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
-                    layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
-                    layer.moe_ffn.as_ref().map(|m| &m.down_w),
+                ) = moe_fields_cached(
+                    &mut state.moe_cache[layer_idx],
+                    layer.moe_ffn.as_ref(),
+                    cfg.expert_count as usize,
+                    cfg.expert_used_count as usize,
+                );
+
+            let dn_attn_norm_w = dq(&layer.attn_norm_w);
+            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) =
+                dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
+            let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
+            let dn_post_norm_w = dq(&layer.post_norm_w);
+
+                let conv_dim = cfg.conv_dim as usize;
+                let conv_kernel_size = cfg.ssm_conv_kernel as usize;
+                let s_v = cfg.head_v_dim as usize;
+                let n_heads_v = cfg.ssm_time_step_rank as usize;
+
+                let t_dn = Instant::now();
+                for t in 0..chunk_n {
+                    let token_hidden = &chunk_hidden[t * n_embd..(t + 1) * n_embd];
+                    let out = crate::model::kernels::delta_net_layer_forward_q(
+                        token_hidden,
+                        &dn_attn_norm_w,
+                        (layer.wqkv.data(), layer.wqkv.ty),
+                        (layer.wqkv_gate.data(), layer.wqkv_gate.ty),
+                        &dn_conv_kernel,
+                        &dn_alpha_bias,
+                        &dn_ssm_a,
+                        &dn_ssm_norm_w,
+                        (layer.ssm_out.data(), layer.ssm_out.ty),
+                        &dn_post_norm_w,
+                        (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
+                        (layer.ffn_up_w.data(), layer.ffn_up_w.ty),
+                        (layer.ffn_down_w.data(), layer.ffn_down_w.ty),
+                        moe_router_w,
+                        moe_gate_up_w,
+                        moe_down_w,
+                        n_expert,
+                        n_expert_used,
+                        shexp_gate_w,
+                        shexp_up_w,
+                        shexp_down_w,
+                        shexp_gate_inp_w,
+                        n_ff_shexp,
+                        layer.moe_ffn.as_ref().map(|m| &m.gate_exps_q),
+                        layer.moe_ffn.as_ref().map(|m| &m.up_exps_q),
+                        layer.moe_ffn.as_ref().map(|m| &m.down_w),
                         n_embd,
                         n_ff,
                         conv_dim,
@@ -1225,12 +1364,26 @@ pub fn prefill_chunked(
                 let layer = &model.full_attn_layers[full_attn_idx];
                 full_attn_idx += 1;
 
-                let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                     shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                    moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                      cfg.expert_count as usize, cfg.expert_used_count as usize);
+                let (
+                    moe_router_w,
+                    moe_gate_up_w,
+                    moe_down_w,
+                    n_expert,
+                    n_expert_used,
+                    shexp_gate_w,
+                    shexp_up_w,
+                    shexp_down_w,
+                    shexp_gate_inp_w,
+                    n_ff_shexp,
+                ) = moe_fields_cached(
+                    &mut state.moe_cache[layer_idx],
+                    layer.moe_ffn.as_ref(),
+                    cfg.expert_count as usize,
+                    cfg.expert_used_count as usize,
+                );
 
-                let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) = dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
+                let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) =
+                    dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
                 let fa_post_norm_w = dq(&layer.post_norm_w);
 
                 let t_fa = Instant::now();
@@ -1310,7 +1463,14 @@ pub fn generate_token(
     let eps = model.cfg.attention_layer_norm_rms_epsilon;
     let output_norm_dq = dq(&model.output_norm_w);
     let output_weight_dq = dq(&model.output_weight);
-    let next_token = lm_head_argmax(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
+    let next_token = lm_head_argmax(
+        &hidden,
+        &output_norm_dq,
+        &output_weight_dq,
+        n_embd,
+        n_vocab,
+        eps,
+    );
     Ok((hidden, next_token))
 }
 
@@ -1363,13 +1523,27 @@ pub fn generate_token_logits(
             let layer = &model.delta_net_layers[delta_net_idx];
             delta_net_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                  cfg.expert_count as usize, cfg.expert_used_count as usize);
+            let (
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            ) = moe_fields_cached(
+                &mut state.moe_cache[layer_idx],
+                layer.moe_ffn.as_ref(),
+                cfg.expert_count as usize,
+                cfg.expert_used_count as usize,
+            );
 
             let dn_attn_norm_w = dq(&layer.attn_norm_w);
-            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) = dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
+            let (dn_conv_kernel, dn_alpha_bias, dn_ssm_a) =
+                dq3(&layer.conv_kernel, &layer.alpha_bias, &layer.ssm_a);
             let dn_ssm_norm_w = dq(&layer.ssm_norm_w);
             let dn_post_norm_w = dq(&layer.post_norm_w);
 
@@ -1424,12 +1598,26 @@ pub fn generate_token_logits(
             let layer = &model.full_attn_layers[full_attn_idx];
             full_attn_idx += 1;
 
-            let (moe_router_w, moe_gate_up_w, moe_down_w, n_expert, n_expert_used,
-                 shexp_gate_w, shexp_up_w, shexp_down_w, shexp_gate_inp_w, n_ff_shexp) =
-                moe_fields_cached(&mut state.moe_cache[layer_idx], layer.moe_ffn.as_ref(),
-                                  cfg.expert_count as usize, cfg.expert_used_count as usize);
+            let (
+                moe_router_w,
+                moe_gate_up_w,
+                moe_down_w,
+                n_expert,
+                n_expert_used,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_ff_shexp,
+            ) = moe_fields_cached(
+                &mut state.moe_cache[layer_idx],
+                layer.moe_ffn.as_ref(),
+                cfg.expert_count as usize,
+                cfg.expert_used_count as usize,
+            );
 
-            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) = dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
+            let (fa_attn_norm_w, fa_q_norm_w, fa_k_norm_w) =
+                dq3(&layer.attn_norm_w, &layer.q_norm_w, &layer.k_norm_w);
             let fa_post_norm_w = dq(&layer.post_norm_w);
 
             let t_fa = Instant::now();
@@ -1486,7 +1674,14 @@ pub fn generate_token_logits(
     let t_lm = Instant::now();
     let output_norm_dq = dq(&model.output_norm_w);
     let output_weight_dq = dq(&model.output_weight);
-    let logits = lm_head_logits(&hidden, &output_norm_dq, &output_weight_dq, n_embd, n_vocab, eps);
+    let logits = lm_head_logits(
+        &hidden,
+        &output_norm_dq,
+        &output_weight_dq,
+        n_embd,
+        n_vocab,
+        eps,
+    );
     let lm_head_us = t_lm.elapsed().as_micros() as u64;
 
     state.last_timing = TimingInfo {
@@ -1509,8 +1704,16 @@ pub fn generate_token_logits(
 // mutably borrowing `state.conv_states` / `ssm_states` / `kv_caches`.
 
 type MoeFieldsRef<'a> = (
-    &'a [f32], &'a [f32], &'a [f32], usize, usize,
-    &'a [f32], &'a [f32], &'a [f32], &'a [f32], usize,
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    usize,
+    usize,
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    usize,
 );
 
 /// Get (or populate) the MoE weight cache entry for one layer.
@@ -1530,8 +1733,18 @@ fn moe_fields_cached<'a>(
         slot.as_ref().unwrap().as_fields()
     } else {
         static EMPTY: [f32; 0] = [];
-        (&EMPTY[..], &EMPTY[..], &EMPTY[..], 0, 0,
-         &EMPTY[..], &EMPTY[..], &EMPTY[..], &EMPTY[..], 0)
+        (
+            &EMPTY[..],
+            &EMPTY[..],
+            &EMPTY[..],
+            0,
+            0,
+            &EMPTY[..],
+            &EMPTY[..],
+            &EMPTY[..],
+            &EMPTY[..],
+            0,
+        )
     }
 }
 
@@ -1607,7 +1820,10 @@ pub fn verify_draft(
         // Degenerate case: plain greedy decode of one token.
         let (hidden, _logits) = generate_token_logits(state, context_token, model)?;
         let bonus = lm_head_argmax(&hidden, &norm_w, &out_w, n_embd, n_vocab, eps);
-        return Ok(VerifyResult { accepted: vec![], bonus });
+        return Ok(VerifyResult {
+            accepted: vec![],
+            bonus,
+        });
     }
 
     let snap = state.snapshot();
@@ -1769,7 +1985,11 @@ impl<'m> BatchScheduler<'m> {
         assert!(!tokens.is_empty(), "prompt must contain at least one token");
         let id = SeqId(self.next_id);
         self.next_id += 1;
-        self.pending.push(PendingSeq { id, tokens, max_new });
+        self.pending.push(PendingSeq {
+            id,
+            tokens,
+            max_new,
+        });
         id
     }
 
@@ -1829,10 +2049,13 @@ impl<'m> BatchScheduler<'m> {
             meta.generated.push(tok);
             meta.last_token = tok;
             events.push(StepEvent::Decoded(meta.id, tok));
-            let done = meta.generated.len() >= meta.max_new
-                || self.eos_id.is_some_and(|eos| tok == eos);
+            let done =
+                meta.generated.len() >= meta.max_new || self.eos_id.is_some_and(|eos| tok == eos);
             if done {
-                events.push(StepEvent::Finished(meta.id, std::mem::take(&mut meta.generated)));
+                events.push(StepEvent::Finished(
+                    meta.id,
+                    std::mem::take(&mut meta.generated),
+                ));
                 retired_ids.push(meta.id);
             }
         }
@@ -1840,7 +2063,10 @@ impl<'m> BatchScheduler<'m> {
         if !retired_ids.is_empty() {
             let mut keep_meta = Vec::with_capacity(self.meta.len());
             let mut keep_states = Vec::with_capacity(self.states.len());
-            for (meta, state) in std::mem::take(&mut self.meta).into_iter().zip(std::mem::take(&mut self.states)) {
+            for (meta, state) in std::mem::take(&mut self.meta)
+                .into_iter()
+                .zip(std::mem::take(&mut self.states))
+            {
                 if retired_ids.contains(&meta.id) {
                     continue;
                 }
@@ -1901,46 +2127,60 @@ mod tests {
         let out_norm = vec![1.0f32; n_embd];
         let out_norm_bytes: Vec<u8> = out_norm.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-        let (hidden, next_token) = forward_pass(0, &ModelWeights {
-            cfg: crate::model::config::Qwen3_5Config {
-                block_count: 0,
-                embedding_length: n_embd as u32,
-                attention_head_count: n_heads as u32,
-                attention_head_count_kv: n_kv_heads as u32,
-                attention_key_length: head_size as u32,
-                attention_value_length: head_size as u32,
-                attention_layer_norm_rms_epsilon: eps,
-                expert_count: 0,
-                expert_used_count: 0,
-                expert_feed_forward_length: n_ff as u32,
-                expert_shared_feed_forward_length: 0,
-                rope_dimension_count: head_size as u32,
-                rope_freq_base: 1e7,
-                context_length: 128,
-                ssm_state_size: 0,
-                ssm_group_count: 0,
-                ssm_time_step_rank: 0,
-                ssm_conv_kernel: 0,
-                ssm_inner_size: None,
-                full_attention_interval: 4,
-                rope_sections: [0; 4],
-                key_dim: 0,
-                value_dim: 0,
-                conv_dim: 0,
-                head_k_dim: 0,
-                head_v_dim: 0,
-                ba_dim: 0,
-                full_attn_q_fused_dim: 0,
+        let (hidden, next_token) = forward_pass(
+            0,
+            &ModelWeights {
+                cfg: crate::model::config::Qwen3_5Config {
+                    block_count: 0,
+                    embedding_length: n_embd as u32,
+                    attention_head_count: n_heads as u32,
+                    attention_head_count_kv: n_kv_heads as u32,
+                    attention_key_length: head_size as u32,
+                    attention_value_length: head_size as u32,
+                    attention_layer_norm_rms_epsilon: eps,
+                    expert_count: 0,
+                    expert_used_count: 0,
+                    expert_feed_forward_length: n_ff as u32,
+                    expert_shared_feed_forward_length: 0,
+                    rope_dimension_count: head_size as u32,
+                    rope_freq_base: 1e7,
+                    context_length: 128,
+                    ssm_state_size: 0,
+                    ssm_group_count: 0,
+                    ssm_time_step_rank: 0,
+                    ssm_conv_kernel: 0,
+                    ssm_inner_size: None,
+                    full_attention_interval: 4,
+                    rope_sections: [0; 4],
+                    key_dim: 0,
+                    value_dim: 0,
+                    conv_dim: 0,
+                    head_k_dim: 0,
+                    head_v_dim: 0,
+                    ba_dim: 0,
+                    full_attn_q_fused_dim: 0,
+                },
+                tok_embd: RawTensor::new(
+                    crate::gguf::GGmlType::F32,
+                    embd_bytes.clone(),
+                    n_vocab * n_embd,
+                ),
+                output_norm_w: RawTensor::new(crate::gguf::GGmlType::F32, out_norm_bytes, n_embd),
+                output_weight: RawTensor::new(
+                    crate::gguf::GGmlType::F32,
+                    embd_bytes,
+                    n_vocab * n_embd,
+                ),
+                full_attn_layers: vec![],
+                delta_net_layers: vec![],
             },
-            tok_embd: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes.clone(), n_vocab * n_embd),
-            output_norm_w: RawTensor::new(crate::gguf::GGmlType::F32, out_norm_bytes, n_embd),
-            output_weight: RawTensor::new(crate::gguf::GGmlType::F32, embd_bytes, n_vocab * n_embd),
-            full_attn_layers: vec![],
-            delta_net_layers: vec![],
-        });
+        );
 
         // Shouldn't panic; token is in vocab range
-        assert!((next_token as usize) < n_vocab, "next_token {next_token} >= n_vocab {n_vocab}");
+        assert!(
+            (next_token as usize) < n_vocab,
+            "next_token {next_token} >= n_vocab {n_vocab}"
+        );
         assert_eq!(hidden.len(), n_embd);
     }
 
@@ -1951,7 +2191,10 @@ mod tests {
         let n_embd = 32usize;
         let embd = vec![0.1f32; 16 * n_embd];
         let embd_bytes: Vec<u8> = embd.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let ones: Vec<u8> = vec![1.0f32; n_embd].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let ones: Vec<u8> = vec![1.0f32; n_embd]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         ModelWeights {
             cfg: crate::model::config::Qwen3_5Config {
                 block_count,
@@ -2039,7 +2282,10 @@ mod tests {
             // vs ~16 MB if the full 262K context were preallocated.
             let bytes = cache.allocated_bytes();
             assert_eq!(cache.capacity_tokens(), 1024);
-            assert!(bytes <= 128 * 1024, "initial allocation too large: {bytes} bytes");
+            assert!(
+                bytes <= 128 * 1024,
+                "initial allocation too large: {bytes} bytes"
+            );
         }
     }
 

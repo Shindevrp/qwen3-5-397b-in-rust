@@ -163,14 +163,8 @@ fn main() -> anyhow::Result<()> {
         println!("  key_dim (state * group):            {}", cfg.key_dim);
         println!("  value_dim (state * time_step):      {}", cfg.value_dim);
         println!("  conv_dim (2*key + value):           {}", cfg.conv_dim);
-        println!(
-            "  head_k_dim (state):                 {}",
-            cfg.head_k_dim
-        );
-        println!(
-            "  head_v_dim (inner/time_step):       {}",
-            cfg.head_v_dim
-        );
+        println!("  head_k_dim (state):                 {}", cfg.head_k_dim);
+        println!("  head_v_dim (inner/time_step):       {}", cfg.head_v_dim);
         println!("  ba_dim (2 * time_step):             {}", cfg.ba_dim);
         println!(
             "  full_attn_q_fused_dim:              {}",
@@ -255,10 +249,7 @@ fn main() -> anyhow::Result<()> {
             );
             let values = quant::dequantize(t.ggml_type, data, t.n_elements())?;
             let shown = values.len().min(dequant_count);
-            let parts: Vec<String> = values[..shown]
-                .iter()
-                .map(|v| format!("{v:.6}"))
-                .collect();
+            let parts: Vec<String> = values[..shown].iter().map(|v| format!("{v:.6}")).collect();
             println!("values[0..{shown}]: {}", parts.join(" "));
         }
 
@@ -268,9 +259,7 @@ fn main() -> anyhow::Result<()> {
             let meta = loader
                 .tensor_meta(&name)
                 .ok_or_else(|| anyhow::anyhow!("tensor \"{name}\" not found"))?;
-            let split_no = loader
-                .shard_of(&name)
-                .map(|i| loader.shards[i].split_no);
+            let split_no = loader.shard_of(&name).map(|i| loader.shards[i].split_no);
             println!(
                 "load \"{name}\": type={} dims={:?} elems={} shards={} split_no={:?} total_tensors={}",
                 meta.ggml_type.name(),
@@ -280,13 +269,13 @@ fn main() -> anyhow::Result<()> {
                 split_no,
                 loader.tensor_count()
             );
-            println!("config: layers={} experts={} used={}", loader.cfg.block_count, loader.cfg.expert_count, loader.cfg.expert_used_count);
+            println!(
+                "config: layers={} experts={} used={}",
+                loader.cfg.block_count, loader.cfg.expert_count, loader.cfg.expert_used_count
+            );
             let values = loader.dequant(&name)?;
             let shown = values.len().min(dequant_count);
-            let parts: Vec<String> = values[..shown]
-                .iter()
-                .map(|v| format!("{v:.6}"))
-                .collect();
+            let parts: Vec<String> = values[..shown].iter().map(|v| format!("{v:.6}")).collect();
             println!("values[0..{shown}]: {}", parts.join(" "));
         }
     }

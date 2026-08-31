@@ -33,7 +33,10 @@ fn main() {
     println!("RSS before advise: {} KiB", rss_kb());
 
     // Advise dontneed first 10 MiB
-    unsafe { mmap.unchecked_advise_range(UncheckedAdvice::DontNeed, 0, 10 * 1024 * 1024).unwrap(); }
+    unsafe {
+        mmap.unchecked_advise_range(UncheckedAdvice::DontNeed, 0, 10 * 1024 * 1024)
+            .unwrap();
+    }
     println!("Advise done");
     println!("RSS after advise: {} KiB", rss_kb());
 

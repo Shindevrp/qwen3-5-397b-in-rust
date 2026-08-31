@@ -138,7 +138,12 @@ fn main() -> anyhow::Result<()> {
             let pct = done as f64 / total as f64 * 100.0;
             let secs = t0.elapsed().as_secs_f64().max(1e-6);
             let mibs = done as f64 / 1024.0 / 1024.0 / secs;
-            eprint!("\r  {}/{} ({pct:5.1}%) {:6.1} MiB/s ", human_bytes(done), human_bytes(total), mibs);
+            eprint!(
+                "\r  {}/{} ({pct:5.1}%) {:6.1} MiB/s ",
+                human_bytes(done),
+                human_bytes(total),
+                mibs
+            );
         } else {
             eprint!("\r  {}", human_bytes(done));
         }
@@ -175,10 +180,16 @@ fn main() -> anyhow::Result<()> {
         } else {
             eprintln!("downloading tokenizer.json");
             let tok_url = resolve_url(&repo, "tokenizer.json")?;
-            let res = download_file(&agent, &tok_url, token.as_deref(), &tok_dest, |done, _total| {
-                eprint!("\r  {}", human_bytes(done));
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            });
+            let res = download_file(
+                &agent,
+                &tok_url,
+                token.as_deref(),
+                &tok_dest,
+                |done, _total| {
+                    eprint!("\r  {}", human_bytes(done));
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                },
+            );
             match res {
                 Ok(_) => eprintln!(),
                 Err(e) => eprintln!(
@@ -188,6 +199,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    eprintln!("\ndone. try:\n  cargo run --release --bin run -- {} {} --chat", dest.display(), out_dir.join("tokenizer.json").display());
+    eprintln!(
+        "\ndone. try:\n  cargo run --release --bin run -- {} {} --chat",
+        dest.display(),
+        out_dir.join("tokenizer.json").display()
+    );
     Ok(())
 }

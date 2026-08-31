@@ -10,14 +10,14 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwen3_5_397b_in_rust::chat::{render_chat, ChatRenderOptions, Message, Role};
+use qwen3_5_397b_in_rust::chat::{ChatRenderOptions, Message, Role, render_chat};
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
 use qwen3_5_397b_in_rust::model::memory::MemoryStats;
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, generate_token_batch, generate_token_logits, generate_token_logits_batch,
-    prefill, prefill_batch, GenerationState, ModelWeights,
+    GenerationState, ModelWeights, generate_token, generate_token_batch, generate_token_logits,
+    generate_token_logits_batch, prefill, prefill_batch,
 };
-use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
+use qwen3_5_397b_in_rust::model::sampler::{SamplerConfig, sample};
 use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
 use qwen3_5_397b_in_rust::tokenizer::StreamingDecoder;
 
@@ -183,7 +183,17 @@ fn main() -> anyhow::Result<()> {
         if prompt.is_empty() {
             prompt = "Hello, world!".to_string();
         }
-        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, kv_q8, memory_bounded, &stop_ids)
+        run_completion(
+            &model,
+            &tokenizer,
+            &prompt,
+            &cfg,
+            n_predict,
+            use_argmax,
+            kv_q8,
+            memory_bounded,
+            &stop_ids,
+        )
     }
 }
 
@@ -201,8 +211,11 @@ fn encode_with_truncation(
         let rendered = render_chat(&msgs, opts).map_err(|e| anyhow::anyhow!("{e}"))?;
         let tokens = tokenizer.encode(&rendered, false)?;
         // Keep at least the (optional) system message + last user message.
-        let system_count =
-            if !msgs.is_empty() && msgs[0].role == Role::System { 1 } else { 0 };
+        let system_count = if !msgs.is_empty() && msgs[0].role == Role::System {
+            1
+        } else {
+            0
+        };
         let droppable = msgs.len() - system_count - 1;
         if tokens.len() + reserve <= max_ctx || droppable == 0 {
             return Ok((msgs, tokens));
@@ -269,7 +282,10 @@ fn chat_loop(
 
         history.push(Message::user(input.to_string()));
 
-        let opts = ChatRenderOptions { add_generation_prompt: true, enable_thinking };
+        let opts = ChatRenderOptions {
+            add_generation_prompt: true,
+            enable_thinking,
+        };
         let (history_fit, tokens) =
             encode_with_truncation(&history, &opts, tokenizer, max_ctx, n_predict)?;
         history = history_fit;
@@ -299,10 +315,12 @@ fn chat_loop(
 
         for _step in 0..n_predict {
             let token = if use_argmax {
-                let (_hidden, next) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+                let (_hidden, next) = generate_token(&mut state, last_token_id, model)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 next
             } else {
-                let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+                let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 sample(&logits, cfg, &sample_history)
             };
 
@@ -346,7 +364,11 @@ fn run_completion(
 ) -> anyhow::Result<()> {
     eprintln!("Prompt: {prompt}");
     let tokens = tokenizer.encode(prompt, false)?;
-    eprintln!("Input tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
+    eprintln!(
+        "Input tokens ({}): {:?}",
+        tokens.len(),
+        &tokens[..tokens.len().min(20)]
+    );
 
     let mut state = if memory_bounded {
         GenerationState::new_memory_bounded_kv_q8(model)
@@ -374,7 +396,8 @@ fn run_completion(
         let mut first = true;
 
         for _step in 0..n_predict {
-            let (_hidden, next_token) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            let (_hidden, next_token) =
+                generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
             if first {
                 MemoryStats::log("after-first-decode");
                 first = false;
@@ -405,7 +428,8 @@ fn run_completion(
 
         let mut first = true;
         for _step in 0..n_predict {
-            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model)
+                .map_err(|e| anyhow::anyhow!(e))?;
             if first {
                 MemoryStats::log("after-first-decode");
                 first = false;
@@ -471,8 +495,8 @@ fn run_batch(
 
     // One state per sequence; prefill all of them in parallel.
     let t0 = Instant::now();
-    let mut states: Vec<GenerationState> =
-        (0..n_total).map(|_| {
+    let mut states: Vec<GenerationState> = (0..n_total)
+        .map(|_| {
             if memory_bounded {
                 GenerationState::new_memory_bounded_kv_q8(model)
             } else if kv_q8 {
@@ -480,7 +504,8 @@ fn run_batch(
             } else {
                 GenerationState::new(model)
             }
-        }).collect();
+        })
+        .collect();
     let prompt_refs: Vec<&[u32]> = token_prompts.iter().map(|v| v.as_slice()).collect();
     prefill_batch(&mut states, &prompt_refs, model).map_err(|e| anyhow::anyhow!(e))?;
     // Phase 24: parallel warm-up of every sequence's MoE weight cache.
@@ -493,8 +518,7 @@ fn run_batch(
 
     // Parallel slot arrays; `order[j]` is the original sequence index of slot j.
     let mut order: Vec<usize> = (0..n_total).collect();
-    let mut last_tokens: Vec<u32> =
-        token_prompts.iter().map(|v| *v.last().unwrap()).collect();
+    let mut last_tokens: Vec<u32> = token_prompts.iter().map(|v| *v.last().unwrap()).collect();
     let mut histories: Vec<Vec<u32>> = token_prompts.clone();
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); n_total];
 
@@ -553,7 +577,11 @@ fn run_batch(
         n_total,
         total_tokens,
         decode_ms,
-        if secs > 0.0 { total_tokens as f64 / secs } else { f64::INFINITY }
+        if secs > 0.0 {
+            total_tokens as f64 / secs
+        } else {
+            f64::INFINITY
+        }
     );
 
     Ok(())

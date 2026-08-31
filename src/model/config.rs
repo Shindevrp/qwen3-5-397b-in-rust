@@ -56,7 +56,11 @@ impl Qwen3_5Config {
 
         // The merged GGUF uses "qwen35moe"; the original llama.cpp PR used
         // "qwen3_5moe". Accept the keys under whichever prefix the file declares.
-        let prefix = if arch == "qwen3_5moe" { "qwen3_5moe" } else { "qwen35moe" };
+        let prefix = if arch == "qwen3_5moe" {
+            "qwen3_5moe"
+        } else {
+            "qwen35moe"
+        };
         let key = |suffix: &str| format!("{prefix}.{suffix}");
 
         let block_count = metadata.get_u32(&key("block_count"))?;
@@ -74,15 +78,11 @@ impl Qwen3_5Config {
         let expert_feed_forward_length = metadata.get_u32(&key("expert_feed_forward_length"))?;
         let expert_shared_feed_forward_length =
             metadata.get_u32(&key("expert_shared_feed_forward_length"))?;
-        let rope_dimension_count = metadata
-            .get_u32(&key("rope.dimension_count"))
-            .unwrap_or(64);
+        let rope_dimension_count = metadata.get_u32(&key("rope.dimension_count")).unwrap_or(64);
         let rope_freq_base = metadata
             .get_f32(&key("rope.freq_base"))
             .unwrap_or(10_000_000.0);
-        let context_length = metadata
-            .get_u32(&key("context_length"))
-            .unwrap_or(262_144);
+        let context_length = metadata.get_u32(&key("context_length")).unwrap_or(262_144);
         let ssm_state_size = metadata.get_u32(&key("ssm.state_size"))?;
         let ssm_group_count = metadata.get_u32(&key("ssm.group_count"))?;
         let ssm_time_step_rank = metadata.get_u32(&key("ssm.time_step_rank"))?;
@@ -166,23 +166,34 @@ impl Qwen3_5Config {
 
         check!(self.block_count > 0, "block_count must be > 0");
         check!(self.embedding_length > 0, "embedding_length must be > 0");
-        check!(self.attention_head_count > 0, "attention.head_count must be > 0");
         check!(
-            self.attention_head_count_kv > 0 && self.attention_head_count_kv <= self.attention_head_count,
+            self.attention_head_count > 0,
+            "attention.head_count must be > 0"
+        );
+        check!(
+            self.attention_head_count_kv > 0
+                && self.attention_head_count_kv <= self.attention_head_count,
             "attention.head_count_kv must be > 0 and <= head_count (GQA)"
         );
         check!(
-            self.attention_key_length > 0 && self.attention_key_length == self.attention_value_length,
+            self.attention_key_length > 0
+                && self.attention_key_length == self.attention_value_length,
             "attention.key_length must be > 0 and == value_length"
         );
         check!(
             self.attention_layer_norm_rms_epsilon > 0.0,
             "attention.layer_norm_rms_epsilon must be > 0"
         );
-        check!(self.full_attention_interval > 0, "full_attention_interval must be > 0");
+        check!(
+            self.full_attention_interval > 0,
+            "full_attention_interval must be > 0"
+        );
         check!(self.ssm_state_size > 0, "ssm.state_size must be > 0");
         check!(self.ssm_group_count > 0, "ssm.group_count must be > 0");
-        check!(self.ssm_time_step_rank > 0, "ssm.time_step_rank must be > 0");
+        check!(
+            self.ssm_time_step_rank > 0,
+            "ssm.time_step_rank must be > 0"
+        );
         check!(self.ssm_conv_kernel > 0, "ssm.conv_kernel must be > 0");
         check!(self.rope_freq_base > 0.0, "rope.freq_base must be > 0");
         check!(
@@ -216,14 +227,20 @@ impl Qwen3_5Config {
         let expected_ba = self.ssm_time_step_rank * 2;
         check!(
             self.ba_dim == expected_ba,
-            format!("ba_dim ({}) must equal 2 * ssm_time_step_rank ({})", self.ba_dim, expected_ba)
+            format!(
+                "ba_dim ({}) must equal 2 * ssm_time_step_rank ({})",
+                self.ba_dim, expected_ba
+            )
         );
 
         // conv_dim = 2 * key_dim + value_dim
         let expected_conv = self.key_dim * 2 + self.value_dim;
         check!(
             self.conv_dim == expected_conv,
-            format!("conv_dim ({}) must equal 2 * key_dim + value_dim ({})", self.conv_dim, expected_conv)
+            format!(
+                "conv_dim ({}) must equal 2 * key_dim + value_dim ({})",
+                self.conv_dim, expected_conv
+            )
         );
 
         // Rope sections sum must not exceed rope_dimension_count
@@ -337,9 +354,18 @@ pub fn validate_tensors(
             eprintln!(
                 "warning: missing expected tensors in this shard ({}){}, first {}: {}",
                 missing.len(),
-                if missing.len() > 10 { " (shard boundary)".to_string() } else { String::new() },
+                if missing.len() > 10 {
+                    " (shard boundary)".to_string()
+                } else {
+                    String::new()
+                },
                 missing.len().min(10),
-                missing.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                missing
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         } else {
             return Err(GgufError::Io(format!(
@@ -357,7 +383,12 @@ pub fn validate_tensors(
             "warning: unexpected tensors ({}), first {}: {}",
             extra.len(),
             extra.len().min(10),
-            extra.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+            extra
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -404,7 +435,8 @@ mod real_model_tests {
             ba_dim: 64 * 2,
             full_attn_q_fused_dim: 256 * 32 * 2,
         };
-        cfg.validate().expect("real 397B config must pass validation");
+        cfg.validate()
+            .expect("real 397B config must pass validation");
         assert_eq!(cfg.head_v_dim, 128);
         assert_eq!(cfg.conv_dim, 12288);
     }

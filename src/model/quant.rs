@@ -6,8 +6,8 @@
 //! only types implemented here; everything else is rejected.
 
 use crate::gguf::GGmlType;
-use std::sync::Arc;
 use memmap2::Mmap;
+use std::sync::Arc;
 
 pub const QK_K: usize = 256;
 
@@ -24,8 +24,20 @@ pub struct RawTensor {
 
 impl RawTensor {
     /// Create a zero-copy reference into mmap'd GGUF data.
-    pub fn from_mmap(mmap: Arc<Mmap>, ty: GGmlType, offset: usize, len: usize, n_elements: usize) -> Self {
-        Self { ty, n_elements, mmap, offset, len }
+    pub fn from_mmap(
+        mmap: Arc<Mmap>,
+        ty: GGmlType,
+        offset: usize,
+        len: usize,
+        n_elements: usize,
+    ) -> Self {
+        Self {
+            ty,
+            n_elements,
+            mmap,
+            offset,
+            len,
+        }
     }
 
     /// Create an owned RawTensor from a byte vector (for tests / synthetic models).
@@ -36,7 +48,13 @@ impl RawTensor {
         use std::io::Write;
         (&tmp).write_all(&data).expect("write to tempfile");
         let mmap = Arc::new(unsafe { Mmap::map(&tmp).expect("mmap tempfile") });
-        Self { ty, n_elements, mmap, offset: 0, len }
+        Self {
+            ty,
+            n_elements,
+            mmap,
+            offset: 0,
+            len,
+        }
     }
 
     /// Access the raw quantized bytes.
@@ -68,7 +86,10 @@ impl RawTensor {
             return Ok(());
         }
         if sub_offset + sub_len > self.len {
-            return Err(format!("subrange out of bounds: {}+{} > {}", sub_offset, sub_len, self.len));
+            return Err(format!(
+                "subrange out of bounds: {}+{} > {}",
+                sub_offset, sub_len, self.len
+            ));
         }
         const PAGE: usize = 4096;
         let start = self
@@ -83,7 +104,11 @@ impl RawTensor {
         let advise_len = aligned_end - aligned_start;
         unsafe {
             self.mmap
-                .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, aligned_start, advise_len)
+                .unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    aligned_start,
+                    advise_len,
+                )
                 .map_err(|e| format!("madvise failed: {e}"))
         }
     }
@@ -113,10 +138,10 @@ pub const fn block_size(ty: GGmlType) -> Option<usize> {
 pub const fn block_bytes(ty: GGmlType) -> Option<usize> {
     match ty {
         GGmlType::F32 => Some(4),
-        GGmlType::Q8_0 => Some(34),        // f16 d + 32 x i8
-        GGmlType::Q4_K => Some(144),       // d, dmin (f16) + scales[12] + qs[128]
-        GGmlType::Q5_K => Some(176),       // d, dmin (f16) + scales[12] + qh[32] + qs[128]
-        GGmlType::Q6_K => Some(210),       // ql[128] + qh[64] + scales[16] + d (f16)
+        GGmlType::Q8_0 => Some(34),  // f16 d + 32 x i8
+        GGmlType::Q4_K => Some(144), // d, dmin (f16) + scales[12] + qs[128]
+        GGmlType::Q5_K => Some(176), // d, dmin (f16) + scales[12] + qh[32] + qs[128]
+        GGmlType::Q6_K => Some(210), // ql[128] + qh[64] + scales[16] + d (f16)
         _ => None,
     }
 }
@@ -142,7 +167,10 @@ pub fn dequantize(ty: GGmlType, data: &[u8], n: u64) -> Result<Vec<f32>, QuantEr
     }
     let expected = tensor_size(ty, n)?;
     if (data.len() as u64) < expected {
-        return Err(QuantError::BadLength { expected, bytes: data.len() });
+        return Err(QuantError::BadLength {
+            expected,
+            bytes: data.len(),
+        });
     }
     let nb = (n / bs) as usize;
     let mut out = Vec::with_capacity(n as usize);
@@ -245,8 +273,8 @@ pub fn f32_to_fp16(v: f32) -> u16 {
         let shift = (14 - e) as u32;
         let half = (m >> shift) as u16;
         let rem = m & ((1u32 << shift) - 1);
-        let half_up = rem > (1u32 << (shift - 1))
-            || (rem == (1u32 << (shift - 1)) && (half & 1) == 1);
+        let half_up =
+            rem > (1u32 << (shift - 1)) || (rem == (1u32 << (shift - 1)) && (half & 1) == 1);
         return sign | if half_up { half + 1 } else { half };
     }
 
@@ -402,7 +430,17 @@ mod tests {
 
     #[test]
     fn fp16_round_trip() {
-        for v in [0.0f32, -0.0, 1.0, -1.0, 0.5, 2.0, -2.5, 65504.0, 0.00006097555] {
+        for v in [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            2.0,
+            -2.5,
+            65504.0,
+            0.00006097555,
+        ] {
             let h = f32_to_fp16(v);
             let back = fp16_to_f32(h);
             assert_eq!(back, v, "round trip of {v} via 0x{h:04x}");
@@ -547,7 +585,8 @@ mod tests {
 
     #[test]
     fn dequantize_f32() {
-        let data = 1.0f32.to_le_bytes()
+        let data = 1.0f32
+            .to_le_bytes()
             .into_iter()
             .chain((-2.0f32).to_le_bytes())
             .collect::<Vec<_>>();
