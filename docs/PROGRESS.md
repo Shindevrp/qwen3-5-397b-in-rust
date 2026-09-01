@@ -1,8 +1,9 @@
 # Progress & Next Steps — Qwen3.5-397B Rust Engine
 
-> Status snapshot: **2026-09-01**
+> Status snapshot: **2026-09-01 (rev 2)** — flat-logits resolved; content-loss
+> hunt in progress, paused.
 > This document records where the project stands, what was accomplished, and
-> the concrete next steps — so work can resume cleanly after a ~3-month pause.
+> the concrete next steps — so work can resume cleanly after a pause.
 
 ## 1. Objective
 
@@ -20,7 +21,7 @@ Run command:
 ./target/release/run <gguf> <tokenizer> "The capital of France is" --memory-bounded --kv-q8 --n-predict 1 --argmax
 ```
 
-## 2. Current status: NOT achieving objective (flat logits)
+## 2. Current status: NOT achieving objective (peaked-but-wrong logits)
 
 ### What works
 - Builds clean (`cargo build --release`).
@@ -33,15 +34,19 @@ Run command:
   - shared-expert gating (`σ(gate)`) matches reference
 - Recurrent (delta-net) path is now **architecturally correct** per
   `qwen35moe-pr.patch` (llama.cpp `qwen3-5.cpp`).
+- The **near-flat logits problem is gone** (2026-09-01 session): logits are now
+  peaked and prompt-dependent. Details in § 3a below.
 
 ### What is broken
-- **End-to-end output is wrong**: prompt yields token 220 (`Ġ`, space) repeated,
-  NOT `ĠParis`. Logits are **near-flat** (top-5 spread ≈ 3; top5 roughly
-  220:22.02, 11:20.01, 318:19.98, 17:19.26, 16:18.83).
-- Improvement already achieved: before fixing the SSM, output was a garbage
-  loop (`947→622→947→54087`); after the fix it became a stable `Ġ` space —
-  proving the SSM fix path is exercised and changed behavior, but it is not
-  sufficient to get coherent logits.
+- **End-to-end output is still wrong**: argmax is low-information structural
+  junk instead of content words. `"The capital of France is"` → top5
+  `Ġ`(220), `,`(11), `Ġ(`(318), `2`(17), `Ċ`(198); `"Hello world"` →
+  `0ER 2` (digits/letters); `"1+1="` → `Ġ`. Hidden RMS grows 0.7→7.3 across
+  layers, logit spread 29–48 (top logit 15–27) — signal is strong but the
+  *direction/content* is corrupted or lost.
+- History: before the SSM fix the run was a garbage loop (`947→622→947→54087`);
+  after the decay-gate fix the logits became peaked but the argmax moved to a
+  stable `Ġ` space; it is still not `ĠParis`.
 
 ## 3. Root cause confirmed & fixed (delta-net SSM decay)
 
@@ -79,35 +84,68 @@ Earlier diagnostics: `state_norm=93.45` over 1,048,576 state elements
 (RMS ≈ 0.09). Whether the recurrent state should have larger magnitude is an
 open question to re-examine when resuming.
 
-## 4. Where to resume: the remaining flat-logits hunt
+## 4. Where to resume: the remaining content-loss hunt
 
-The delta-net is correct, layer norms are healthy, and the delta-net residual
-(22.62 vs input 0.59) is strong — yet final logits are near-flat. Investigate
-these, in order:
+The delta-net math is verified, quantization decode is verified, yet the output
+is peaked-but-content-free. The investigation below is what was done in the
+**2026-09-01 session** and where it stood when paused.
 
-1. **Full-attention layers** (`layer_idx % 4 == 0`, every 4th, 15 of 60).
-   Verify the `wq` split (Q + sigmoid gate), QK-norm, IMRoPE, GQA scaling, and
-   the sigmoid-gated output (`cur = attn * σ(gate)` then `× wo`) against
+### 4a. Ruled OUT (verified against real model + authoritative refs)
+
+1. **Layer routing**: `is_recurrent(layer) = !(layer+1).is_multiple_of(4)`;
+   full-attn layers are `il % 4 == 3` (3,7,…59). Loader tensor names/layout
+   match GGUF. NOT the bug.
+2. **Config dims vs GGUF**: head_k=head_v=256, n_head=32, n_kv_head=2,
+   ssm_state_size=128, ssm_group_count=16, ssm_time_step_rank=64,
+   ssm_inner_size=8192, conv_dim=12288, key_dim=2048, value_dim=8192,
+   ba_dim=8192, n_q_full=16384, n_kv_size=512 — all match real tensor shapes.
+3. **Quantization decode**: our `dequantize_q4_k/q5_k/q6_k` match
+   `ref/ggml-quants.c` (authoritative ggml source) line-for-line.
+4. **SIMD gemv**: `gemv_parallel` == naive dequant-dot on **real model bytes**
+   (Q4_K/Q5_K/Q6_K) within Q-noise (rms_err ~0.002, ref_rms ~0.4). Verified via
+   `src/bin/gemvcheck.rs` on `attn_qkv/attn_gate/ssm_beta/ssm_alpha/attn_q/k/v/
+   attn_output/ffn_gate_inp`.
+5. **Delta-net AR math** (`delta_net_autoregressive`): q/k L2-norm, q scaled by
+   `1/sqrt(S_v)`, GDA gate broadcast over both state dims, `k_state =
+   state^T k_norm`, `v_diff = v - k_state`, outer-product state update,
+   `out = state^T q_norm` — verified against `build_delta_net_unified_autoregressive`.
+6. **Gated norm**: `rms_norm_per_head(attn_out, ssm_norm_w, s_v) * silu(z)`
+   matches `build_norm_gated`. (Note: `attn_gate`/`z` used ONLY for gated norm.)
+7. **Recurrent state is NOT collapsing**: state RMS 0.09→0.26 across layers,
+   decay `exp(g)` range [0,1] healthy; attn_out RMS 0.017→0.09.
+8. **FFN bypass** (`QWEN35_NOFNN=1`, attention-only): still codes to
+   structural junk (top5 `Ġ`,`2`,digits) — so the FFN/MoE is not the *sole*
+   culprit; the attention/residual content itself is degraded. **Do not
+   conclude MoE is clean** — FFN is essential for gen and the test only showed
+   attention alone is also wrong-colored.
+
+### 4b. Still suspicious / not yet verified (resume here, in order)
+
+1. **conv1d window & kernel orientation** — the one block NOT yet diffed
+   against ggml. ggml `ggml_ssm_conv` semantics (state prepend + which kernel
+   tap lands on the newest token, SiLU after conv) must be confirmed against the
+   real op (fetch `ggml/src/ggml-cpu.c` `ggml_compute_forward_ssm_conv_f32` or
+   the branch/PR that added it). An off-by-one here corrupts the whole
+   recurrent signal while everything else "looks right".
+2. **Full-attention layers** (15 of 60, layers 3,7,…59): `wq` = Q + sigmoid
+   gate split, QK-norm, IMRoPE (`rope_sections`), GQA 16:1 scaling, sigmoid-
+   gated `attn*σ(gate)` then `×wo` — diff `full_layer_forward_q` against
    `build_layer_attn` in the patch.
-2. **MoE FFN path** — the model is the **MoE variant**
-   (`Qwen3.5-397B-A17B`, expert_count 512, n_expert_used 10). Verify routing,
-   top-k weight normalization, per-expert SwiGLU, and shared-expert weighting
-   against `qwen3-5moe.cpp` `build_layer_ffn` / `build_moe_ffn`. Check whether
-   expert gate/up handling and the router are correct (see `moe_ffn_stream`).
-3. **LM head / output scaling** — check `output_norm` + `output_weight`
-   (`n_vocab = n_elements()/n_embd`), and whether logits are being scaled or
-   flattened. Suspects: output-weight content, norm scaling, or f32 precision
-   loss in some path.
-4. **Precision**: a global 32-bit (f32) degradation in some path (e.g. MoE,
-   cache q8, or large accumulators) is unconfirmed but possible.
-5. **Reference to fetch/verify against**:
-   - Dense: `https://github.com/ggml-org/llama.cpp/blob/6c8dcaa7/src/models/qwen35.cpp`
-   - MoE: `https://github.com/ggml-org/llama.cpp/blob/fc2b0053/src/models/qwen35moe.cpp`
-   - Local copy of the patch: `ref/qwen35moe-pr.patch` (already in repo).
-
-A direct numerical comparison is a strong tool: run the same 5-token prompt
-through llama.cpp and compare hidden norms / logits layer-by-layer to localize
-the divergence.
+3. **MoE FFN path** (512 experts / 10 used, streaming per-expert Q4_K from
+   shards): routing / top-k renormalization (`norm_w`), per-expert SwiGLU,
+   shared-expert `σ(gate_imp)` weighting, and **expert weight byte layout
+   across shards** (the MoE tensors are the only ones not covered by
+   `gemvcheck`-style real-byte verification).
+4. **LM head / output**: `output.weight` Q6_K [4096, 248320] is loaded and the
+   argmax path structurally matches llama's `llm_output`; the "embedding domain"
+   test (`src/bin/lmtest.rs` — raw embedding → lm_head, no layers) produces
+   unrelated argmax, i.e. the embedding↔output correlation is low; whether that
+   is expected for an untied head is unconfirmed.
+5. **Missing reference**: llama.cpp is NOT installed on this machine (no
+   `llama-cli`), so a full layer-by-layer numeric diff vs llama.cpp was not
+   possible. Building/running llama.cpp on this 397B model is infeasible locally
+   (23 GB RAM). Strongest future tool: a side-by-side hidden-state dump from a
+   machine that can run llama.cpp.
 
 ## 5. Verification commands
 
@@ -137,12 +175,14 @@ keep Phase 31 per-tensor MoE streaming; environment is RAM-limited.
   `ssm_alpha`/`ssm_norm`/`ssm_dt`)
 - `src/model/crossval_tests.rs` — fixtures, thresholds, debug eprintlns
 - `src/bin/run.rs`, `src/bin/kern_check.rs` — CLI / kernel checker
+- `src/bin/probe.rs`, `src/bin/gemvcheck.rs`, `src/bin/lmtest.rs`,
+  `src/bin/dumpsmall.rs` — diagnostics (see § 7a)
 - `src/gguf/` — GGUF reader
 - `tests/golden/spec.txt` — golden test configs
 - References (in repo): `ref/qwen35moe-pr.patch`, `ref/llama-arch.cpp`,
   `ref/llama-graph.cpp`; docs in `docs/`.
 
-## 7. Important notes for resuming (3-month gap)
+## 7. Important notes for resuming
 
 - Rebuild before running; `target/` may be stale.
 - Check `git status` / `git log` for any uncommitted work.
@@ -150,3 +190,36 @@ keep Phase 31 per-tensor MoE streaming; environment is RAM-limited.
   and q paths must stay in agreement.
 - The run is memory-hungry; keep `--n-predict` small and use long timeouts.
 - Do NOT remove `n_vocab = n_elements()/n_embd`. Do NOT add NaN sanitization.
+
+### 7a. Temporary instrumentation left in the tree (clean up or keep deliberately)
+
+These are **uncommitted** and were added for this session's diagnostics.
+Decide their fate before the next commit:
+
+- `src/bin/probe.rs` — prints real config + tensor shapes/dims (keep, harmless).
+- `src/bin/gemvcheck.rs` — SIMD-gemv vs dequant-dot on real bytes (keep, useful).
+- `src/bin/lmtest.rs` — raw-embedding→lm_head argmax test (keep, useful).
+- `src/bin/dumpsmall.rs` — dumps small f32 tensors (remove or keep).
+- Env-gated debug prints in `kernels.rs` / `pipeline.rs` gated behind
+  `QWEN35_DBG=1` (per-layer RMS / cosine-vs-embedding / state RMS / decay / logit
+  top5). Currently dormant unless the env var is set — decide to keep or strip.
+- `QWEN35_NOFNN=1` env bypass in `delta_net_layer_forward_q` and
+  `full_layer_forward_q` (skips the FFN entirely) — used for the attention-only
+  test. **Remove before any release commit** unless deliberately retained.
+
+Debug command used this session:
+```
+QWEN35_DBG=1 ./target/release/run <gguf> <tok> "The capital of France is" \
+  --memory-bounded --kv-q8 --n-predict 0|1 --argmax    # per-layer + logit stats
+QWEN35_NOFNN=1 ... --n-predict 1 --argmax             # attention-only test
+./target/release/gemvcheck <shard1.gguf>              # real-byte quant check
+./target/release/lmtest <shard1.gguf>                 # embedding-domain test
+```
+
+### 7b. Unresolved questions carried forward
+
+- Whether the recurrent state magnitude (state RMS ≈ 0.09–0.26 over S_v²·H_v
+  elements) is correct — unresolved.
+- Whether the embedding↔output-weight correlation being low (`lmtest`) is
+  expected for an untied head — unconfirmed.
+- ggml `ggml_ssm_conv` (conv window/kernel orientation) not yet diffed — see § 4b.

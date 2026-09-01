@@ -35,6 +35,15 @@ More memory only buys speed, because the OS page cache is the expert cache:</p>
 </table>
 </div>
 
+> **Status (2026-09-01):** the engine compiles clean, all 106 lib tests + 5
+> crossval tests pass, and each layer can be streamed from the real 7-shard
+> checkpoint — but **end-to-end generation on the real checkpoint is still
+> under verification** (logits are peaked but the argmax is not yet coherent).
+> The flat-logits bug is fixed; the remaining content-loss hunt is tracked in
+> **[`docs/PROGRESS.md`](docs/PROGRESS.md)**. Rows below that say "byte-identical
+> output" are about the memory ladder (RAM changes speed only), not correctness
+> of the checkpoint run.
+
 ---
 
 ## Contents
