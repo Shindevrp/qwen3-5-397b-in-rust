@@ -35,6 +35,12 @@ More memory only buys speed, because the OS page cache is the expert cache:</p>
 </table>
 </div>
 
+> **Open to Opportunities:** ==I am open to AI research / AI/ML related roles and PhD positions==
+
+
+> ![Open to Work](https://media4.giphy.com/media/wijs4lJT5oHGPDy6oC/giphy.gif)
+
+
 > **Status (2026-09-01):** the engine compiles clean, all 106 lib tests + 5
 > crossval tests pass, and each layer can be streamed from the real 7-shard
 > checkpoint — but **end-to-end generation on the real checkpoint is still
