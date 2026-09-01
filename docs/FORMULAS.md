@@ -15,8 +15,15 @@ $$
 $$
 g_t = \sigma(W_g h_t), \quad \alpha_t = \text{sigmoid}(W_\alpha h_t)
 $$
+
+Decay gate (matches `qwen3-5.cpp` `build_layer_attn_linear`):
 $$
-S_t = \alpha_t S_{t-1} + h_t k_t^\top
+\alpha_t = \log(A) \cdot \text{softplus}(W_\alpha h_t + b)
+$$
+where $A \in (0,1]$ is the learned per-head `ssm_a` (stored as $\log A$), and
+$b$ is `ssm_dt.bias`. The state is scaled by $\exp(\alpha_t)$ each step:
+$$
+S_t = e^{\alpha_t} S_{t-1} + h_t k_t^\top
 $$
 $$
 o_t = S_t q_t

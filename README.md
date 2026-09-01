@@ -1,8 +1,7 @@
-# qwen3-5-397b-in-rust
+# Qwen3.5-397B-A17B — CPU-only inference in safe Rust
 
 <div align="center">
 
-<h1>Qwen3.5-397B-A17B — CPU-only inference in safe Rust</h1>
 <h3>A 397-billion-parameter model. One CPU. 10–14 GB RSS.</h3>
 
 <p>Qwen3.5-397B-A17B inference in safe Rust. No CUDA. No BLAS. No framework.</p>
@@ -240,12 +239,12 @@ Key numbers:
 
 ```mermaid
 graph TD
-    A[Model 397B, 240 GB on disk] --> B[Active per token ~9 GB experts]
+    A["Model 397B, 240 GB on disk"] --> B[Active per token ~9 GB experts]
     B --> C{RAM}
     C -->|~10 GB| D[Stream every token]
     C -->|13 GB| E[Cache hot experts]
     C -->|64 GB+| F[Large resident slice]
-    C -->|256 GB| G[Denes resident, disk wait gone]
+    C -->|256 GB| G["Dense resident, disk wait gone"]
     D & E & F & G --> H[Byte-identical output]
 ```
 
@@ -256,21 +255,21 @@ The engine keeps the 240 GB checkpoint on disk and streams only what is needed p
 ```mermaid
 flowchart TB
     Disk[GGUF shards 240 GB on NVMe] --> Mmap[memmap2 zero-copy slices]
-    Mmap --> Loader[ModelLoader → ModelWeights Arc<Mmap>]
+    Mmap --> Loader["ModelLoader → ModelWeights Arc<Mmap>"]
     Loader --> Pipeline[Pipeline prefill / decode]
     Pipeline --> Embed[embed_tokens]
     Embed --> Layers[60 layers]
     subgraph L["Layer mix"]
         direction TB
-        DN[45 layers<br/>delta-net recurrent<br/>O(1) state, conv k=4]
-        FA[15 layers<br/>full attention<br/>paged KV, IMRoPE]
-        MoE[Top-10 of 512 experts<br/>stream expert rows, shared expert resident]
+        DN["45 layers<br/>delta-net recurrent<br/>O(1) state, conv k=4"]
+        FA["15 layers<br/>full attention<br/>paged KV, IMRoPE"]
+        MoE["Top-10 of 512 experts<br/>stream expert rows, shared expert resident"]
     end
     Layers --> DN
     Layers --> FA
     DN --> MoE
     FA --> MoE
-    MoE --> LM[LM head → logits → sample]
+    MoE --> LM["LM head → logits → sample"]
     LM --> Out[Token stream]
     PageCache[OS page cache] -.caches hot experts.-> Mmap
     classDef disk fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D;

@@ -302,7 +302,7 @@ fn qwen35_config_loads_and_validates() {
     assert_eq!(cfg.key_dim, 128 * 16);
     assert_eq!(cfg.value_dim, 128 * 64);
     assert_eq!(cfg.conv_dim, (128 * 16) * 2 + 128 * 64);
-    assert_eq!(cfg.ba_dim, 64 * 2);
+    assert_eq!(cfg.ba_dim, 128 * 64);
     assert_eq!(cfg.full_attn_q_fused_dim, 256 * 32 * 2);
 }
 

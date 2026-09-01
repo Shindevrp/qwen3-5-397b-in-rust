@@ -114,7 +114,7 @@ impl Qwen3_5Config {
         let head_v_dim = ssm_inner_size
             .map(|d| d / ssm_time_step_rank)
             .unwrap_or(ssm_state_size);
-        let ba_dim = ssm_time_step_rank * 2;
+        let ba_dim = ssm_state_size * ssm_time_step_rank;
         let full_attn_q_fused_dim = attention_key_length * attention_head_count * 2;
 
         let cfg = Self {
@@ -223,12 +223,13 @@ impl Qwen3_5Config {
             )
         );
 
-        // ba_dim = 2 * ssm_time_step_rank (beta + alpha projections)
-        let expected_ba = self.ssm_time_step_rank * 2;
+        // ba_dim = ssm_state_size * ssm_time_step_rank (z projection for the
+        // gated norm: the attn_gate tensor maps n_embd -> [head_v_dim, num_v_heads])
+        let expected_ba = self.ssm_state_size * self.ssm_time_step_rank;
         check!(
             self.ba_dim == expected_ba,
             format!(
-                "ba_dim ({}) must equal 2 * ssm_time_step_rank ({})",
+                "ba_dim ({}) must equal ssm_state_size * ssm_time_step_rank ({})",
                 self.ba_dim, expected_ba
             )
         );
@@ -432,7 +433,7 @@ mod real_model_tests {
             conv_dim: 128 * 16 * 2 + 128 * 64,
             head_k_dim: 128,
             head_v_dim: 8192 / 64,
-            ba_dim: 64 * 2,
+            ba_dim: 128 * 64,
             full_attn_q_fused_dim: 256 * 32 * 2,
         };
         cfg.validate()

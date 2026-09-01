@@ -98,7 +98,13 @@ impl SynthConfig {
     }
 
     pub fn ba_dim(&self) -> usize {
-        self.ssm_time_step_rank * 2
+        // z projection width = head_v_dim = ssm_state_size * n_heads_v
+        self.ssm_state_size * self.ssm_time_step_rank
+    }
+
+    /// Number of V-heads in the delta-net SSM = ssm.time_step_rank.
+    pub fn n_heads_v(&self) -> usize {
+        self.ssm_time_step_rank
     }
 
     /// Delta-net layers are every layer except multiples of `full_attn_interval`.
@@ -296,24 +302,31 @@ pub fn build_gguf(cfg: &SynthConfig) -> Vec<u8> {
                 &conv_kernel,
             ));
 
-            let alpha_bias: Vec<f32> = rand_f32(ba_dim);
+            let alpha_bias: Vec<f32> = rand_f32(cfg.n_heads_v());
             builder = builder.tensor(vec1d(&format!("{prefix}.ssm_dt.bias"), &alpha_bias));
 
-            let ssm_a: Vec<f32> = (0..ba_dim).map(|j| -((j + 1) as f32)).collect();
+            let ssm_a: Vec<f32> = (0..cfg.n_heads_v()).map(|j| -((j + 1) as f32)).collect();
             builder = builder.tensor(vec1d(&format!("{prefix}.ssm_a"), &ssm_a));
 
             let v_size = ssm_state_size * ssm_time_step_rank;
-            builder = builder.tensor(vec1d(
-                &format!("{prefix}.ssm_alpha.weight"),
-                &vec![1.0; v_size],
-            ));
-            builder = builder.tensor(vec1d(
+            // ssm_beta / ssm_alpha: [n_embd, n_heads_v] per-v-head projections
+            let ssm_beta: Vec<f32> = rand_f32(ssm_time_step_rank * n_embd);
+            builder = builder.tensor(vec2d(
                 &format!("{prefix}.ssm_beta.weight"),
-                &vec![0.0; v_size],
+                n_embd,
+                ssm_time_step_rank,
+                &ssm_beta,
+            ));
+            let ssm_alpha: Vec<f32> = rand_f32(ssm_time_step_rank * n_embd);
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.ssm_alpha.weight"),
+                n_embd,
+                ssm_time_step_rank,
+                &ssm_alpha,
             ));
             builder = builder.tensor(vec1d(
                 &format!("{prefix}.ssm_norm.weight"),
-                &vec![1.0; v_size],
+                &vec![1.0; ssm_state_size],
             ));
 
             let ssm_out: Vec<f32> = rand_f32(v_size * n_embd);

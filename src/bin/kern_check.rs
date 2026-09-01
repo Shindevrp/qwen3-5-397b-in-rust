@@ -371,9 +371,14 @@ fn main() {
                 );
                 let ab = read_f32_file(&dir.join(format!("delta_layer_{id}_ab.bin")), n_heads_v);
                 let sa = read_f32_file(&dir.join(format!("delta_layer_{id}_sa.bin")), n_heads_v);
-                let snw = read_f32_file(
-                    &dir.join(format!("delta_layer_{id}_snw.bin")),
-                    s_v * n_heads_v,
+                let snw = read_f32_file(&dir.join(format!("delta_layer_{id}_snw.bin")), s_v);
+                let sbetaw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_sbetaw.bin")),
+                    n_heads_v * n_embd,
+                );
+                let salphaw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_salphaw.bin")),
+                    n_heads_v * n_embd,
                 );
                 let so = read_f32_file(
                     &dir.join(format!("delta_layer_{id}_so.bin")),
@@ -404,6 +409,8 @@ fn main() {
                     alpha_bias: &ab,
                     ssm_a: &sa,
                     ssm_norm_w: &snw,
+                    ssm_beta_w: &sbetaw,
+                    ssm_alpha_w: &salphaw,
                     ssm_out: &so,
                     post_norm_w: &pnw,
                     ffn_gate_w: &fgw,

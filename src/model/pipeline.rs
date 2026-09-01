@@ -105,6 +105,12 @@ impl TensorNames {
     fn ssm_norm(&self) -> String {
         self.name("ssm_norm.weight")
     }
+    fn ssm_beta(&self) -> String {
+        self.name("ssm_beta.weight")
+    }
+    fn ssm_alpha(&self) -> String {
+        self.name("ssm_alpha.weight")
+    }
     fn ssm_out(&self) -> String {
         self.name("ssm_out.weight")
     }
@@ -207,6 +213,8 @@ pub struct LoadedDeltaNetLayer {
     pub alpha_bias: RawTensor,
     pub ssm_a: RawTensor,
     pub ssm_norm_w: RawTensor,
+    pub ssm_beta_w: RawTensor,
+    pub ssm_alpha_w: RawTensor,
     pub ssm_out: RawTensor,
     pub post_norm_w: RawTensor,
     /// Dense FFN (when expert_count == 0)
@@ -363,6 +371,8 @@ impl ModelWeights {
                 let alpha_bias = raw(&t.ssm_dt())?;
                 let ssm_a = raw(&t.ssm_a())?;
                 let ssm_norm_w = raw(&t.ssm_norm())?;
+                let ssm_beta_w = raw(&t.ssm_beta())?;
+                let ssm_alpha_w = raw(&t.ssm_alpha())?;
                 let ssm_out = raw(&t.ssm_out())?;
 
                 // FFN: MoE or dense
@@ -385,6 +395,8 @@ impl ModelWeights {
                     alpha_bias,
                     ssm_a,
                     ssm_norm_w,
+                    ssm_beta_w,
+                    ssm_alpha_w,
                     ssm_out,
                     post_norm_w,
                     ffn_gate_w,
@@ -547,6 +559,8 @@ pub fn forward_pass(token_id: u32, model: &ModelWeights) -> (Vec<f32>, u32) {
                 &dn_alpha_bias,
                 &dn_ssm_a,
                 &dn_ssm_norm_w,
+                (layer.ssm_beta_w.data(), layer.ssm_beta_w.ty),
+                (layer.ssm_alpha_w.data(), layer.ssm_alpha_w.ty),
                 (layer.ssm_out.data(), layer.ssm_out.ty),
                 &dn_post_norm_w,
                 (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
@@ -1093,6 +1107,8 @@ pub fn prefill(
                     &dn_alpha_bias,
                     &dn_ssm_a,
                     &dn_ssm_norm_w,
+                    (layer.ssm_beta_w.data(), layer.ssm_beta_w.ty),
+                    (layer.ssm_alpha_w.data(), layer.ssm_alpha_w.ty),
                     (layer.ssm_out.data(), layer.ssm_out.ty),
                     &dn_post_norm_w,
                     (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
@@ -1326,6 +1342,8 @@ pub fn prefill_chunked(
                         &dn_alpha_bias,
                         &dn_ssm_a,
                         &dn_ssm_norm_w,
+                        (layer.ssm_beta_w.data(), layer.ssm_beta_w.ty),
+                        (layer.ssm_alpha_w.data(), layer.ssm_alpha_w.ty),
                         (layer.ssm_out.data(), layer.ssm_out.ty),
                         &dn_post_norm_w,
                         (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),
@@ -1562,6 +1580,8 @@ pub fn generate_token_logits(
                 &dn_alpha_bias,
                 &dn_ssm_a,
                 &dn_ssm_norm_w,
+                (layer.ssm_beta_w.data(), layer.ssm_beta_w.ty),
+                (layer.ssm_alpha_w.data(), layer.ssm_alpha_w.ty),
                 (layer.ssm_out.data(), layer.ssm_out.ty),
                 &dn_post_norm_w,
                 (layer.ffn_gate_w.data(), layer.ffn_gate_w.ty),

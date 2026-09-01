@@ -2569,6 +2569,8 @@ pub struct DeltaNetLayerWeights<'a> {
     pub alpha_bias: &'a [f32],  // [n_heads_v]  (ssm_dt.bias)
     pub ssm_a: &'a [f32],       // [n_heads_v]  (per-v-head decay)
     pub ssm_norm_w: &'a [f32],  // [s_v] per-head
+    pub ssm_beta_w: &'a [f32],  // [n_heads_v, n_embd] (per-v-head beta pre-projection)
+    pub ssm_alpha_w: &'a [f32], // [n_heads_v, n_embd] (per-v-head alpha pre-projection)
     pub ssm_out: &'a [f32],     // [n_embd, s_v * n_heads_v]
     pub post_norm_w: &'a [f32], // [n_embd]
     // Dense FFN (when moe is None)
@@ -2647,27 +2649,32 @@ pub fn delta_net_layer_forward(
     let _qkv_k = &qkv[q_size..q_size + k_size];
     let _qkv_v = &qkv[q_size + k_size..q_size + k_size + v_size];
 
-    // 5. Process alpha and beta from gate_proj
-    // gate_proj has ba_dim = 2 * n_heads_v elements
-    // First half = beta, second half = alpha
-    // The C code maps per-K-head: each K head gets (n_heads_v/n_heads_k) beta and alpha values
-    let ratio = n_heads_v / n_heads_k;
-    let mut alpha = vec![0.0f32; n_heads_v];
+    // 5. Beta projection: ssm_beta_w @ normed -> [n_heads_v] (per-v-head)
     let mut beta = vec![0.0f32; n_heads_v];
-    for hi in 0..n_heads_k {
-        for j in 0..ratio {
-            let v_hi = hi * ratio + j;
-            // beta = first half, alpha = second half
-            beta[v_hi] = gate_proj[hi * ratio + j];
-            alpha[v_hi] = gate_proj[n_heads_k * ratio + hi * ratio + j];
+    for o in 0..n_heads_v {
+        let mut acc = 0.0f32;
+        for i in 0..n_embd {
+            acc += normed[i] * layer.ssm_beta_w[o * n_embd + i];
         }
+        beta[o] = acc;
     }
 
-    // 6. Alpha: alpha_biased = alpha + alpha_bias, gate = softplus(alpha_biased) * ssm_a
+    // 6. Alpha projection: ssm_alpha_w @ normed -> [n_heads_v]
+    let mut alpha = vec![0.0f32; n_heads_v];
+    for o in 0..n_heads_v {
+        let mut acc = 0.0f32;
+        for i in 0..n_embd {
+            acc += normed[i] * layer.ssm_alpha_w[o * n_embd + i];
+        }
+        alpha[o] = acc;
+    }
+
+    // 7. Alpha: gate = ssm_a * softplus(alpha + bias); state decays by exp(gate) in AR.
+    // Reference (qwen3-5.cpp build_layer_attn_linear): gate = softplus(alpha + ssm_dt.bias) * ssm_a.
     let mut decay_gate = vec![0.0f32; n_heads_v];
     for v_hi in 0..n_heads_v {
         let sp = (alpha[v_hi] + layer.alpha_bias[v_hi]).exp().ln_1p();
-        decay_gate[v_hi] = sp * layer.ssm_a[v_hi];
+        decay_gate[v_hi] = layer.ssm_a[v_hi] * sp;
     }
 
     // 7. Conv1d: slide over [conv_state | qkv] concatenated
@@ -2730,18 +2737,13 @@ pub fn delta_net_layer_forward(
     // attn_out: [s_v * n_heads_v]
 
     // 10. Gated norm: rms_norm_per_head(attn_out, ssm_norm_w) * silu(z)
-    // z is the gate_proj first n_heads_v * s_v elements (z in C code)
-    // Actually, looking at the C code: z comes from a separate projection (wqkv_gate)
-    // and is reshaped to [s_v * n_heads_v]. We use gate_proj as a proxy.
-    // For correctness: the z is the *gating* dimension of the gate_proj, which is
-    // the second half mapped to [n_heads_v] and then broadcast per-dim.
-    // Simplified: use decay_gate as the z (or ones for a basic working version)
+    // z = gate_proj (attn_gate projection output), shape [s_v, n_heads_v]
+    assert_eq!(ba_dim, v_size, "gate z size must equal v_size for gated norm");
     let normed_attn = rms_norm_per_head(&attn_out, layer.ssm_norm_w, s_v, eps);
     let mut gated_attn = vec![0.0f32; v_size];
     for i in 0..v_size {
-        // Use silu of the alpha value as the gate (simplified)
-        let v_hi = i / s_v;
-        let s = 1.0f32 / (1.0f32 + (-alpha[v_hi]).exp());
+        let z = gate_proj[i];
+        let s = z / (1.0f32 + (-z).exp());
         gated_attn[i] = normed_attn[i] * s;
     }
 
@@ -2862,6 +2864,8 @@ pub fn delta_net_layer_forward_q(
     alpha_bias: &[f32],           // [n_heads_v] — small
     ssm_a: &[f32],                // [n_heads_v] — small
     ssm_norm_w: &[f32],           // [s_v] per-head — small
+    ssm_beta: (&[u8], GGmlType),  // [n_heads_v, n_embd]
+    ssm_alpha: (&[u8], GGmlType), // [n_heads_v, n_embd]
     ssm_out: (&[u8], GGmlType),   // [n_embd, v_size]
     post_norm_w: &[f32],
     // Dense FFN — quantized
@@ -2912,23 +2916,18 @@ pub fn delta_net_layer_forward_q(
     let gate_proj =
         gemv_parallel(wqkv_gate.1, wqkv_gate.0, n_embd, ba_dim, &normed).expect("gemv wqkv_gate");
 
-    // 4. Process alpha/beta from gate_proj
-    let ratio = n_heads_v / n_heads_k;
-    let mut alpha = vec![0.0f32; n_heads_v];
-    let mut beta = vec![0.0f32; n_heads_v];
-    for hi in 0..n_heads_k {
-        for j in 0..ratio {
-            let v_hi = hi * ratio + j;
-            beta[v_hi] = gate_proj[hi * ratio + j];
-            alpha[v_hi] = gate_proj[n_heads_k * ratio + hi * ratio + j];
-        }
-    }
+    // 4. Process alpha/beta from dedicated projections
+    let beta = gemv_parallel(ssm_beta.1, ssm_beta.0, n_embd, n_heads_v, &normed)
+        .expect("gemv ssm_beta");
+    let alpha = gemv_parallel(ssm_alpha.1, ssm_alpha.0, n_embd, n_heads_v, &normed)
+        .expect("gemv ssm_alpha");
 
-    // 5. Decay gate: softplus(alpha + bias) * ssm_a
+    // 5. Decay gate: ssm_a * softplus(alpha + bias); state decays by exp(gate) in AR.
+    // Reference (qwen3-5.cpp build_layer_attn_linear): gate = softplus(alpha + ssm_dt.bias) * ssm_a.
     let mut decay_gate = vec![0.0f32; n_heads_v];
     for v_hi in 0..n_heads_v {
         let sp = (alpha[v_hi] + alpha_bias[v_hi]).exp().ln_1p();
-        decay_gate[v_hi] = sp * ssm_a[v_hi];
+        decay_gate[v_hi] = ssm_a[v_hi] * sp;
     }
 
     // 6. Conv1d: slide over [conv_state | qkv] concatenated
@@ -2982,12 +2981,14 @@ pub fn delta_net_layer_forward_q(
         eps,
     );
 
-    // 10. Gated norm: rms_norm_per_head(attn_out) * silu(gate)
+    // 10. Gated norm: rms_norm_per_head(attn_out, ssm_norm_w) * silu(z)
+    // z = gate_proj (attn_gate projection output), shape [s_v, n_heads_v]
+    assert_eq!(ba_dim, v_size, "gate z size must equal v_size for gated norm");
     let normed_attn = rms_norm_per_head(&attn_out, ssm_norm_w, s_v, eps);
     let mut gated_attn = vec![0.0f32; v_size];
     for i in 0..v_size {
-        let v_hi = i / s_v;
-        let s = 1.0f32 / (1.0f32 + (-alpha[v_hi]).exp());
+        let z = gate_proj[i];
+        let s = z / (1.0f32 + (-z).exp());
         gated_attn[i] = normed_attn[i] * s;
     }
 
@@ -4170,7 +4171,7 @@ mod tests {
         let n_heads_v = 16;
         let conv_kernel_size = 4;
         let conv_dim = s_k * n_heads_k * 2 + s_v * n_heads_v; // Q+K+V
-        let ba_dim = n_heads_v * 2;
+        let ba_dim = s_v * n_heads_v;
         let eps = 1e-6;
 
         let rng = |i: usize| (i as f32 * 0.13 + 1.7).sin() * 0.3;
@@ -4181,7 +4182,9 @@ mod tests {
         let conv_kernel_w: Vec<f32> = (0..conv_dim * conv_kernel_size).map(rng).collect();
         let alpha_bias: Vec<f32> = (0..n_heads_v).map(rng).collect();
         let ssm_a: Vec<f32> = (0..n_heads_v).map(|i| -(i as f32 * 0.1)).collect();
-        let ssm_norm_w: Vec<f32> = (0..s_v * n_heads_v).map(|_| 1.0f32).collect();
+        let ssm_norm_w: Vec<f32> = (0..s_v).map(|_| 1.0f32).collect();
+        let ssm_beta_w: Vec<f32> = (0..n_heads_v * n_embd).map(rng).collect();
+        let ssm_alpha_w: Vec<f32> = (0..n_heads_v * n_embd).map(rng).collect();
         let ssm_out: Vec<f32> = (0..n_embd * s_v * n_heads_v).map(rng).collect();
         let ffn_gate: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
         let ffn_up: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
@@ -4195,6 +4198,8 @@ mod tests {
             alpha_bias: &alpha_bias,
             ssm_a: &ssm_a,
             ssm_norm_w: &ssm_norm_w,
+            ssm_beta_w: &ssm_beta_w,
+            ssm_alpha_w: &ssm_alpha_w,
             ssm_out: &ssm_out,
             post_norm_w: &norm_w,
             ffn_gate_w: &ffn_gate,
@@ -4229,9 +4234,9 @@ mod tests {
             s_k,
             s_v,
             n_heads_k,
-            n_heads_v,
-            eps,
-        );
+        n_heads_v,
+        eps,
+    );
 
         assert_eq!(out.len(), n_embd);
         let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();

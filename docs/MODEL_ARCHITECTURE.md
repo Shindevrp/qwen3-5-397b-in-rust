@@ -18,14 +18,14 @@ Total parameters ≈ 397B, mixture of dense and MoE layers.
 ```mermaid
 flowchart TB
     subgraph L0["Layer 0 dense"]
-        D0[RMSNorm → SwiGLU]
+        D0["RMSNorm → SwiGLU"]
     end
     subgraph L1["Layers 1-59"]
         direction TB
         A[Attn Norm RMSNorm]
-        B[DeltaNet if layer%4≠0<br/>Full Attn if layer%4=0]
+        B["DeltaNet if layer%4≠0<br/>Full Attn if layer%4=0"]
         C[Post Norm]
-        D[MoE Top-10 + shared]
+        D["MoE Top-10 + shared"]
     end
     A --> B --> C --> D
 ```
@@ -50,22 +50,27 @@ Operations:
 flowchart TB
     x --> Norm[RMSNorm]
     Norm --> Proj[Wqkv GEMV]
-    Proj --> Gate[β sigmoid, α decay]
-    Gate --> Conv[conv1d k=4 + SiLU]
-    Conv --> Rec[DeltaNet recurrence S_t]
+    Proj --> Gate["β sigmoid, α decay"]
+    Gate --> Conv["conv1d k=4 + SiLU"]
+    Conv --> Rec["DeltaNet recurrence S_t"]
     Rec --> Out[Gated RMSNorm]
 ```
 
 State update:
 $$
-S_t = \alpha_t \odot S_{t-1} + k_t h_t^\top
+\alpha_t = \log(A) \cdot \text{softplus}(W_\alpha h_t + b)
+$$
+$$
+S_t = e^{\alpha_t} S_{t-1} + k_t h_t^\top
 $$
 $$
 o_t = S_t q_t
 $$
 
 - $S_t \in \mathbb{R}^{128 \times 128}$ per head
-- $\alpha_t$ is a decay gate, $0 < \alpha_t < 1$
+- Per-head `ssm_a` is stored as $\log(A)$ with $A \in (0,1]$, and the state
+  is scaled by $\exp(\alpha_t)$ each step (exact formula from
+  `qwen3-5.cpp` `build_layer_attn_linear`)
 - Memory independent of sequence length → O(1)
 
 State update is O(1) per token, constant memory.
@@ -77,11 +82,11 @@ Layers where `layer_idx % 4 == 0` use full attention.
 ```mermaid
 flowchart TB
     x --> Norm[RMSNorm]
-    Norm --> QKV[Wq, Wk, Wv]
+    Norm --> QKV["Wq, Wk, Wv"]
     QKV --> QKNorm[QK-norm per head]
-    QKNorm --> RoPE[IMRoPE sections [11,11,10,0]]
-    RoPE --> Flash[Flash Attention GQA 16:1]
-    Flash --> Gate[sigmoid × Wo]
+    QKNorm --> RoPE["IMRoPE sections [11,11,10,0]"]
+    RoPE --> Flash["Flash Attention GQA 16:1"]
+    Flash --> Gate["sigmoid × Wo"]
 ```
 
 Details:
@@ -104,14 +109,14 @@ Every layer except layer 0 has MoE FFN.
 
 ```mermaid
 flowchart LR
-    x --> Router[Softmax → top-10]
+    x --> Router["Softmax → top-10"]
     Router --> Slice[Slice expert rows from mmap]
-    Slice --> Dequant[Q4_K on-the-fly dequant]
+    Slice --> Dequant["Q4_K on-the-fly dequant"]
     Dequant --> Gemv[gemv_parallel]
     Gemv --> SwiGLU[SwiGLU activation]
     SwiGLU --> Experts[10 experts]
     Experts --> Shared[Shared expert resident]
-    Experts --> Sum[Weighted sum + shared]
+    Experts --> Sum["Weighted sum + shared"]
 ```
 
 Routing:

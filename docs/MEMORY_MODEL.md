@@ -21,9 +21,9 @@ GGUF v3 shards are memory-mapped read-only:
 ```mermaid
 flowchart TB
     File[GGUF shard file on NVMe] --> Mmap[memmap2 MmapMut]
-    Mmap --> View[&[u8] slice view, no copy]
-    View --> Parser[GGUF parser → tensor metadata]
-    Parser --> Weights[ModelWeights Arc<Mmap>]
+    Mmap --> View["&[u8] slice view, no copy"]
+    View --> Parser["GGUF parser → tensor metadata"]
+    Parser --> Weights["ModelWeights Arc<Mmap>"]
 ```
 
 Key properties:
@@ -46,7 +46,7 @@ This gives us an automatic LRU expert cache without explicit code.
 ```mermaid
 flowchart TB
     Disk[(GGUF shards 240 GB)] --> Mmap[memmap2 zero-copy]
-    Mmap --> Loader[ModelLoader Arc<Mmap>]
+    Mmap --> Loader["ModelLoader Arc<Mmap>"]
     Loader --> Pipeline[Pipeline]
     PageCache[(OS page cache)] -.caches hot experts.-> Mmap
     RAM[RAM] -->|~10 GB| Stream[Stream every token]
@@ -128,12 +128,12 @@ Access cost:
 
 ```mermaid
 flowchart LR
-    x[Input x∈R⁴⁰⁹⁶] --> Route[route_topk softmax]
+    x["Input x∈R⁴⁰⁹⁶"] --> Route[route_topk softmax]
     Route --> Slice[Slice expert rows from mmap]
     Slice --> Dequant[On-the-fly Q4_K dequant]
     Dequant --> Gemv[gemv_parallel AVX2/NEON]
     Gemv --> Swish[SwiGLU]
-    Swish --> Sum[Σ w_e y_e + σ(gate)·shared]
+    Swish --> Sum["Σ w_e y_e + σ(gate)·shared"]
 ```
 
 Shared expert:
@@ -152,7 +152,7 @@ flowchart LR
     Route --> Slice[Slice expert rows from mmap]
     Slice --> Gemv[gemv_parallel Q4_K]
     Gemv --> Swish[SwiGLU]
-    Swish --> Sum[Σ w_e y_e + σ(gate)·shared]
+    Swish --> Sum["Σ w_e y_e + σ(gate)·shared"]
 ```
 
 ## Why it works
