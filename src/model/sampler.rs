@@ -15,8 +15,8 @@ impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
             temperature: 1.0,
-            top_k: 0,       // 0 = disabled
-            top_p: 1.0,     // 1.0 = disabled
+            top_k: 0,   // 0 = disabled
+            top_p: 1.0, // 1.0 = disabled
             repeat_penalty: 1.0,
             repeat_last_n: 64,
         }
@@ -35,9 +35,7 @@ pub fn sample(logits: &[f32], cfg: &SamplerConfig, history: &[u32]) -> u32 {
     assert!(!logits.is_empty(), "logits must not be empty");
 
     let n_vocab = logits.len();
-    let mut scored: Vec<(u32, f32)> = (0..n_vocab as u32)
-        .zip(logits.iter().copied())
-        .collect();
+    let mut scored: Vec<(u32, f32)> = (0..n_vocab as u32).zip(logits.iter().copied()).collect();
 
     // 1. Repetition penalty
     if cfg.repeat_penalty != 1.0 && !history.is_empty() {
@@ -174,7 +172,10 @@ mod tests {
                 break;
             }
         }
-        assert!(picked_zero, "high temperature should sometimes pick non-argmax token");
+        assert!(
+            picked_zero,
+            "high temperature should sometimes pick non-argmax token"
+        );
     }
 
     #[test]

@@ -98,7 +98,13 @@ impl SynthConfig {
     }
 
     pub fn ba_dim(&self) -> usize {
-        self.ssm_time_step_rank * 2
+        // z projection width = head_v_dim = ssm_state_size * n_heads_v
+        self.ssm_state_size * self.ssm_time_step_rank
+    }
+
+    /// Number of V-heads in the delta-net SSM = ssm.time_step_rank.
+    pub fn n_heads_v(&self) -> usize {
+        self.ssm_time_step_rank
     }
 
     /// Delta-net layers are every layer except multiples of `full_attn_interval`.
@@ -107,7 +113,9 @@ impl SynthConfig {
     }
 
     pub fn n_attn_layers(&self) -> usize {
-        (0..self.n_layers).filter(|&l| !self.is_recurrent(l)).count()
+        (0..self.n_layers)
+            .filter(|&l| !self.is_recurrent(l))
+            .count()
     }
 
     fn rope_sections(&self) -> [i32; 4] {
@@ -171,22 +179,58 @@ pub fn build_gguf(cfg: &SynthConfig) -> Vec<u8> {
         .metadata("qwen35moe.block_count", Value::U32(n_layers as u32))
         .metadata("qwen35moe.embedding_length", Value::U32(n_embd as u32))
         .metadata("qwen35moe.attention.head_count", Value::U32(n_heads as u32))
-        .metadata("qwen35moe.attention.head_count_kv", Value::U32(n_kv_heads as u32))
-        .metadata("qwen35moe.attention.key_length", Value::U32(head_size as u32))
-        .metadata("qwen35moe.attention.value_length", Value::U32(head_size as u32))
-        .metadata("qwen35moe.attention.layer_norm_rms_epsilon", Value::F32(eps))
+        .metadata(
+            "qwen35moe.attention.head_count_kv",
+            Value::U32(n_kv_heads as u32),
+        )
+        .metadata(
+            "qwen35moe.attention.key_length",
+            Value::U32(head_size as u32),
+        )
+        .metadata(
+            "qwen35moe.attention.value_length",
+            Value::U32(head_size as u32),
+        )
+        .metadata(
+            "qwen35moe.attention.layer_norm_rms_epsilon",
+            Value::F32(eps),
+        )
         .metadata("qwen35moe.expert_count", Value::U32(0))
         .metadata("qwen35moe.expert_used_count", Value::U32(0))
-        .metadata("qwen35moe.expert_feed_forward_length", Value::U32(n_ff as u32))
+        .metadata(
+            "qwen35moe.expert_feed_forward_length",
+            Value::U32(n_ff as u32),
+        )
         .metadata("qwen35moe.expert_shared_feed_forward_length", Value::U32(0))
-        .metadata("qwen35moe.rope.dimension_count", Value::U32(head_size as u32))
+        .metadata(
+            "qwen35moe.rope.dimension_count",
+            Value::U32(head_size as u32),
+        )
         .metadata("qwen35moe.rope.freq_base", Value::F32(cfg.rope_freq_base))
-        .metadata("qwen35moe.context_length", Value::U32(cfg.context_length as u32))
-        .metadata("qwen35moe.ssm.state_size", Value::U32(ssm_state_size as u32))
-        .metadata("qwen35moe.ssm.group_count", Value::U32(ssm_group_count as u32))
-        .metadata("qwen35moe.ssm.time_step_rank", Value::U32(ssm_time_step_rank as u32))
-        .metadata("qwen35moe.ssm.conv_kernel", Value::U32(ssm_conv_kernel as u32))
-        .metadata("qwen35moe.full_attention_interval", Value::U32(cfg.full_attn_interval as u32))
+        .metadata(
+            "qwen35moe.context_length",
+            Value::U32(cfg.context_length as u32),
+        )
+        .metadata(
+            "qwen35moe.ssm.state_size",
+            Value::U32(ssm_state_size as u32),
+        )
+        .metadata(
+            "qwen35moe.ssm.group_count",
+            Value::U32(ssm_group_count as u32),
+        )
+        .metadata(
+            "qwen35moe.ssm.time_step_rank",
+            Value::U32(ssm_time_step_rank as u32),
+        )
+        .metadata(
+            "qwen35moe.ssm.conv_kernel",
+            Value::U32(ssm_conv_kernel as u32),
+        )
+        .metadata(
+            "qwen35moe.full_attention_interval",
+            Value::U32(cfg.full_attn_interval as u32),
+        )
         .metadata(
             "qwen35moe.rope.dimension_sections",
             Value::Array {
@@ -224,7 +268,10 @@ pub fn build_gguf(cfg: &SynthConfig) -> Vec<u8> {
     for i in 0..n_layers {
         let prefix = format!("blk.{i}");
 
-        builder = builder.tensor(vec1d(&format!("{prefix}.attn_norm.weight"), &vec![1.0; n_embd]));
+        builder = builder.tensor(vec1d(
+            &format!("{prefix}.attn_norm.weight"),
+            &vec![1.0; n_embd],
+        ));
         builder = builder.tensor(vec1d(
             &format!("{prefix}.post_attention_norm.weight"),
             &vec![1.0; n_embd],
@@ -232,12 +279,20 @@ pub fn build_gguf(cfg: &SynthConfig) -> Vec<u8> {
 
         if cfg.is_recurrent(i) {
             let wqkv: Vec<f32> = rand_f32(conv_dim * n_embd);
-            builder =
-                builder.tensor(vec2d(&format!("{prefix}.attn_qkv.weight"), conv_dim, n_embd, &wqkv));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_qkv.weight"),
+                conv_dim,
+                n_embd,
+                &wqkv,
+            ));
 
             let wqkv_gate: Vec<f32> = rand_f32(ba_dim * n_embd);
-            builder = builder
-                .tensor(vec2d(&format!("{prefix}.attn_gate.weight"), ba_dim, n_embd, &wqkv_gate));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_gate.weight"),
+                ba_dim,
+                n_embd,
+                &wqkv_gate,
+            ));
 
             let conv_kernel: Vec<f32> = rand_f32(conv_dim * ssm_conv_kernel);
             builder = builder.tensor(vec2d(
@@ -247,52 +302,105 @@ pub fn build_gguf(cfg: &SynthConfig) -> Vec<u8> {
                 &conv_kernel,
             ));
 
-            let alpha_bias: Vec<f32> = rand_f32(ba_dim);
-            builder =
-                builder.tensor(vec1d(&format!("{prefix}.ssm_dt.bias"), &alpha_bias));
+            let alpha_bias: Vec<f32> = rand_f32(cfg.n_heads_v());
+            builder = builder.tensor(vec1d(&format!("{prefix}.ssm_dt.bias"), &alpha_bias));
 
-            let ssm_a: Vec<f32> = (0..ba_dim).map(|j| -((j + 1) as f32)).collect();
+            let ssm_a: Vec<f32> = (0..cfg.n_heads_v()).map(|j| -((j + 1) as f32)).collect();
             builder = builder.tensor(vec1d(&format!("{prefix}.ssm_a"), &ssm_a));
 
             let v_size = ssm_state_size * ssm_time_step_rank;
-            builder =
-                builder.tensor(vec1d(&format!("{prefix}.ssm_alpha.weight"), &vec![1.0; v_size]));
-            builder =
-                builder.tensor(vec1d(&format!("{prefix}.ssm_beta.weight"), &vec![0.0; v_size]));
-            builder =
-                builder.tensor(vec1d(&format!("{prefix}.ssm_norm.weight"), &vec![1.0; v_size]));
+            // ssm_beta / ssm_alpha: [n_embd, n_heads_v] per-v-head projections
+            let ssm_beta: Vec<f32> = rand_f32(ssm_time_step_rank * n_embd);
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.ssm_beta.weight"),
+                n_embd,
+                ssm_time_step_rank,
+                &ssm_beta,
+            ));
+            let ssm_alpha: Vec<f32> = rand_f32(ssm_time_step_rank * n_embd);
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.ssm_alpha.weight"),
+                n_embd,
+                ssm_time_step_rank,
+                &ssm_alpha,
+            ));
+            builder = builder.tensor(vec1d(
+                &format!("{prefix}.ssm_norm.weight"),
+                &vec![1.0; ssm_state_size],
+            ));
 
             let ssm_out: Vec<f32> = rand_f32(v_size * n_embd);
-            builder = builder
-                .tensor(vec2d(&format!("{prefix}.ssm_out.weight"), v_size, n_embd, &ssm_out));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.ssm_out.weight"),
+                v_size,
+                n_embd,
+                &ssm_out,
+            ));
         } else {
             let q_out = 2 * n_heads * head_size; // fused QK rows in Q
             let kv_out = n_kv_heads * head_size;
 
             let wq: Vec<f32> = rand_f32(q_out * n_embd);
-            builder = builder.tensor(vec2d(&format!("{prefix}.attn_q.weight"), q_out, n_embd, &wq));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_q.weight"),
+                q_out,
+                n_embd,
+                &wq,
+            ));
             let wk: Vec<f32> = rand_f32(kv_out * n_embd);
-            builder = builder.tensor(vec2d(&format!("{prefix}.attn_k.weight"), kv_out, n_embd, &wk));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_k.weight"),
+                kv_out,
+                n_embd,
+                &wk,
+            ));
             let wv: Vec<f32> = rand_f32(kv_out * n_embd);
-            builder = builder.tensor(vec2d(&format!("{prefix}.attn_v.weight"), kv_out, n_embd, &wv));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_v.weight"),
+                kv_out,
+                n_embd,
+                &wv,
+            ));
             let wo: Vec<f32> = rand_f32(n_embd * q_out);
-            builder = builder
-                .tensor(vec2d(&format!("{prefix}.attn_output.weight"), n_embd, q_out, &wo));
+            builder = builder.tensor(vec2d(
+                &format!("{prefix}.attn_output.weight"),
+                n_embd,
+                q_out,
+                &wo,
+            ));
 
-            builder = builder
-                .tensor(vec1d(&format!("{prefix}.attn_q_norm.weight"), &vec![1.0; head_size]));
-            builder = builder
-                .tensor(vec1d(&format!("{prefix}.attn_k_norm.weight"), &vec![1.0; head_size]));
+            builder = builder.tensor(vec1d(
+                &format!("{prefix}.attn_q_norm.weight"),
+                &vec![1.0; head_size],
+            ));
+            builder = builder.tensor(vec1d(
+                &format!("{prefix}.attn_k_norm.weight"),
+                &vec![1.0; head_size],
+            ));
         }
 
         // Dense FFN (expert_count = 0)
         let ffn_gate: Vec<f32> = rand_f32(n_ff * n_embd);
-        builder =
-            builder.tensor(vec2d(&format!("{prefix}.ffn_gate.weight"), n_ff, n_embd, &ffn_gate));
+        builder = builder.tensor(vec2d(
+            &format!("{prefix}.ffn_gate.weight"),
+            n_ff,
+            n_embd,
+            &ffn_gate,
+        ));
         let ffn_up: Vec<f32> = rand_f32(n_ff * n_embd);
-        builder = builder.tensor(vec2d(&format!("{prefix}.ffn_up.weight"), n_ff, n_embd, &ffn_up));
+        builder = builder.tensor(vec2d(
+            &format!("{prefix}.ffn_up.weight"),
+            n_ff,
+            n_embd,
+            &ffn_up,
+        ));
         let ffn_down: Vec<f32> = rand_f32(n_embd * n_ff);
-        builder = builder.tensor(vec2d(&format!("{prefix}.ffn_down.weight"), n_embd, n_ff, &ffn_down));
+        builder = builder.tensor(vec2d(
+            &format!("{prefix}.ffn_down.weight"),
+            n_embd,
+            n_ff,
+            &ffn_down,
+        ));
     }
 
     builder.build()
@@ -318,7 +426,10 @@ mod tests {
         for name in ["tiny", "medium", "large"] {
             let cfg = SynthConfig::preset(name).unwrap();
             assert_eq!(cfg.n_heads % cfg.n_kv_heads, 0);
-            assert!(cfg.head_size.is_multiple_of(4), "rope sections need quarters");
+            assert!(
+                cfg.head_size.is_multiple_of(4),
+                "rope sections need quarters"
+            );
             assert!(cfg.n_attn_layers() > 0 && cfg.is_recurrent(0));
             assert!(cfg.kv_bytes_per_token() > 0);
         }

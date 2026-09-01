@@ -6,13 +6,25 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_5_397b_in_rust::model::kernels::{attention_forward, conv1d_silu, delta_net_autoregressive, delta_net_layer_forward, full_layer_forward, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head, rope_multi_imrope, softmax_topk, swiglu, RopeConfig, DeltaNetLayerWeights};
 use qwen3_5_397b_in_rust::gguf::GGmlType;
+use qwen3_5_397b_in_rust::model::kernels::{
+    DeltaNetLayerWeights, RopeConfig, attention_forward, conv1d_silu, delta_net_autoregressive,
+    delta_net_layer_forward, full_layer_forward, gemm, gemv, moe_ffn, rms_norm, rms_norm_per_head,
+    rope_multi_imrope, softmax_topk, swiglu,
+};
 
 fn read_f32_file(path: &Path, n: usize) -> Vec<f32> {
     let data = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(data.len(), n * 4, "{}: expected {n} f32 values, got {} bytes", path.display(), data.len());
-    data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    assert_eq!(
+        data.len(),
+        n * 4,
+        "{}: expected {n} f32 values, got {} bytes",
+        path.display(),
+        data.len()
+    );
+    data.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn write_txt(path: &Path, vals: &[f32]) {
@@ -35,7 +47,11 @@ fn ty_from_name(name: &str) -> GGmlType {
 }
 
 fn main() {
-    let dir = PathBuf::from(env::args().nth(1).unwrap_or_else(|| "/tmp/opencode/kern_check".to_string()));
+    let dir = PathBuf::from(
+        env::args()
+            .nth(1)
+            .unwrap_or_else(|| "/tmp/opencode/kern_check".to_string()),
+    );
     let spec = fs::read_to_string(dir.join("spec.txt")).expect("read spec.txt");
     for (lineno, line) in spec.lines().enumerate() {
         if line.trim().is_empty() {
@@ -56,7 +72,8 @@ fn main() {
                 let ty = ty_from_name(f[1]);
                 let n_in: usize = f[2].parse().unwrap();
                 let n_out: usize = f[3].parse().unwrap();
-                let w = fs::read(dir.join(format!("gemv_{}_w.bin", f[1]))).expect("read weight file");
+                let w =
+                    fs::read(dir.join(format!("gemv_{}_w.bin", f[1]))).expect("read weight file");
                 let x = read_f32_file(&dir.join(f[4]), n_in);
                 let out = gemv(ty, &w, n_in, n_out, &x).expect("gemv");
                 assert_eq!(out.len(), n_out);
@@ -67,7 +84,8 @@ fn main() {
                 let n_in: usize = f[2].parse().unwrap();
                 let n_out: usize = f[3].parse().unwrap();
                 let n_batch: usize = f[4].parse().unwrap();
-                let w = fs::read(dir.join(format!("gemm_{}_w.bin", f[1]))).expect("read weight file");
+                let w =
+                    fs::read(dir.join(format!("gemm_{}_w.bin", f[1]))).expect("read weight file");
                 let x = read_f32_file(&dir.join(f[5]), n_in * n_batch);
                 let out = gemm(ty, &w, n_in, n_out, n_batch, &x).expect("gemm");
                 assert_eq!(out.len(), n_out * n_batch);
@@ -82,10 +100,21 @@ fn main() {
                 let n_kv: usize = f[6].parse().unwrap();
                 let causal: bool = f[7].parse::<u8>().unwrap() != 0;
                 let scale = 1.0 / (head_dim as f32).sqrt();
-                let q = read_f32_file(&dir.join(format!("attn_{id}_q.bin")), n_q * n_heads * head_dim);
-                let k = read_f32_file(&dir.join(format!("attn_{id}_k.bin")), n_kv * n_kv_heads * head_dim);
-                let v = read_f32_file(&dir.join(format!("attn_{id}_v.bin")), n_kv * n_kv_heads * head_dim);
-                let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, n_kv, scale, causal);
+                let q = read_f32_file(
+                    &dir.join(format!("attn_{id}_q.bin")),
+                    n_q * n_heads * head_dim,
+                );
+                let k = read_f32_file(
+                    &dir.join(format!("attn_{id}_k.bin")),
+                    n_kv * n_kv_heads * head_dim,
+                );
+                let v = read_f32_file(
+                    &dir.join(format!("attn_{id}_v.bin")),
+                    n_kv * n_kv_heads * head_dim,
+                );
+                let out = attention_forward(
+                    &q, &k, &v, n_heads, n_kv_heads, head_dim, n_q, n_kv, scale, causal,
+                );
                 assert_eq!(out.len(), n_q * n_heads * head_dim);
                 write_txt(&dir.join(format!("rust_attn_{id}.txt")), &out);
             }
@@ -98,12 +127,18 @@ fn main() {
                 let eps = 1e-6f32;
                 let mut state = vec![0.0f32; s_v * s_v * n_heads];
                 for step in 0..n_steps {
-                    let q = read_f32_file(&dir.join(format!("dn_{id}_s{step}_q.bin")), s_k * n_heads);
-                    let k = read_f32_file(&dir.join(format!("dn_{id}_s{step}_k.bin")), s_k * n_heads);
-                    let v = read_f32_file(&dir.join(format!("dn_{id}_s{step}_v.bin")), s_v * n_heads);
+                    let q =
+                        read_f32_file(&dir.join(format!("dn_{id}_s{step}_q.bin")), s_k * n_heads);
+                    let k =
+                        read_f32_file(&dir.join(format!("dn_{id}_s{step}_k.bin")), s_k * n_heads);
+                    let v =
+                        read_f32_file(&dir.join(format!("dn_{id}_s{step}_v.bin")), s_v * n_heads);
                     let g = read_f32_file(&dir.join(format!("dn_{id}_s{step}_g.bin")), n_heads);
-                    let beta = read_f32_file(&dir.join(format!("dn_{id}_s{step}_beta.bin")), n_heads);
-                    let out = delta_net_autoregressive(&q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps);
+                    let beta =
+                        read_f32_file(&dir.join(format!("dn_{id}_s{step}_beta.bin")), n_heads);
+                    let out = delta_net_autoregressive(
+                        &q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps,
+                    );
                     assert_eq!(out.len(), s_v * n_heads);
                     write_txt(&dir.join(format!("rust_dn_{id}_s{step}.txt")), &out);
                 }
@@ -175,8 +210,12 @@ fn main() {
                 let channels: usize = f[2].parse().unwrap();
                 let kernel_size: usize = f[3].parse().unwrap();
                 let seq_len: usize = f[4].parse().unwrap();
-                let inp = read_f32_file(&dir.join(format!("conv_{id}_inp.bin")), channels * seq_len);
-                let krn = read_f32_file(&dir.join(format!("conv_{id}_krn.bin")), channels * kernel_size);
+                let inp =
+                    read_f32_file(&dir.join(format!("conv_{id}_inp.bin")), channels * seq_len);
+                let krn = read_f32_file(
+                    &dir.join(format!("conv_{id}_krn.bin")),
+                    channels * kernel_size,
+                );
                 let pad = kernel_size - 1;
                 let st = read_f32_file(&dir.join(format!("conv_{id}_st.bin")), channels * pad);
                 let (out, state_out) = conv1d_silu(&inp, &krn, &st, channels, seq_len, kernel_size);
@@ -194,9 +233,25 @@ fn main() {
                 let n_tokens: usize = f[6].parse().unwrap();
                 let inp = read_f32_file(&dir.join(format!("moe_{id}_inp.bin")), n_tokens * n_embd);
                 let rw = read_f32_file(&dir.join(format!("moe_{id}_rw.bin")), n_expert * n_embd);
-                let guw = read_f32_file(&dir.join(format!("moe_{id}_guw.bin")), n_expert * 2 * n_ff * n_embd);
-                let dw = read_f32_file(&dir.join(format!("moe_{id}_dw.bin")), n_expert * n_embd * n_ff);
-                let out = moe_ffn(&inp, &rw, &guw, &dw, n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+                let guw = read_f32_file(
+                    &dir.join(format!("moe_{id}_guw.bin")),
+                    n_expert * 2 * n_ff * n_embd,
+                );
+                let dw = read_f32_file(
+                    &dir.join(format!("moe_{id}_dw.bin")),
+                    n_expert * n_embd * n_ff,
+                );
+                let out = moe_ffn(
+                    &inp,
+                    &rw,
+                    &guw,
+                    &dw,
+                    n_embd,
+                    n_ff,
+                    n_expert,
+                    n_expert_used,
+                    n_tokens,
+                );
                 assert_eq!(out.len(), n_tokens * n_embd);
                 write_txt(&dir.join(format!("rust_moe_{id}.txt")), &out);
             }
@@ -212,18 +267,36 @@ fn main() {
                     let parts: Vec<i32> = f[8].split(',').map(|s| s.parse().unwrap()).collect();
                     [parts[0], parts[1], parts[2], parts[3]]
                 };
-                let inp = read_f32_file(&dir.join(format!("full_layer_{id}_inp.bin")), n_tokens * n_embd);
+                let inp = read_f32_file(
+                    &dir.join(format!("full_layer_{id}_inp.bin")),
+                    n_tokens * n_embd,
+                );
                 let anw = read_f32_file(&dir.join(format!("full_layer_{id}_anw.bin")), n_embd);
-                let wq = read_f32_file(&dir.join(format!("full_layer_{id}_wq.bin")), 2 * n_heads * head_size * n_embd);
-                let wk = read_f32_file(&dir.join(format!("full_layer_{id}_wk.bin")), n_kv_heads * head_size * n_embd);
-                let wv = read_f32_file(&dir.join(format!("full_layer_{id}_wv.bin")), n_kv_heads * head_size * n_embd);
-                let wo = read_f32_file(&dir.join(format!("full_layer_{id}_wo.bin")), n_embd * n_heads * head_size);
+                let wq = read_f32_file(
+                    &dir.join(format!("full_layer_{id}_wq.bin")),
+                    2 * n_heads * head_size * n_embd,
+                );
+                let wk = read_f32_file(
+                    &dir.join(format!("full_layer_{id}_wk.bin")),
+                    n_kv_heads * head_size * n_embd,
+                );
+                let wv = read_f32_file(
+                    &dir.join(format!("full_layer_{id}_wv.bin")),
+                    n_kv_heads * head_size * n_embd,
+                );
+                let wo = read_f32_file(
+                    &dir.join(format!("full_layer_{id}_wo.bin")),
+                    n_embd * n_heads * head_size,
+                );
                 let qnw = read_f32_file(&dir.join(format!("full_layer_{id}_qnw.bin")), head_size);
                 let knw = read_f32_file(&dir.join(format!("full_layer_{id}_knw.bin")), head_size);
                 let pnw = read_f32_file(&dir.join(format!("full_layer_{id}_pnw.bin")), n_embd);
-                let fgw = read_f32_file(&dir.join(format!("full_layer_{id}_fgw.bin")), n_ff * n_embd);
-                let fuw = read_f32_file(&dir.join(format!("full_layer_{id}_fuw.bin")), n_ff * n_embd);
-                let fdw = read_f32_file(&dir.join(format!("full_layer_{id}_fdw.bin")), n_embd * n_ff);
+                let fgw =
+                    read_f32_file(&dir.join(format!("full_layer_{id}_fgw.bin")), n_ff * n_embd);
+                let fuw =
+                    read_f32_file(&dir.join(format!("full_layer_{id}_fuw.bin")), n_ff * n_embd);
+                let fdw =
+                    read_f32_file(&dir.join(format!("full_layer_{id}_fdw.bin")), n_embd * n_ff);
                 let rope_cfg = RopeConfig {
                     freq_base: 1e7,
                     freq_scale: 1.0,
@@ -233,12 +306,38 @@ fn main() {
                     beta_slow: 1.0,
                 };
                 let out = full_layer_forward(
-                    &inp, &anw, &wq, &wk, &wv, &wo, &qnw, &knw,
-                    [5, 0, 0, 0], &rope_cfg, &pnw, &fgw, &fuw, &fdw,
-                    n_embd, n_heads, n_kv_heads, head_size, n_ff, n_tokens,
-                    1e-6, sections,
-                    &[], &[], &[], 0, 0,
-                    &[], &[], &[], &[], 0,
+                    &inp,
+                    &anw,
+                    &wq,
+                    &wk,
+                    &wv,
+                    &wo,
+                    &qnw,
+                    &knw,
+                    [5, 0, 0, 0],
+                    &rope_cfg,
+                    &pnw,
+                    &fgw,
+                    &fuw,
+                    &fdw,
+                    n_embd,
+                    n_heads,
+                    n_kv_heads,
+                    head_size,
+                    n_ff,
+                    n_tokens,
+                    1e-6,
+                    sections,
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    0,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    0,
                     None,
                 );
                 assert_eq!(out.len(), n_tokens * n_embd);
@@ -258,17 +357,46 @@ fn main() {
 
                 let inp = read_f32_file(&dir.join(format!("delta_layer_{id}_inp.bin")), n_embd);
                 let anw = read_f32_file(&dir.join(format!("delta_layer_{id}_anw.bin")), n_embd);
-                let wqkv = read_f32_file(&dir.join(format!("delta_layer_{id}_wqkv.bin")), conv_dim * n_embd);
-                let wg = read_f32_file(&dir.join(format!("delta_layer_{id}_wg.bin")), ba_dim * n_embd);
-                let ck = read_f32_file(&dir.join(format!("delta_layer_{id}_ck.bin")), conv_dim * conv_kernel);
+                let wqkv = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_wqkv.bin")),
+                    conv_dim * n_embd,
+                );
+                let wg = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_wg.bin")),
+                    ba_dim * n_embd,
+                );
+                let ck = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_ck.bin")),
+                    conv_dim * conv_kernel,
+                );
                 let ab = read_f32_file(&dir.join(format!("delta_layer_{id}_ab.bin")), n_heads_v);
                 let sa = read_f32_file(&dir.join(format!("delta_layer_{id}_sa.bin")), n_heads_v);
-                let snw = read_f32_file(&dir.join(format!("delta_layer_{id}_snw.bin")), s_v * n_heads_v);
-                let so = read_f32_file(&dir.join(format!("delta_layer_{id}_so.bin")), n_embd * s_v * n_heads_v);
+                let snw = read_f32_file(&dir.join(format!("delta_layer_{id}_snw.bin")), s_v);
+                let sbetaw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_sbetaw.bin")),
+                    n_heads_v * n_embd,
+                );
+                let salphaw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_salphaw.bin")),
+                    n_heads_v * n_embd,
+                );
+                let so = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_so.bin")),
+                    n_embd * s_v * n_heads_v,
+                );
                 let pnw = read_f32_file(&dir.join(format!("delta_layer_{id}_pnw.bin")), n_embd);
-                let fgw = read_f32_file(&dir.join(format!("delta_layer_{id}_fgw.bin")), n_ff * n_embd);
-                let fuw = read_f32_file(&dir.join(format!("delta_layer_{id}_fuw.bin")), n_ff * n_embd);
-                let fdw = read_f32_file(&dir.join(format!("delta_layer_{id}_fdw.bin")), n_embd * n_ff);
+                let fgw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_fgw.bin")),
+                    n_ff * n_embd,
+                );
+                let fuw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_fuw.bin")),
+                    n_ff * n_embd,
+                );
+                let fdw = read_f32_file(
+                    &dir.join(format!("delta_layer_{id}_fdw.bin")),
+                    n_embd * n_ff,
+                );
 
                 let mut cs = vec![0.0f32; conv_dim * (conv_kernel - 1)];
                 let mut ss = vec![0.0f32; s_v * s_v * n_heads_v];
@@ -281,6 +409,8 @@ fn main() {
                     alpha_bias: &ab,
                     ssm_a: &sa,
                     ssm_norm_w: &snw,
+                    ssm_beta_w: &sbetaw,
+                    ssm_alpha_w: &salphaw,
                     ssm_out: &so,
                     post_norm_w: &pnw,
                     ffn_gate_w: &fgw,
@@ -299,9 +429,20 @@ fn main() {
                 };
 
                 let out = delta_net_layer_forward(
-                    &inp, &layer, &mut cs, &mut ss,
-                    n_embd, n_ff, conv_dim, conv_kernel, ba_dim,
-                    s_k, s_v, n_heads_k, n_heads_v, 1e-6,
+                    &inp,
+                    &layer,
+                    &mut cs,
+                    &mut ss,
+                    n_embd,
+                    n_ff,
+                    conv_dim,
+                    conv_kernel,
+                    ba_dim,
+                    s_k,
+                    s_v,
+                    n_heads_k,
+                    n_heads_v,
+                    1e-6,
                 );
                 assert_eq!(out.len(), n_embd);
                 write_txt(&dir.join(format!("rust_delta_layer_{id}.txt")), &out);

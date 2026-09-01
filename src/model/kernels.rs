@@ -6,7 +6,7 @@
 //! float accumulation order, which is noted where relevant).
 
 use crate::gguf::GGmlType;
-use crate::model::quant::{QuantError, QK_K, fp16_to_f32};
+use crate::model::quant::{QK_K, QuantError, RawTensor, fp16_to_f32, tensor_size};
 use rayon::prelude::*;
 
 pub const QK8_0: usize = 32;
@@ -50,7 +50,10 @@ pub(crate) fn rms_norm_scalar(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// `d = amax/127`, `qs[j] = roundf(x[j] * (1/d))`, d stored as fp16.
 /// Block size 34 bytes.
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
-    assert!(x.len().is_multiple_of(QK8_0), "Q8_0 quantization needs a multiple of 32 elements");
+    assert!(
+        x.len().is_multiple_of(QK8_0),
+        "Q8_0 quantization needs a multiple of 32 elements"
+    );
     let mut out = Vec::with_capacity(x.len() / QK8_0 * 34);
     for block in x.chunks_exact(QK8_0) {
         let amax = block.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
@@ -70,7 +73,10 @@ pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
 /// `nearest_int` is round-half-to-even, so Rust uses `round_ties_even`.
 /// Block size 290 bytes (d f16 + qs[256] + bsums[16]).
 pub fn quantize_row_q8_k(x: &[f32]) -> Vec<u8> {
-    assert!(x.len().is_multiple_of(QK_K), "Q8_K quantization needs a multiple of 256 elements");
+    assert!(
+        x.len().is_multiple_of(QK_K),
+        "Q8_K quantization needs a multiple of 256 elements"
+    );
     let mut out = Vec::with_capacity(x.len() / QK_K * 290);
     for block in x.chunks_exact(QK_K) {
         let mut max = 0.0f32;
@@ -85,7 +91,7 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Vec<u8> {
         if amax == 0.0 {
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&[0u8; QK_K]);
-            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(&[0u8; 32]);
             continue;
         }
         let iscale = -127.0f32 / max;
@@ -168,8 +174,10 @@ pub(crate) fn vec_dot_q4_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     for i in 0..nb {
         let xb = &x[i * 144..(i + 1) * 144];
         let yb = &y[i * 290..(i + 1) * 290];
-        let d = fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]])) * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
-        let dmin = fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]])) * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let d = fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]))
+            * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let dmin = fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]]))
+            * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
 
         let mut a = [0i8; QK_K];
         for j in 0..(QK_K / 64) {
@@ -253,8 +261,10 @@ pub(crate) fn vec_dot_q5_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     for i in 0..nb {
         let xb = &x[i * 176..(i + 1) * 176];
         let yb = &y[i * 290..(i + 1) * 290];
-        let d = fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]])) * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
-        let dmin = fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]])) * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let d = fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]))
+            * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let dmin = fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]]))
+            * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
 
         let q4 = &xb[48..176];
         let hm = &xb[16..48];
@@ -342,7 +352,8 @@ pub(crate) fn vec_dot_q6_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
     for i in 0..nb {
         let xb = &x[i * 210..(i + 1) * 210];
         let yb = &y[i * 290..(i + 1) * 290];
-        let d = fp16_to_f32(u16::from_le_bytes([xb[208], xb[209]])) * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let d = fp16_to_f32(u16::from_le_bytes([xb[208], xb[209]]))
+            * fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
 
         let q4 = &xb[0..128];
         let qh = &xb[128..192];
@@ -353,7 +364,8 @@ pub(crate) fn vec_dot_q6_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
             let h = &qh[j * 32..(j + 1) * 32];
             for l in 0..32 {
                 a[j * 128 + l] = (((q[l] & 0x0F) | ((h[l] & 0x03) << 4)) as i8) - 32;
-                a[j * 128 + 32 + l] = (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
+                a[j * 128 + 32 + l] =
+                    (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 64 + l] = (((q[l] >> 4) | (((h[l] >> 4) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 96 + l] = (((q[l + 32] >> 4) | (((h[l] >> 6) & 0x03) << 4)) as i8) - 32;
             }
@@ -393,7 +405,13 @@ pub(crate) fn vec_dot_q6_k_q8_k_scalar(n: usize, x: &[u8], y: &[u8]) -> f32 {
 /// multiple of the block size). The activation vector is quantized once:
 /// Q8_0 for Q8_0 weights, Q8_K for the K-types, matching ggml's matmul
 /// dispatch. F32 weights use a plain f32 dot product.
-pub fn gemv(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Result<Vec<f32>, QuantError> {
+pub fn gemv(
+    ty: GGmlType,
+    w: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+) -> Result<Vec<f32>, QuantError> {
     assert_eq!(x.len(), n_in);
     let row_bytes = crate::model::quant::tensor_size(ty, n_in as u64)? as usize;
     assert!(w.len() >= n_out * row_bytes);
@@ -415,29 +433,100 @@ pub fn gemv(ty: GGmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32]) -> Res
         GGmlType::Q8_0 => {
             let act = quantize_row_q8_0(x);
             for r in 0..n_out {
-                out.push(vec_dot_q8_0_q8_0(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act));
+                out.push(vec_dot_q8_0_q8_0(
+                    n_in,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &act,
+                ));
             }
         }
         GGmlType::Q4_K => {
             let act = quantize_row_q8_k(x);
             for r in 0..n_out {
-                out.push(vec_dot_q4_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act));
+                out.push(vec_dot_q4_k_q8_k(
+                    n_in,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &act,
+                ));
             }
         }
         GGmlType::Q5_K => {
             let act = quantize_row_q8_k(x);
             for r in 0..n_out {
-                out.push(vec_dot_q5_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act));
+                out.push(vec_dot_q5_k_q8_k(
+                    n_in,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &act,
+                ));
             }
         }
         GGmlType::Q6_K => {
             let act = quantize_row_q8_k(x);
             for r in 0..n_out {
-                out.push(vec_dot_q6_k_q8_k(n_in, &w[r * row_bytes..(r + 1) * row_bytes], &act));
+                out.push(vec_dot_q6_k_q8_k(
+                    n_in,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &act,
+                ));
             }
         }
         other => return Err(QuantError::UnsupportedType(other.name())),
     }
+    Ok(out)
+}
+
+/// Row-parallel matrix-vector product: same as `gemv` but parallelises across
+/// output rows using rayon. The activation is quantized once (shared read-only)
+/// and each output row is computed independently on a separate thread.
+///
+/// For `n_out >= 8` this gives near-linear scaling with core count.
+pub fn gemv_parallel(
+    ty: GGmlType,
+    w: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+) -> Result<Vec<f32>, QuantError> {
+    assert_eq!(x.len(), n_in);
+    let row_bytes = crate::model::quant::tensor_size(ty, n_in as u64)? as usize;
+    assert!(w.len() >= n_out * row_bytes);
+
+    // For small row counts the thread overhead isn't worth it — fall back to
+    // serial gemv. Threshold chosen so that the 64-128 row projections in
+    // Qwen3.5 attention layers always parallelise, while tiny FFN-gate inner
+    // dims don't.
+    if n_out < 8 {
+        return gemv(ty, w, n_in, n_out, x);
+    }
+
+    // Pre-quantize activation once (shared across all row threads).
+    let act: Vec<u8> = match ty {
+        GGmlType::F32 => vec![], // not used for F32 path
+        GGmlType::Q8_0 => quantize_row_q8_0(x),
+        _ => quantize_row_q8_k(x), // Q4_K, Q5_K, Q6_K all use Q8_K activation
+    };
+
+    let mut out = vec![0.0f32; n_out];
+
+    out.par_chunks_mut(1).enumerate().for_each(|(r, slot)| {
+        let row_start = r * row_bytes;
+        let row = &w[row_start..row_start + row_bytes];
+        slot[0] = match ty {
+            GGmlType::F32 => {
+                let mut sum = 0.0f32;
+                for (i, c) in row.chunks_exact(4).enumerate() {
+                    sum += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * x[i];
+                }
+                sum
+            }
+            GGmlType::Q8_0 => vec_dot_q8_0_q8_0(n_in, row, &act),
+            GGmlType::Q4_K => vec_dot_q4_k_q8_k(n_in, row, &act),
+            GGmlType::Q5_K => vec_dot_q5_k_q8_k(n_in, row, &act),
+            GGmlType::Q6_K => vec_dot_q6_k_q8_k(n_in, row, &act),
+            _ => unreachable!(),
+        };
+    });
+
     Ok(out)
 }
 
@@ -563,7 +652,10 @@ pub fn attention_forward(
     scale: f32,
     causal: bool,
 ) -> Vec<f32> {
-    assert!(n_heads.is_multiple_of(n_kv_heads), "n_heads must be a multiple of n_kv_heads");
+    assert!(
+        n_heads.is_multiple_of(n_kv_heads),
+        "n_heads must be a multiple of n_kv_heads"
+    );
     let gqa = n_heads / n_kv_heads;
     let q_stride = head_dim; // stride between heads within one query token
     let kv_head_stride = head_dim; // stride between tokens for one kv head
@@ -623,6 +715,112 @@ pub fn attention_forward(
 }
 
 // ---- Delta-net linear attention (autoregressive) --------------------------
+
+/// Flash-attention-style scaled dot-product attention (Phase 26).
+///
+/// Same contract as `attention_forward`, but processes K/V in fixed-size
+/// blocks with an **online softmax**: a running (max, sum, accumulator) triple
+/// is rescaled per block, so each K/V tile is read exactly once and stays in
+/// L1/L2 instead of requiring a full-length score row plus a second sweep.
+/// Numerically equivalent up to float rounding (verified by crossval tests).
+///
+/// Layout (ggml row-major): `ne[0] = head_dim, ne[1] = tokens, ne[2] = heads`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_forward_flash(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_q: usize,
+    n_kv: usize,
+    scale: f32,
+    causal: bool,
+) -> Vec<f32> {
+    const BLOCK: usize = 64;
+    assert!(
+        n_heads.is_multiple_of(n_kv_heads),
+        "n_heads must be a multiple of n_kv_heads"
+    );
+    let gqa = n_heads / n_kv_heads;
+    let kv_head_stride = head_dim;
+    let kv_tok_stride = head_dim * n_kv_heads;
+
+    let mut out = vec![0.0f32; n_q * n_heads * head_dim];
+    let mut block_scores = vec![0.0f32; BLOCK];
+    let mut acc = vec![0.0f32; head_dim];
+
+    for qt in 0..n_q {
+        let q_base = qt * n_heads * head_dim;
+        let o_base = qt * n_heads * head_dim;
+        for qh in 0..n_heads {
+            let kv_h = qh / gqa;
+            let qh_base = q_base + qh * head_dim;
+            let oh_base = o_base + qh * head_dim;
+            let kv_h_base = kv_h * kv_head_stride;
+
+            let max_kv = if causal {
+                if n_q > 1 { qt.min(n_kv - 1) } else { n_kv - 1 }
+            } else {
+                n_kv - 1
+            };
+
+            // Online softmax state.
+            let mut run_max = f32::NEG_INFINITY;
+            let mut run_sum = 0.0f32;
+            for val in acc.iter_mut() {
+                *val = 0.0;
+            }
+
+            let mut b_start = 0usize;
+            while b_start <= max_kv {
+                let b_end = (b_start + BLOCK).min(max_kv + 1);
+
+                // Scores for this block; track block max.
+                let mut b_max = f32::NEG_INFINITY;
+                for (bi, t) in (b_start..b_end).enumerate() {
+                    let k_base = kv_h_base + t * kv_tok_stride;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[qh_base + d] * k[k_base + d];
+                    }
+                    let s = dot * scale;
+                    block_scores[bi] = s;
+                    if s > b_max {
+                        b_max = s;
+                    }
+                }
+
+                // Rescale running state into the new max, accumulate block.
+                let new_max = if b_max > run_max { b_max } else { run_max };
+                let corr = (run_max - new_max).exp();
+                run_sum *= corr;
+                for val in acc.iter_mut() {
+                    *val *= corr;
+                }
+                run_max = new_max;
+
+                for (bi, t) in (b_start..b_end).enumerate() {
+                    let p = (block_scores[bi] - run_max).exp();
+                    run_sum += p;
+                    let v_base = kv_h_base + t * kv_tok_stride;
+                    for d in 0..head_dim {
+                        acc[d] += p * v[v_base + d];
+                    }
+                }
+
+                b_start += BLOCK;
+            }
+
+            let inv_l = 1.0 / run_sum;
+            for d in 0..head_dim {
+                out[oh_base + d] = acc[d] * inv_l;
+            }
+        }
+    }
+    out
+}
 
 /// Delta-net autoregressive linear attention (GDA mode).
 ///
@@ -755,7 +953,14 @@ fn rope_yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
 
 /// `rope_yarn` from ggml ops.cpp: computes (cos_theta, sin_theta).
 #[inline]
-fn rope_yarn(theta_extrap: f32, freq_scale: f32, corr: [f32; 2], i0: usize, ext_factor: f32, mscale: f32) -> (f32, f32) {
+fn rope_yarn(
+    theta_extrap: f32,
+    freq_scale: f32,
+    corr: [f32; 2],
+    i0: usize,
+    ext_factor: f32,
+    mscale: f32,
+) -> (f32, f32) {
     let theta_interp = freq_scale * theta_extrap;
     let mut theta = theta_interp;
     let mut mscale = mscale;
@@ -793,12 +998,18 @@ pub fn rope_multi_imrope(
     cfg: &RopeConfig,
 ) -> Vec<f32> {
     let ne0 = x.len();
-    assert!(n_dims <= ne0 && n_dims.is_multiple_of(2), "n_dims {n_dims} out of range for row of {ne0}");
+    assert!(
+        n_dims <= ne0 && n_dims.is_multiple_of(2),
+        "n_dims {n_dims} out of range for row of {ne0}"
+    );
     let theta_scale = cfg.freq_base.powf(-2.0 / n_dims as f32);
     let corr = rope_yarn_corr_dims(n_ctx_orig, cfg.beta_fast, cfg.beta_slow);
 
     let sect_dims = sections.iter().sum::<i32>();
-    assert!(sect_dims > 0 && (sect_dims as usize) <= ne0, "sections {sections:?} incompatible with row of {ne0}");
+    assert!(
+        sect_dims > 0 && (sect_dims as usize) <= ne0,
+        "sections {sections:?} incompatible with row of {ne0}"
+    );
     let sec_w = sections[1] + sections[0];
     let _sec_e = sections[2] + sec_w;
 
@@ -823,7 +1034,14 @@ pub fn rope_multi_imrope(
         } else {
             theta_e
         };
-        let (c, s) = rope_yarn(theta, cfg.freq_scale, corr, i0, cfg.ext_factor, cfg.attn_factor);
+        let (c, s) = rope_yarn(
+            theta,
+            cfg.freq_scale,
+            corr,
+            i0,
+            cfg.ext_factor,
+            cfg.attn_factor,
+        );
         cos_v[i0 / 2] = c;
         sin_v[i0 / 2] = s;
 
@@ -863,11 +1081,18 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 
 #[inline]
 pub(crate) fn swiglu_scalar(gate: &[f32], up: &[f32]) -> Vec<f32> {
-    assert_eq!(gate.len(), up.len(), "swiglu: gate and up must have same length");
-    gate.iter().zip(up.iter()).map(|(&g, &u)| {
-        let s = 1.0 / (1.0 + (-g).exp());
-        g * s * u
-    }).collect()
+    assert_eq!(
+        gate.len(),
+        up.len(),
+        "swiglu: gate and up must have same length"
+    );
+    gate.iter()
+        .zip(up.iter())
+        .map(|(&g, &u)| {
+            let s = 1.0 / (1.0 + (-g).exp());
+            g * s * u
+        })
+        .collect()
 }
 
 /// Per-head RMS norm.
@@ -877,8 +1102,15 @@ pub(crate) fn swiglu_scalar(gate: &[f32], up: &[f32]) -> Vec<f32> {
 ///
 /// Port of applying `LLM_NORM_RMS` to a `[head_size, n_heads]` tensor.
 pub fn rms_norm_per_head(x: &[f32], w: &[f32], head_size: usize, eps: f32) -> Vec<f32> {
-    assert!(x.len().is_multiple_of(head_size), "rms_norm_per_head: x.len must be multiple of head_size");
-    assert_eq!(w.len(), head_size, "rms_norm_per_head: w must be head_size long");
+    assert!(
+        x.len().is_multiple_of(head_size),
+        "rms_norm_per_head: x.len must be multiple of head_size"
+    );
+    assert_eq!(
+        w.len(),
+        head_size,
+        "rms_norm_per_head: w must be head_size long"
+    );
     let n_heads = x.len() / head_size;
     let mut out = vec![0.0f32; x.len()];
     for h in 0..n_heads {
@@ -1020,6 +1252,27 @@ pub fn conv1d_silu(
 ///
 /// This is a scalar f32 port of `build_moe_ffn` from llama-graph.cpp for
 /// Qwen3.5 MoE (softmax gating, SwiGLU activation, weight normalization).
+//
+// Bundled MoE parameters to reduce argument counts across the codebase.
+pub struct MoEParams<'a> {
+    pub router_w: &'a [f32],
+    pub gate_up_w: &'a [f32],
+    pub down_w: &'a [f32],
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub shexp_gate_w: &'a [f32],
+    pub shexp_up_w: &'a [f32],
+    pub shexp_down_w: &'a [f32],
+    pub shexp_gate_inp_w: &'a [f32],
+    pub n_ff_shexp: usize,
+}
+
+impl<'a> MoEParams<'a> {
+    pub fn is_moe(&self) -> bool {
+        self.n_expert > 0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn moe_ffn(
     input: &[f32],
@@ -1046,87 +1299,219 @@ pub fn moe_ffn(
         .par_chunks_mut(n_embd)
         .zip(input.par_chunks(n_embd))
         .for_each(|(out_chunk, x)| {
-
-        // 1. Router logits: logits[e] = sum_i router_w[e, i] * x[i]
-        let mut logits = vec![0.0f32; n_expert];
-        for e in 0..n_expert {
-            let mut acc = 0.0f32;
-            for i in 0..n_embd {
-                acc += router_w[e * n_embd + i] * x[i];
+            // 1. Router logits: logits[e] = sum_i router_w[e, i] * x[i]
+            let mut logits = vec![0.0f32; n_expert];
+            for e in 0..n_expert {
+                let mut acc = 0.0f32;
+                for i in 0..n_embd {
+                    acc += router_w[e * n_embd + i] * x[i];
+                }
+                logits[e] = acc;
             }
-            logits[e] = acc;
-        }
 
-        // 2. Softmax (f64 for stability)
-        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
-        let sum_exp: f64 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|&e| (e / sum_exp) as f32).collect();
+            // 2. Softmax (f64 for stability)
+            let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
+            let sum_exp: f64 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|&e| (e / sum_exp) as f32).collect();
 
-        // 3. Top-k selection (sort by descending prob)
-        let mut idx: Vec<usize> = (0..n_expert).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-        idx.truncate(n_expert_used);
+            // 3. Top-k selection (sort by descending prob)
+            let mut idx: Vec<usize> = (0..n_expert).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            idx.truncate(n_expert_used);
 
-        // 4. Extract weights for selected experts, normalize
-        let mut sel_weights: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
-        let w_sum: f32 = sel_weights.iter().sum();
-        let w_sum = w_sum.max(1e-6f32); // avoid div by zero
-        for w in &mut sel_weights {
-            *w /= w_sum;
-        }
+            // 4. Extract weights for selected experts, normalize
+            let mut sel_weights: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+            let w_sum: f32 = sel_weights.iter().sum();
+            let w_sum = w_sum.max(1e-6f32); // avoid div by zero
+            for w in &mut sel_weights {
+                *w /= w_sum;
+            }
 
-        // 5. For each selected expert: gate_up → SwiGLU → down → accumulate
-        //    Expert FFNs are independent — parallelize across selected experts.
-        let expert_outputs: Vec<(f32, Vec<f32>)> = idx
-            .par_iter()
-            .map(|&e| {
-                let w_e = probs[e] / w_sum;
+            // 5. For each selected expert: gate_up → SwiGLU → down → accumulate
+            //    Expert FFNs are independent — parallelize across selected experts.
+            let expert_outputs: Vec<(f32, Vec<f32>)> = idx
+                .par_iter()
+                .map(|&e| {
+                    let w_e = probs[e] / w_sum;
 
-                // gate_up = gate_up_w[e] @ x  → [2 * n_ff]
-                let gw_base = e * 2 * n_ff * n_embd;
-                let mut gate_up = vec![0.0f32; 2 * n_ff];
-                for f in 0..2 * n_ff {
-                    let mut acc = 0.0f32;
-                    for i in 0..n_embd {
-                        acc += gate_up_w[gw_base + f * n_embd + i] * x[i];
+                    // gate_up = gate_up_w[e] @ x  → [2 * n_ff]
+                    let gw_base = e * 2 * n_ff * n_embd;
+                    let mut gate_up = vec![0.0f32; 2 * n_ff];
+                    for f in 0..2 * n_ff {
+                        let mut acc = 0.0f32;
+                        for i in 0..n_embd {
+                            acc += gate_up_w[gw_base + f * n_embd + i] * x[i];
+                        }
+                        gate_up[f] = acc;
                     }
-                    gate_up[f] = acc;
-                }
 
-                // SwiGLU: silu(gate) * up
-                let mut ff_out = vec![0.0f32; n_ff];
-                for f in 0..n_ff {
-                    let g = gate_up[f];
-                    let u = gate_up[n_ff + f];
-                    let s = 1.0f32 / (1.0f32 + (-g).exp());
-                    ff_out[f] = g * s * u;
-                }
-
-                // down = down_w[e] @ ff_out  → [n_embd]
-                let dw_base = e * n_embd * n_ff;
-                let mut down_out = vec![0.0f32; n_embd];
-                for j in 0..n_embd {
-                    let mut acc = 0.0f32;
+                    // SwiGLU: silu(gate) * up
+                    let mut ff_out = vec![0.0f32; n_ff];
                     for f in 0..n_ff {
-                        acc += down_w[dw_base + j * n_ff + f] * ff_out[f];
+                        let g = gate_up[f];
+                        let u = gate_up[n_ff + f];
+                        let s = 1.0f32 / (1.0f32 + (-g).exp());
+                        ff_out[f] = g * s * u;
                     }
-                    down_out[j] = acc;
+
+                    // down = down_w[e] @ ff_out  → [n_embd]
+                    let dw_base = e * n_embd * n_ff;
+                    let mut down_out = vec![0.0f32; n_embd];
+                    for j in 0..n_embd {
+                        let mut acc = 0.0f32;
+                        for f in 0..n_ff {
+                            acc += down_w[dw_base + j * n_ff + f] * ff_out[f];
+                        }
+                        down_out[j] = acc;
+                    }
+
+                    (w_e, down_out)
+                })
+                .collect();
+
+            // Accumulate weighted expert outputs
+            for (w_e, down_out) in &expert_outputs {
+                for j in 0..n_embd {
+                    out_chunk[j] += down_out[j] * w_e;
                 }
-
-                (w_e, down_out)
-            })
-            .collect();
-
-        // Accumulate weighted expert outputs
-        for (w_e, down_out) in &expert_outputs {
-            for j in 0..n_embd {
-                out_chunk[j] += down_out[j] * w_e;
             }
-        }
-    });
+        });
 
     output
+}
+
+/// Router: logits → softmax → top-k → normalized selection weights.
+///
+/// Returns `(indices, weights)` of the `k` selected experts, weights summing
+/// to 1. Shared by the dense and streaming MoE paths so routing decisions are
+/// bit-identical between them.
+fn route_topk(
+    x: &[f32],
+    router_w: &[f32],
+    n_embd: usize,
+    n_expert: usize,
+    k: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    // 1. Router logits
+    let mut logits = vec![0.0f32; n_expert];
+    for e in 0..n_expert {
+        let mut acc = 0.0f32;
+        let row = &router_w[e * n_embd..(e + 1) * n_embd];
+        for i in 0..n_embd {
+            acc += row[i] * x[i];
+        }
+        logits[e] = acc;
+    }
+    // 2. Softmax (f64 accumulation, matching the dense path)
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f64> = logits.iter().map(|&l| ((l - max_l) as f64).exp()).collect();
+    let sum_exp: f64 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|&e| (e / sum_exp) as f32).collect();
+    // 3. Top-k + normalize
+    let mut idx: Vec<usize> = (0..n_expert).collect();
+    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.truncate(k);
+    let mut wts: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+    let s: f32 = wts.iter().sum::<f32>().max(1e-6);
+    for w in &mut wts {
+        *w /= s;
+    }
+    (idx, wts)
+}
+
+/// Streaming MoE FFN over **raw quantized expert weights** (Phase 30).
+///
+/// Instead of dequantizing every expert's matrices (impossible for 512-expert
+/// models — tens of GB per layer), this slices each *selected* expert's rows
+/// directly out of the mmap-backed byte buffers and runs the existing
+/// quantized GEMV against them. Memory cost is one expert's activations at a
+/// time; the hot pages stay in the OS page cache across tokens.
+///
+/// Layouts (ggml row-major, ne[0] fastest):
+/// - `gate_up_bytes`: `[n_expert, 2*n_ff, n_embd]` quantized, expert stride
+///   = `2*n_ff * row_bytes(n_embd)`
+/// - `down_bytes`:    `[n_expert, n_embd, n_ff]` quantized, expert stride
+///   = `n_embd * row_bytes(n_ff)`
+///
+/// `input` is a single token's hidden vector `[n_embd]`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ffn_stream(
+    input: &[f32],
+    router_w: &[f32],
+    gate_tensor: &RawTensor,
+    up_tensor: &RawTensor,
+    down_tensor: &RawTensor,
+    n_embd: usize,
+    n_ff: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Result<Vec<f32>, QuantError> {
+    assert_eq!(input.len(), n_embd);
+    assert_eq!(router_w.len(), n_expert * n_embd);
+    assert!(n_expert_used <= n_expert);
+
+    let gate_ty = gate_tensor.ty;
+    let up_ty = up_tensor.ty;
+    let down_ty = down_tensor.ty;
+    // gate and up are expected to share type, but allow separate for safety
+    debug_assert_eq!(gate_ty, up_ty);
+
+    let gate_bytes = gate_tensor.data();
+    let up_bytes = up_tensor.data();
+    let down_bytes = down_tensor.data();
+
+    let rb_in = tensor_size(gate_ty, n_embd as u64)? as usize;
+    let rb_ff_gate = tensor_size(gate_ty, n_ff as u64)? as usize;
+    let rb_ff_down = tensor_size(down_ty, n_ff as u64)? as usize;
+
+    let gate_stride = n_ff * rb_in;
+    let up_stride = n_ff * rb_in;
+    let down_stride = n_embd * rb_ff_down;
+
+    let mut out = vec![0.0f32; n_embd];
+    let (idx, wts) = route_topk(input, router_w, n_embd, n_expert, n_expert_used);
+
+    for (&e, &w_e) in idx.iter().zip(&wts) {
+        let gate_off = e * gate_stride;
+        let up_off = e * up_stride;
+        let down_off = e * down_stride;
+
+        if gate_off + gate_stride > gate_bytes.len()
+            || up_off + up_stride > up_bytes.len()
+            || down_off + down_stride > down_bytes.len()
+        {
+            return Err(QuantError::BadLength {
+                expected: ((e + 1) * gate_stride) as u64,
+                bytes: gate_bytes.len(),
+            });
+        }
+
+        let gate_w = &gate_bytes[gate_off..gate_off + gate_stride];
+        let up_w = &up_bytes[up_off..up_off + up_stride];
+        let down_w = &down_bytes[down_off..down_off + down_stride];
+
+        let gate_out = gemv_parallel(gate_ty, gate_w, n_embd, n_ff, input)?;
+        let up_out = gemv_parallel(up_ty, up_w, n_embd, n_ff, input)?;
+
+        let mut act = vec![0.0f32; n_ff];
+        for f in 0..n_ff {
+            let g = gate_out[f];
+            let u = up_out[f];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            act[f] = g * s * u;
+        }
+
+        let down_out = gemv_parallel(down_ty, down_w, n_ff, n_embd, &act)?;
+        for j in 0..n_embd {
+            out[j] += down_out[j] * w_e;
+        }
+
+        let _ = gate_tensor.advise_range(gate_off, gate_stride);
+        let _ = up_tensor.advise_range(up_off, up_stride);
+        let _ = down_tensor.advise_range(down_off, down_stride);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,54 +1546,55 @@ pub fn shared_expert_ffn(
 
     let mut output = vec![0.0f32; n_tokens * n_embd];
 
-    for t in 0..n_tokens {
-        let x = &input[t * n_embd..(t + 1) * n_embd];
-
-        // Gate + up projections
-        let mut gate_out = vec![0.0f32; n_ff_shexp];
-        let mut up_out = vec![0.0f32; n_ff_shexp];
-        for f in 0..n_ff_shexp {
-            let mut g_acc = 0.0f32;
-            let mut u_acc = 0.0f32;
-            for i in 0..n_embd {
-                g_acc += x[i] * shexp_gate_w[f * n_embd + i];
-                u_acc += x[i] * shexp_up_w[f * n_embd + i];
-            }
-            gate_out[f] = g_acc;
-            up_out[f] = u_acc;
-        }
-
-        // SwiGLU: silu(gate) * up
-        let mut ffn_act = vec![0.0f32; n_ff_shexp];
-        for f in 0..n_ff_shexp {
-            let g = gate_out[f];
-            let u = up_out[f];
-            let s = 1.0f32 / (1.0f32 + (-g).exp());
-            ffn_act[f] = g * s * u;
-        }
-
-        // Down projection
-        let mut ffn_out = vec![0.0f32; n_embd];
-        for j in 0..n_embd {
-            let mut acc = 0.0f32;
+    output
+        .par_chunks_mut(n_embd)
+        .zip(input.par_chunks(n_embd))
+        .for_each(|(out_chunk, x)| {
+            // Gate + up projections
+            let mut gate_out = vec![0.0f32; n_ff_shexp];
+            let mut up_out = vec![0.0f32; n_ff_shexp];
             for f in 0..n_ff_shexp {
-                acc += ffn_act[f] * shexp_down_w[j * n_ff_shexp + f];
+                let mut g_acc = 0.0f32;
+                let mut u_acc = 0.0f32;
+                for i in 0..n_embd {
+                    g_acc += x[i] * shexp_gate_w[f * n_embd + i];
+                    u_acc += x[i] * shexp_up_w[f * n_embd + i];
+                }
+                gate_out[f] = g_acc;
+                up_out[f] = u_acc;
             }
-            ffn_out[j] = acc;
-        }
 
-        // Sigmoid gate: sigmoid(x @ gate_inp_w)
-        let mut gate_logit = 0.0f32;
-        for i in 0..n_embd {
-            gate_logit += x[i] * shexp_gate_inp_w[i];
-        }
-        let sig_gate = 1.0f32 / (1.0f32 + (-gate_logit).exp());
+            // SwiGLU: silu(gate) * up
+            let mut ffn_act = vec![0.0f32; n_ff_shexp];
+            for f in 0..n_ff_shexp {
+                let g = gate_out[f];
+                let u = up_out[f];
+                let s = 1.0f32 / (1.0f32 + (-g).exp());
+                ffn_act[f] = g * s * u;
+            }
 
-        // Gated output
-        for j in 0..n_embd {
-            output[t * n_embd + j] = sig_gate * ffn_out[j];
-        }
-    }
+            // Down projection
+            let mut ffn_out = vec![0.0f32; n_embd];
+            for j in 0..n_embd {
+                let mut acc = 0.0f32;
+                for f in 0..n_ff_shexp {
+                    acc += ffn_act[f] * shexp_down_w[j * n_ff_shexp + f];
+                }
+                ffn_out[j] = acc;
+            }
+
+            // Sigmoid gate: sigmoid(x @ gate_inp_w)
+            let mut gate_logit = 0.0f32;
+            for i in 0..n_embd {
+                gate_logit += x[i] * shexp_gate_inp_w[i];
+            }
+            let sig_gate = 1.0f32 / (1.0f32 + (-gate_logit).exp());
+
+            // Gated output
+            for j in 0..n_embd {
+                out_chunk[j] = sig_gate * ffn_out[j];
+            }
+        });
 
     output
 }
@@ -1245,26 +1631,26 @@ pub fn shared_expert_ffn(
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub fn full_layer_forward(
-    input: &[f32],           // [n_tokens * n_embd]
+    input: &[f32], // [n_tokens * n_embd]
     // Attention norm
-    attn_norm_w: &[f32],     // [n_embd]
+    attn_norm_w: &[f32], // [n_embd]
     // QKV projections: weights are [out, in] row-major
-    wq: &[f32],              // [2*n_heads*head_size, n_embd]
-    wk: &[f32],              // [n_kv_heads*head_size, n_embd]
-    wv: &[f32],              // [n_kv_heads*head_size, n_embd]
-    wo: &[f32],              // [n_embd, n_heads*head_size]
+    wq: &[f32], // [2*n_heads*head_size, n_embd]
+    wk: &[f32], // [n_kv_heads*head_size, n_embd]
+    wv: &[f32], // [n_kv_heads*head_size, n_embd]
+    wo: &[f32], // [n_embd, n_heads*head_size]
     // Q/K norm weights (per-head)
-    q_norm_w: &[f32],        // [head_size]
-    k_norm_w: &[f32],        // [head_size]
+    q_norm_w: &[f32], // [head_size]
+    k_norm_w: &[f32], // [head_size]
     // RoPE positions
     pos: [i32; 4],
     rope_cfg: &RopeConfig,
     // Post-attention norm
-    post_norm_w: &[f32],     // [n_embd]
+    post_norm_w: &[f32], // [n_embd]
     // Dense FFN weights: SwiGLU (gate, up, down)
-    ffn_gate_w: &[f32],      // [n_ff, n_embd]
-    ffn_up_w: &[f32],        // [n_ff, n_embd]
-    ffn_down_w: &[f32],      // [n_embd, n_ff]
+    ffn_gate_w: &[f32], // [n_ff, n_embd]
+    ffn_up_w: &[f32],   // [n_ff, n_embd]
+    ffn_down_w: &[f32], // [n_embd, n_ff]
     // Dimensions
     n_embd: usize,
     n_heads: usize,
@@ -1275,9 +1661,9 @@ pub fn full_layer_forward(
     eps: f32,
     rope_sections: [i32; 4],
     // MoE FFN (empty slices when dense)
-    moe_router_w: &[f32],    // [n_expert, n_embd]
-    moe_gate_up_w: &[f32],   // [n_expert, 2*n_ff, n_embd]
-    moe_down_w: &[f32],      // [n_expert, n_embd, n_ff]
+    moe_router_w: &[f32],  // [n_expert, n_embd]
+    moe_gate_up_w: &[f32], // [n_expert, 2*n_ff, n_embd]
+    moe_down_w: &[f32],    // [n_expert, n_embd, n_ff]
     n_expert: usize,
     n_expert_used: usize,
     // Shared expert (shexp)
@@ -1286,9 +1672,13 @@ pub fn full_layer_forward(
     shexp_down_w: &[f32],
     shexp_gate_inp_w: &[f32],
     n_ff_shexp: usize,
-    mut kv_cache: Option<KvCacheMut<'_>>,
+    mut kv_cache: Option<KvStoreMut<'_>>,
 ) -> Vec<f32> {
-    let n_rot = rope_sections.iter().map(|&s| s.max(0) as usize).sum::<usize>() * 2;
+    let n_rot = rope_sections
+        .iter()
+        .map(|&s| s.max(0) as usize)
+        .sum::<usize>()
+        * 2;
 
     // 1. Attention norm (per-token)
     let mut normed = vec![0.0f32; n_tokens * n_embd];
@@ -1360,13 +1750,24 @@ pub fn full_layer_forward(
     // 4. QK norm (per-head)
     let mut q_normed = vec![0.0f32; n_tokens * q_size];
     for t in 0..n_tokens {
-        let h_out = rms_norm_per_head(&q_flat[t * q_size..(t + 1) * q_size], q_norm_w, head_size, eps);
+        let h_out = rms_norm_per_head(
+            &q_flat[t * q_size..(t + 1) * q_size],
+            q_norm_w,
+            head_size,
+            eps,
+        );
         q_normed[t * q_size..(t + 1) * q_size].copy_from_slice(&h_out);
     }
     let mut k_normed = vec![0.0f32; n_tokens * n_kv_heads * head_size];
     for t in 0..n_tokens {
-        let h_out = rms_norm_per_head(&k_cur[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size], k_norm_w, head_size, eps);
-        k_normed[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size].copy_from_slice(&h_out);
+        let h_out = rms_norm_per_head(
+            &k_cur[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size],
+            k_norm_w,
+            head_size,
+            eps,
+        );
+        k_normed[t * n_kv_heads * head_size..(t + 1) * n_kv_heads * head_size]
+            .copy_from_slice(&h_out);
     }
 
     // 5. RoPE on Q and K
@@ -1398,28 +1799,44 @@ pub fn full_layer_forward(
     // When using cache: write new K,V to cache, then attend over full cache
     // When no cache: attend over current tokens only (self-attention)
     let (k_for_attn, v_for_attn, n_kv_for_attn) = if let Some(ref mut cache) = kv_cache {
-        // Write k_cur (n_rope, already RoPE'd) and v_cur to cache
-        let nc = cache.n_cached;
-        for t in 0..n_tokens {
-            let k_src = t * kv_dim;
-            let v_src = t * kv_dim;
-            let k_dst = (nc + t) * kv_dim;
-            let v_dst = (nc + t) * kv_dim;
-            cache.k[k_dst..k_dst + kv_dim].copy_from_slice(&k_rope[k_src..k_src + kv_dim]);
-            cache.v[v_dst..v_dst + kv_dim].copy_from_slice(&v_cur[v_src..v_src + kv_dim]);
+        match cache {
+            KvStoreMut::F32(c) => {
+                // Write k_cur (n_rope, already RoPE'd) and v_cur to cache
+                let nc = c.n_cached;
+                for t in 0..n_tokens {
+                    let k_src = t * kv_dim;
+                    let v_src = t * kv_dim;
+                    let k_dst = (nc + t) * kv_dim;
+                    let v_dst = (nc + t) * kv_dim;
+                    c.k[k_dst..k_dst + kv_dim].copy_from_slice(&k_rope[k_src..k_src + kv_dim]);
+                    c.v[v_dst..v_dst + kv_dim].copy_from_slice(&v_cur[v_src..v_src + kv_dim]);
+                }
+                let n_kv_total = nc + n_tokens;
+                (
+                    c.k[..n_kv_total * kv_dim].to_vec(),
+                    c.v[..n_kv_total * kv_dim].to_vec(),
+                    n_kv_total,
+                )
+            }
+            KvStoreMut::Q8 { .. } => {
+                panic!("f32 reference forward_pass_full_attn supports F32 KV backing only")
+            }
         }
-        let n_kv_total = nc + n_tokens;
-        (cache.k[..n_kv_total * kv_dim].to_vec(),
-         cache.v[..n_kv_total * kv_dim].to_vec(),
-         n_kv_total)
     } else {
         (k_rope.clone(), v_cur.clone(), n_tokens)
     };
 
     let attn_out = attention_forward(
-        &q_rope, &k_for_attn, &v_for_attn,
-        n_heads, n_kv_heads, head_size,
-        n_tokens, n_kv_for_attn, scale, true,
+        &q_rope,
+        &k_for_attn,
+        &v_for_attn,
+        n_heads,
+        n_kv_heads,
+        head_size,
+        n_tokens,
+        n_kv_for_attn,
+        scale,
+        true,
     );
 
     // 7. Gate sigmoid + multiply
@@ -1556,6 +1973,360 @@ pub fn full_layer_forward(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18 – Quantized full-attention layer forward (row-parallel gemv)
+// ---------------------------------------------------------------------------
+
+/// Quantized variant of `full_layer_forward` that accepts raw quantized weight
+/// bytes for the large projection matrices and uses `gemv_parallel` for
+/// row-parallel matmul.  Small weight vectors (norms, RoPE) stay as `&[f32]`.
+///
+/// This eliminates per-token dequant allocations and adds multi-core matmul.
+#[allow(clippy::too_many_arguments)]
+pub fn full_layer_forward_q(
+    input: &[f32], // [n_tokens * n_embd]
+    // Attention norm (small, kept as f32)
+    attn_norm_w: &[f32], // [n_embd]
+    // QKV projections — quantized
+    wq: (&[u8], GGmlType), // quantized [2*n_heads*head_size, n_embd]
+    wk: (&[u8], GGmlType), // quantized [n_kv_heads*head_size, n_embd]
+    wv: (&[u8], GGmlType), // quantized [n_kv_heads*head_size, n_embd]
+    wo: (&[u8], GGmlType), // quantized [n_embd, n_heads*head_size]
+    // Q/K norm weights (per-head, small)
+    q_norm_w: &[f32], // [head_size]
+    k_norm_w: &[f32], // [head_size]
+    // RoPE positions
+    pos: [i32; 4],
+    rope_cfg: &RopeConfig,
+    // Post-attention norm
+    post_norm_w: &[f32], // [n_embd]
+    // Dense FFN weights — quantized
+    ffn_gate_w: (&[u8], GGmlType), // quantized [n_ff, n_embd]
+    ffn_up_w: (&[u8], GGmlType),   // quantized [n_ff, n_embd]
+    ffn_down_w: (&[u8], GGmlType), // quantized [n_embd, n_ff]
+    // Dimensions
+    n_embd: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_size: usize,
+    n_ff: usize,
+    n_tokens: usize,
+    eps: f32,
+    rope_sections: [i32; 4],
+    // MoE FFN (fused F32 from load time — keeps existing parallel expert path)
+    moe_router_w: &[f32],
+    moe_gate_up_w: &[f32],
+    moe_down_w: &[f32],
+    n_expert: usize,
+    n_expert_used: usize,
+    // Shared expert (shexp)
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_ff_shexp: usize,
+    // Streaming MoE (Phase 30): raw quantized expert weights; take priority
+    // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
+    moe_gate_raw: Option<&RawTensor>,
+    moe_up_raw: Option<&RawTensor>,
+    moe_down_raw: Option<&RawTensor>,
+    mut kv_cache: Option<KvStoreMut<'_>>,
+) -> Vec<f32> {
+    let n_rot = rope_sections
+        .iter()
+        .map(|&s| s.max(0) as usize)
+        .sum::<usize>()
+        * 2;
+
+    // 1. Attention norm (per-token)
+    let mut normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&input[t * n_embd..(t + 1) * n_embd], attn_norm_w, eps);
+        normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 2. QKV projections via row-parallel quantized gemv
+    let n_q_full = 2 * n_heads * head_size;
+    let q_full = gemv_parallel_tokens(&normed, wq, n_embd, n_q_full, n_tokens);
+    let n_k = n_kv_heads * head_size;
+    let k_cur = gemv_parallel_tokens(&normed, wk, n_embd, n_k, n_tokens);
+    let v_cur = gemv_parallel_tokens(&normed, wv, n_embd, n_kv_heads * head_size, n_tokens);
+
+    // 3. Split Q_full into Q and gate
+    let q_size = n_heads * head_size;
+    let mut q_flat = vec![0.0f32; n_tokens * q_size];
+    let mut gate_flat = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            q_flat[t * q_size + i] = q_full[t * n_q_full + i];
+            gate_flat[t * q_size + i] = q_full[t * n_q_full + q_size + i];
+        }
+    }
+
+    // 4. QK norm (per-head)
+    let mut q_normed = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(
+            &q_flat[t * q_size..(t + 1) * q_size],
+            q_norm_w,
+            head_size,
+            eps,
+        );
+        q_normed[t * q_size..(t + 1) * q_size].copy_from_slice(&h_out);
+    }
+    let mut k_normed = vec![0.0f32; n_tokens * n_k];
+    for t in 0..n_tokens {
+        let h_out = rms_norm_per_head(&k_cur[t * n_k..(t + 1) * n_k], k_norm_w, head_size, eps);
+        k_normed[t * n_k..(t + 1) * n_k].copy_from_slice(&h_out);
+    }
+
+    // 5. RoPE on Q and K
+    let mut q_rope = vec![0.0f32; n_tokens * q_size];
+    let mut k_rope = vec![0.0f32; n_tokens * n_k];
+    for t in 0..n_tokens {
+        for h in 0..n_heads {
+            let base = t * q_size + h * head_size;
+            let slice = &q_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            q_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+        for h in 0..n_kv_heads {
+            let base = t * n_k + h * head_size;
+            let slice = &k_normed[base..base + head_size];
+            let pos_t = [pos[0] + t as i32, pos[1], pos[2], pos[3]];
+            let rotated = rope_multi_imrope(slice, pos_t, n_rot, rope_sections, 4096, rope_cfg);
+            k_rope[base..base + head_size].copy_from_slice(&rotated);
+        }
+    }
+
+    // 6. KV cache write
+    let kv_dim = n_kv_heads * head_size;
+    let row_bytes = KvStoreMut::q8_row_bytes(kv_dim);
+    if let Some(ref mut cache) = kv_cache {
+        match cache {
+            KvStoreMut::F32(c) => {
+                let nc = c.n_cached;
+                for t in 0..n_tokens {
+                    c.k[(nc + t) * kv_dim..(nc + t + 1) * kv_dim]
+                        .copy_from_slice(&k_rope[t * kv_dim..(t + 1) * kv_dim]);
+                    c.v[(nc + t) * kv_dim..(nc + t + 1) * kv_dim]
+                        .copy_from_slice(&v_cur[t * kv_dim..(t + 1) * kv_dim]);
+                }
+            }
+            KvStoreMut::Q8 { k, v, n_cached, .. } => {
+                let nc = *n_cached;
+                for t in 0..n_tokens {
+                    KvStoreMut::pack_row(
+                        k,
+                        (nc + t) * row_bytes,
+                        &k_rope[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                    KvStoreMut::pack_row(
+                        v,
+                        (nc + t) * row_bytes,
+                        &v_cur[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                }
+            }
+        }
+    }
+
+    // 7. Full attention (Q @ K^T → softmax → @ V) — Phase 26 flash kernel
+    let scale = 1.0f32 / (head_size as f32).sqrt();
+    let (k_for_attn, v_for_attn, n_kv_for_attn): (Vec<f32>, Vec<f32>, usize) =
+        if let Some(ref cache) = kv_cache {
+            match cache {
+                KvStoreMut::F32(c) => {
+                    let n_kv_total = c.n_cached + n_tokens;
+                    (
+                        c.k[..n_kv_total * kv_dim].to_vec(),
+                        c.v[..n_kv_total * kv_dim].to_vec(),
+                        n_kv_total,
+                    )
+                }
+                KvStoreMut::Q8 { k, v, n_cached, .. } => {
+                    // Dequantize-on-read: transient scratch for attention only.
+                    let n_kv_total = *n_cached + n_tokens;
+                    let mut kd = vec![0.0f32; n_kv_total * kv_dim];
+                    let mut vd = vec![0.0f32; n_kv_total * kv_dim];
+                    for p in 0..n_kv_total {
+                        KvStoreMut::unpack_row(
+                            k,
+                            p * row_bytes,
+                            &mut kd[p * kv_dim..(p + 1) * kv_dim],
+                        );
+                        KvStoreMut::unpack_row(
+                            v,
+                            p * row_bytes,
+                            &mut vd[p * kv_dim..(p + 1) * kv_dim],
+                        );
+                    }
+                    (kd, vd, n_kv_total)
+                }
+            }
+        } else {
+            (k_rope.clone(), v_cur.clone(), n_tokens)
+        };
+    let attn_out = attention_forward_flash(
+        &q_rope,
+        &k_for_attn,
+        &v_for_attn,
+        n_heads,
+        n_kv_heads,
+        head_size,
+        n_tokens,
+        n_kv_for_attn,
+        scale,
+        true,
+    );
+
+    // 8. Gate sigmoid + multiply
+    let mut gated = vec![0.0f32; n_tokens * q_size];
+    for t in 0..n_tokens {
+        for i in 0..q_size {
+            let g = gate_flat[t * q_size + i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            gated[t * q_size + i] = attn_out[t * q_size + i] * s;
+        }
+    }
+
+    // 9. Output projection: gated @ wo^T → [n_embd] — row-parallel quantized
+    let attn_residual = gemv_parallel_tokens(&gated, wo, q_size, n_embd, n_tokens);
+
+    // 10. Residual connection
+    let mut residual1 = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        residual1[i] = input[i] + attn_residual[i];
+    }
+
+    // 10. Post-attention norm (per-token)
+    let mut post_normed = vec![0.0f32; n_tokens * n_embd];
+    for t in 0..n_tokens {
+        let row = rms_norm(&residual1[t * n_embd..(t + 1) * n_embd], post_norm_w, eps);
+        post_normed[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+    }
+
+    // 11. FFN: dense SwiGLU (quantized) or MoE (streaming or F32-fused)
+    let ffn_out = if n_expert > 0 && moe_gate_raw.is_some() && moe_up_raw.is_some() {
+        // Phase 30 streaming path: per-token routing + per-expert quantized
+        // GEMV directly on mmap-backed byte slices. O(active experts) memory.
+        let gate_raw = moe_gate_raw.unwrap();
+        let up_raw = moe_up_raw.unwrap();
+        let down_raw = moe_down_raw.unwrap();
+        let mut moe_out = vec![0.0f32; n_tokens * n_embd];
+        for t in 0..n_tokens {
+            let row = moe_ffn_stream(
+                &post_normed[t * n_embd..(t + 1) * n_embd],
+                moe_router_w,
+                gate_raw,
+                up_raw,
+                down_raw,
+                n_embd,
+                n_ff,
+                n_expert,
+                n_expert_used,
+            )
+            .expect("moe_ffn_stream");
+            moe_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row);
+        }
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_embd,
+                n_ff_shexp,
+                n_tokens,
+            );
+            for i in 0..n_tokens * n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else if n_expert > 0 {
+        let mut moe_out = moe_ffn(
+            &post_normed,
+            moe_router_w,
+            moe_gate_up_w,
+            moe_down_w,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+            n_tokens,
+        );
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_embd,
+                n_ff_shexp,
+                n_tokens,
+            );
+            for i in 0..n_tokens * n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else {
+        // Dense SwiGLU: gate + up → silu(gate)*up → down — all quantized
+        let ffn_gate_out = gemv_parallel_tokens(&post_normed, ffn_gate_w, n_embd, n_ff, n_tokens);
+        let ffn_up_out = gemv_parallel_tokens(&post_normed, ffn_up_w, n_embd, n_ff, n_tokens);
+        // SwiGLU
+        let mut ffn_act = vec![0.0f32; n_tokens * n_ff];
+        for i in 0..n_tokens * n_ff {
+            let g = ffn_gate_out[i];
+            let u = ffn_up_out[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[i] = g * s * u;
+        }
+        // down projection — quantized
+        gemv_parallel_tokens(&ffn_act, ffn_down_w, n_ff, n_embd, n_tokens)
+    };
+
+    // 12. Final residual
+    let mut output = vec![0.0f32; n_tokens * n_embd];
+    for i in 0..n_tokens * n_embd {
+        output[i] = residual1[i] + ffn_out[i];
+    }
+
+    output
+}
+
+/// Helper: run quantized gemv for each token position.
+/// `input` is `[n_tokens, n_in]`, weight is `(&[u8], GGmlType)`, output is `[n_tokens, n_out]`.
+fn gemv_parallel_tokens(
+    input: &[f32],
+    weight: (&[u8], GGmlType),
+    n_in: usize,
+    n_out: usize,
+    n_tokens: usize,
+) -> Vec<f32> {
+    let (w_data, w_ty) = weight;
+    let mut out = vec![0.0f32; n_tokens * n_out];
+    // For single-token decode (the common case), just call gemv_parallel directly.
+    // For multi-token prefill, parallelise across tokens as well.
+    if n_tokens == 1 {
+        let result = gemv_parallel(w_ty, w_data, n_in, n_out, input).expect("gemv_parallel failed");
+        out.copy_from_slice(&result);
+    } else {
+        out.par_chunks_mut(n_out)
+            .zip(input.par_chunks(n_in))
+            .for_each(|(out_row, in_row)| {
+                let result =
+                    gemv_parallel(w_ty, w_data, n_in, n_out, in_row).expect("gemv_parallel failed");
+                out_row.copy_from_slice(&result);
+            });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3d – End-to-end forward pass (embed → layers → LM head → argmax)
 // ---------------------------------------------------------------------------
 
@@ -1615,9 +2386,77 @@ pub fn lm_head_logits(
 
 /// Mutable reference to a layer's KV cache for use during forward pass.
 pub struct KvCacheMut<'a> {
-    pub k: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
-    pub v: &'a mut [f32],  // [n_ctx * n_kv_heads * head_size]
-    pub n_cached: usize,   // number of positions already cached
+    pub k: &'a mut [f32], // [n_ctx * n_kv_heads * head_size]
+    pub v: &'a mut [f32], // [n_ctx * n_kv_heads * head_size]
+    pub n_cached: usize,  // number of positions already cached
+}
+
+/// Backing storage variant for a layer's KV cache (Phase 25).
+///
+/// `F32` stores K/V as raw f32 rows. `Q8` stores each token row packed as
+/// Q8_0 blocks ((kv_dim/32) blocks × (2-byte f16 scale + 32 i8 values)),
+/// cutting durable cache memory ~3.8x at the cost of a dequantize-on-read
+/// scratch buffer during attention.
+pub enum KvStoreMut<'a> {
+    F32(KvCacheMut<'a>),
+    Q8 {
+        k: &'a mut [u8], // [capacity_tokens * row_bytes]
+        v: &'a mut [u8], // [capacity_tokens * row_bytes]
+        n_cached: usize,
+        kv_dim: usize,
+    },
+}
+
+impl<'a> KvStoreMut<'a> {
+    /// Number of positions already cached.
+    pub fn n_cached(&self) -> usize {
+        match self {
+            KvStoreMut::F32(c) => c.n_cached,
+            KvStoreMut::Q8 { n_cached, .. } => *n_cached,
+        }
+    }
+
+    /// Packed byte length of one Q8_0 row covering `n` elements
+    /// ((n/32) blocks × (2-byte f16 scale + 32 i8 values) = 34 bytes/block).
+    pub fn q8_row_bytes(n: usize) -> usize {
+        n.div_ceil(QK8_0) * (2 + QK8_0)
+    }
+
+    /// Pack one f32 row into Q8_0 blocks written at `byte_off`.
+    /// Rows whose length is not a multiple of 32 are zero-padded.
+    pub(crate) fn pack_row(dst: &mut [u8], byte_off: usize, src: &[f32]) {
+        let packed = if src.len().is_multiple_of(QK8_0) {
+            quantize_row_q8_0(src)
+        } else {
+            let mut padded = src.to_vec();
+            padded.resize(src.len().next_multiple_of(QK8_0), 0.0);
+            quantize_row_q8_0(&padded)
+        };
+        dst[byte_off..byte_off + packed.len()].copy_from_slice(&packed);
+    }
+
+    /// Unpack one Q8_0 row from `src` at `byte_off` into `dst`.
+    /// Handles rows shorter than a whole number of blocks.
+    pub(crate) fn unpack_row(src: &[u8], byte_off: usize, dst: &mut [f32]) {
+        const BLOCK_BYTES: usize = 2 + QK8_0;
+        let n = dst.len();
+        let blocks = n.div_ceil(QK8_0);
+        for b in 0..blocks {
+            let base = byte_off + b * BLOCK_BYTES;
+            // Layout per block: f16 d | QK8_0 i8 quants (matches quant.rs).
+            let scale = f16_from_le_bytes([src[base], src[base + 1]]);
+            for j in 0..QK8_0 {
+                let idx = b * QK8_0 + j;
+                if idx < n {
+                    dst[idx] = scale * (src[base + 2 + j] as i8 as f32);
+                }
+            }
+        }
+    }
+}
+
+fn f16_from_le_bytes(b: [u8; 2]) -> f32 {
+    crate::model::quant::fp16_to_f32(u16::from_le_bytes(b))
 }
 
 /// All weights needed for a single full-attention layer.
@@ -1723,23 +2562,25 @@ pub fn forward_pass_full_attn(
 
 /// All weights needed for a single delta-net (recurrent) layer.
 pub struct DeltaNetLayerWeights<'a> {
-    pub attn_norm_w: &'a [f32],      // [n_embd]
-    pub wqkv: &'a [f32],             // [conv_dim, n_embd]
-    pub wqkv_gate: &'a [f32],        // [ba_dim, n_embd]
-    pub conv_kernel: &'a [f32],       // [conv_dim, conv_kernel_size]
-    pub alpha_bias: &'a [f32],        // [n_heads_v]  (ssm_dt.bias)
-    pub ssm_a: &'a [f32],            // [n_heads_v]  (per-v-head decay)
-    pub ssm_norm_w: &'a [f32],       // [s_v * n_heads_v]
-    pub ssm_out: &'a [f32],          // [n_embd, s_v * n_heads_v]
-    pub post_norm_w: &'a [f32],      // [n_embd]
+    pub attn_norm_w: &'a [f32], // [n_embd]
+    pub wqkv: &'a [f32],        // [conv_dim, n_embd]
+    pub wqkv_gate: &'a [f32],   // [ba_dim, n_embd]
+    pub conv_kernel: &'a [f32], // [conv_dim, conv_kernel_size]
+    pub alpha_bias: &'a [f32],  // [n_heads_v]  (ssm_dt.bias)
+    pub ssm_a: &'a [f32],       // [n_heads_v]  (per-v-head decay)
+    pub ssm_norm_w: &'a [f32],  // [s_v] per-head
+    pub ssm_beta_w: &'a [f32],  // [n_heads_v, n_embd] (per-v-head beta pre-projection)
+    pub ssm_alpha_w: &'a [f32], // [n_heads_v, n_embd] (per-v-head alpha pre-projection)
+    pub ssm_out: &'a [f32],     // [n_embd, s_v * n_heads_v]
+    pub post_norm_w: &'a [f32], // [n_embd]
     // Dense FFN (when moe is None)
-    pub ffn_gate_w: &'a [f32],       // [n_ff, n_embd]
-    pub ffn_up_w: &'a [f32],         // [n_ff, n_embd]
-    pub ffn_down_w: &'a [f32],       // [n_embd, n_ff]
+    pub ffn_gate_w: &'a [f32], // [n_ff, n_embd]
+    pub ffn_up_w: &'a [f32],   // [n_ff, n_embd]
+    pub ffn_down_w: &'a [f32], // [n_embd, n_ff]
     // MoE FFN (when Some)
-    pub moe_router_w: &'a [f32],     // [n_expert, n_embd] or empty
-    pub moe_gate_up_w: &'a [f32],    // [n_expert, 2*n_ff, n_embd] or empty
-    pub moe_down_w: &'a [f32],       // [n_expert, n_embd, n_ff] or empty
+    pub moe_router_w: &'a [f32],  // [n_expert, n_embd] or empty
+    pub moe_gate_up_w: &'a [f32], // [n_expert, 2*n_ff, n_embd] or empty
+    pub moe_down_w: &'a [f32],    // [n_expert, n_embd, n_ff] or empty
     pub n_expert: usize,
     pub n_expert_used: usize,
     // Shared expert (shexp) — present when expert_shared_feed_forward_length > 0
@@ -1759,19 +2600,19 @@ pub struct DeltaNetLayerWeights<'a> {
 /// `conv_state` and `ssm_state` are mutated for autoregressive decoding.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn delta_net_layer_forward(
-    input: &[f32],               // [n_embd]
+    input: &[f32], // [n_embd]
     layer: &DeltaNetLayerWeights<'_>,
-    conv_state: &mut [f32],      // [conv_dim * (conv_kernel_size - 1)]
-    ssm_state: &mut [f32],      // [s_v * s_v * n_heads_v]
+    conv_state: &mut [f32], // [conv_dim * (conv_kernel_size - 1)]
+    ssm_state: &mut [f32],  // [s_v * s_v * n_heads_v]
     n_embd: usize,
     n_ff: usize,
     conv_dim: usize,
     conv_kernel_size: usize,
     ba_dim: usize,
-    s_k: usize,                  // head_k_dim = ssm_state_size
-    s_v: usize,                  // head_v_dim = ssm_inner_size / n_heads_v
-    n_heads_k: usize,            // num_k_heads = ssm_group_count
-    n_heads_v: usize,            // num_v_heads = ssm_time_step_rank
+    s_k: usize,       // head_k_dim = ssm_state_size
+    s_v: usize,       // head_v_dim = ssm_inner_size / n_heads_v
+    n_heads_k: usize, // num_k_heads = ssm_group_count
+    n_heads_v: usize, // num_v_heads = ssm_time_step_rank
     eps: f32,
 ) -> Vec<f32> {
     // 1. Attention norm
@@ -1808,33 +2649,42 @@ pub fn delta_net_layer_forward(
     let _qkv_k = &qkv[q_size..q_size + k_size];
     let _qkv_v = &qkv[q_size + k_size..q_size + k_size + v_size];
 
-    // 5. Process alpha and beta from gate_proj
-    // gate_proj has ba_dim = 2 * n_heads_v elements
-    // First half = beta, second half = alpha
-    // The C code maps per-K-head: each K head gets (n_heads_v/n_heads_k) beta and alpha values
-    let ratio = n_heads_v / n_heads_k;
-    let mut alpha = vec![0.0f32; n_heads_v];
+    // 5. Beta projection: ssm_beta_w @ normed -> [n_heads_v] (per-v-head)
     let mut beta = vec![0.0f32; n_heads_v];
-    for hi in 0..n_heads_k {
-        for j in 0..ratio {
-            let v_hi = hi * ratio + j;
-            // beta = first half, alpha = second half
-            beta[v_hi] = gate_proj[hi * ratio + j];
-            alpha[v_hi] = gate_proj[n_heads_k * ratio + hi * ratio + j];
+    for o in 0..n_heads_v {
+        let mut acc = 0.0f32;
+        for i in 0..n_embd {
+            acc += normed[i] * layer.ssm_beta_w[o * n_embd + i];
         }
+        beta[o] = acc;
     }
 
-    // 6. Alpha: alpha_biased = alpha + alpha_bias, gate = softplus(alpha_biased) * ssm_a
+    // 6. Alpha projection: ssm_alpha_w @ normed -> [n_heads_v]
+    let mut alpha = vec![0.0f32; n_heads_v];
+    for o in 0..n_heads_v {
+        let mut acc = 0.0f32;
+        for i in 0..n_embd {
+            acc += normed[i] * layer.ssm_alpha_w[o * n_embd + i];
+        }
+        alpha[o] = acc;
+    }
+
+    // 7. Alpha: gate = ssm_a * softplus(alpha + bias); state decays by exp(gate) in AR.
+    // Reference (qwen3-5.cpp build_layer_attn_linear): gate = softplus(alpha + ssm_dt.bias) * ssm_a.
     let mut decay_gate = vec![0.0f32; n_heads_v];
     for v_hi in 0..n_heads_v {
         let sp = (alpha[v_hi] + layer.alpha_bias[v_hi]).exp().ln_1p();
-        decay_gate[v_hi] = sp * layer.ssm_a[v_hi];
+        decay_gate[v_hi] = layer.ssm_a[v_hi] * sp;
     }
 
     // 7. Conv1d: slide over [conv_state | qkv] concatenated
     let (conv_out, new_conv_state) = conv1d_silu(
-        &qkv, layer.conv_kernel, conv_state,
-        conv_dim, 1, conv_kernel_size,
+        &qkv,
+        layer.conv_kernel,
+        conv_state,
+        conv_dim,
+        1,
+        conv_kernel_size,
     );
     conv_state.copy_from_slice(&new_conv_state);
 
@@ -1873,25 +2723,27 @@ pub fn delta_net_layer_forward(
     // 9. Delta-net autoregressive (per V-head)
     // Pass raw beta; delta_net_autoregressive applies sigmoid internally.
     let attn_out = delta_net_autoregressive(
-        &q_conv, &k_conv, &v_conv,
-        &decay_gate, &beta, ssm_state,
-        s_k, s_v, n_heads_v, eps,
+        &q_conv,
+        &k_conv,
+        &v_conv,
+        &decay_gate,
+        &beta,
+        ssm_state,
+        s_k,
+        s_v,
+        n_heads_v,
+        eps,
     );
     // attn_out: [s_v * n_heads_v]
 
-    // 10. Gated norm: rms_norm(attn_out, ssm_norm_w) * silu(z)
-    // z is the gate_proj first n_heads_v * s_v elements (z in C code)
-    // Actually, looking at the C code: z comes from a separate projection (wqkv_gate)
-    // and is reshaped to [s_v * n_heads_v]. We use gate_proj as a proxy.
-    // For correctness: the z is the *gating* dimension of the gate_proj, which is
-    // the second half mapped to [n_heads_v] and then broadcast per-dim.
-    // Simplified: use decay_gate as the z (or ones for a basic working version)
-    let normed_attn = rms_norm(&attn_out, layer.ssm_norm_w, eps);
+    // 10. Gated norm: rms_norm_per_head(attn_out, ssm_norm_w) * silu(z)
+    // z = gate_proj (attn_gate projection output), shape [s_v, n_heads_v]
+    assert_eq!(ba_dim, v_size, "gate z size must equal v_size for gated norm");
+    let normed_attn = rms_norm_per_head(&attn_out, layer.ssm_norm_w, s_v, eps);
     let mut gated_attn = vec![0.0f32; v_size];
     for i in 0..v_size {
-        // Use silu of the alpha value as the gate (simplified)
-        let v_hi = i / s_v;
-        let s = 1.0f32 / (1.0f32 + (-alpha[v_hi]).exp());
+        let z = gate_proj[i];
+        let s = z / (1.0f32 + (-z).exp());
         gated_attn[i] = normed_attn[i] * s;
     }
 
@@ -1996,6 +2848,250 @@ pub fn delta_net_layer_forward(
     output
 }
 
+/// Quantized delta-net layer forward: same flow as `delta_net_layer_forward` but
+/// large projection matrices (wqkv, wqkv_gate, ssm_out, ffn_gate/up/down) stay
+/// in quantized form and are computed via `gemv_parallel`. Small norms/params stay f32.
+/// MoE weights stay fused-F32 from load time.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn delta_net_layer_forward_q(
+    input: &[f32], // [n_embd]
+    // Attention norm (small, kept as f32)
+    attn_norm_w: &[f32],
+    // Quantized projections
+    wqkv: (&[u8], GGmlType),      // [conv_dim, n_embd]
+    wqkv_gate: (&[u8], GGmlType), // [ba_dim, n_embd]
+    conv_kernel: &[f32],          // [conv_dim, conv_kernel_size] — small
+    alpha_bias: &[f32],           // [n_heads_v] — small
+    ssm_a: &[f32],                // [n_heads_v] — small
+    ssm_norm_w: &[f32],           // [s_v] per-head — small
+    ssm_beta: (&[u8], GGmlType),  // [n_heads_v, n_embd]
+    ssm_alpha: (&[u8], GGmlType), // [n_heads_v, n_embd]
+    ssm_out: (&[u8], GGmlType),   // [n_embd, v_size]
+    post_norm_w: &[f32],
+    // Dense FFN — quantized
+    ffn_gate_w: (&[u8], GGmlType), // [n_ff, n_embd]
+    ffn_up_w: (&[u8], GGmlType),   // [n_ff, n_embd]
+    ffn_down_w: (&[u8], GGmlType), // [n_embd, n_ff]
+    // MoE FFN (fused F32)
+    moe_router_w: &[f32],
+    moe_gate_up_w: &[f32],
+    moe_down_w: &[f32],
+    n_expert: usize,
+    n_expert_used: usize,
+    shexp_gate_w: &[f32],
+    shexp_up_w: &[f32],
+    shexp_down_w: &[f32],
+    shexp_gate_inp_w: &[f32],
+    n_ff_shexp: usize,
+    // Streaming MoE (Phase 30): raw quantized expert weights; take priority
+    // over the f32 moe_gate_up_w/moe_down_w fallback when non-empty.
+    moe_gate_raw: Option<&RawTensor>,
+    moe_up_raw: Option<&RawTensor>,
+    moe_down_raw: Option<&RawTensor>,
+    // Dimensions
+    n_embd: usize,
+    n_ff: usize,
+    conv_dim: usize,
+    conv_kernel_size: usize,
+    ba_dim: usize,
+    s_k: usize,
+    s_v: usize,
+    n_heads_k: usize,
+    n_heads_v: usize,
+    eps: f32,
+    conv_state: &mut [f32],
+    ssm_state: &mut [f32],
+) -> Vec<f32> {
+    let q_size = s_k * n_heads_k;
+    let k_size = s_k * n_heads_k;
+    let v_size = s_v * n_heads_v;
+
+    // 1. Attention norm (per-token, f32)
+    let normed = rms_norm(input, attn_norm_w, eps);
+
+    // 2. QKV projection — quantized gemv
+    let qkv = gemv_parallel(wqkv.1, wqkv.0, n_embd, conv_dim, &normed).expect("gemv wqkv");
+
+    // 3. Gate projection — quantized gemv
+    let gate_proj =
+        gemv_parallel(wqkv_gate.1, wqkv_gate.0, n_embd, ba_dim, &normed).expect("gemv wqkv_gate");
+
+    // 4. Process alpha/beta from dedicated projections
+    let beta = gemv_parallel(ssm_beta.1, ssm_beta.0, n_embd, n_heads_v, &normed)
+        .expect("gemv ssm_beta");
+    let alpha = gemv_parallel(ssm_alpha.1, ssm_alpha.0, n_embd, n_heads_v, &normed)
+        .expect("gemv ssm_alpha");
+
+    // 5. Decay gate: ssm_a * softplus(alpha + bias); state decays by exp(gate) in AR.
+    // Reference (qwen3-5.cpp build_layer_attn_linear): gate = softplus(alpha + ssm_dt.bias) * ssm_a.
+    let mut decay_gate = vec![0.0f32; n_heads_v];
+    for v_hi in 0..n_heads_v {
+        let sp = (alpha[v_hi] + alpha_bias[v_hi]).exp().ln_1p();
+        decay_gate[v_hi] = ssm_a[v_hi] * sp;
+    }
+
+    // 6. Conv1d: slide over [conv_state | qkv] concatenated
+    let (conv_out, new_conv_state) =
+        conv1d_silu(&qkv, conv_kernel, conv_state, conv_dim, 1, conv_kernel_size);
+    conv_state.copy_from_slice(&new_conv_state);
+
+    // 7. Split conv output → q_conv, k_conv, v_conv
+    let q_conv_raw = &conv_out[0..q_size];
+    let k_conv_raw = &conv_out[q_size..q_size + k_size];
+    let v_conv = conv_out[q_size + k_size..q_size + k_size + v_size].to_vec();
+
+    // 8. Repeat Q and K to match V-head count when n_heads_k != n_heads_v
+    let ratio = n_heads_v / n_heads_k;
+    let q_conv = {
+        let mut out = vec![0.0f32; s_k * n_heads_v];
+        for hi in 0..n_heads_k {
+            for r in 0..ratio {
+                let dst_hi = hi * ratio + r;
+                for d in 0..s_k {
+                    out[dst_hi * s_k + d] = q_conv_raw[hi * s_k + d];
+                }
+            }
+        }
+        out
+    };
+    let k_conv = {
+        let mut out = vec![0.0f32; s_k * n_heads_v];
+        for hi in 0..n_heads_k {
+            for r in 0..ratio {
+                let dst_hi = hi * ratio + r;
+                for d in 0..s_k {
+                    out[dst_hi * s_k + d] = k_conv_raw[hi * s_k + d];
+                }
+            }
+        }
+        out
+    };
+
+    // 9. Delta-net autoregressive
+    let attn_out = delta_net_autoregressive(
+        &q_conv,
+        &k_conv,
+        &v_conv,
+        &decay_gate,
+        &beta,
+        ssm_state,
+        s_k,
+        s_v,
+        n_heads_v,
+        eps,
+    );
+
+    // 10. Gated norm: rms_norm_per_head(attn_out, ssm_norm_w) * silu(z)
+    // z = gate_proj (attn_gate projection output), shape [s_v, n_heads_v]
+    assert_eq!(ba_dim, v_size, "gate z size must equal v_size for gated norm");
+    let normed_attn = rms_norm_per_head(&attn_out, ssm_norm_w, s_v, eps);
+    let mut gated_attn = vec![0.0f32; v_size];
+    for i in 0..v_size {
+        let z = gate_proj[i];
+        let s = z / (1.0f32 + (-z).exp());
+        gated_attn[i] = normed_attn[i] * s;
+    }
+
+    // 11. Output projection — quantized gemv (ssm_out: [n_embd, v_size])
+    let attn_residual =
+        gemv_parallel(ssm_out.1, ssm_out.0, v_size, n_embd, &gated_attn).expect("gemv ssm_out");
+
+    // 12. Residual
+    let mut residual1 = vec![0.0f32; n_embd];
+    for i in 0..n_embd {
+        residual1[i] = input[i] + attn_residual[i];
+    }
+
+    // 13. Post-attention norm (f32)
+    let post_normed = rms_norm(&residual1, post_norm_w, eps);
+
+    // 14. FFN: dense SwiGLU (quantized), streaming MoE, or F32-fused MoE
+    let ffn_out = if n_expert > 0 && moe_gate_raw.is_some() && moe_up_raw.is_some() {
+        let gate_raw = moe_gate_raw.unwrap();
+        let up_raw = moe_up_raw.unwrap();
+        let down_raw = moe_down_raw.unwrap();
+        let row = moe_ffn_stream(
+            &post_normed,
+            moe_router_w,
+            gate_raw,
+            up_raw,
+            down_raw,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+        )
+        .expect("moe_ffn_stream");
+        let mut moe_out = row;
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_embd,
+                n_ff_shexp,
+                1,
+            );
+            for i in 0..n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else if n_expert > 0 {
+        let mut moe_out = moe_ffn(
+            &post_normed,
+            moe_router_w,
+            moe_gate_up_w,
+            moe_down_w,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+            1,
+        );
+        if !shexp_gate_w.is_empty() {
+            let shexp_out = shared_expert_ffn(
+                &post_normed,
+                shexp_gate_w,
+                shexp_up_w,
+                shexp_down_w,
+                shexp_gate_inp_w,
+                n_embd,
+                n_ff_shexp,
+                1,
+            );
+            for i in 0..n_embd {
+                moe_out[i] += shexp_out[i];
+            }
+        }
+        moe_out
+    } else {
+        // Dense SwiGLU: quantized gate/up → silu(gate)*up → quantized down
+        let ffn_gate_out = gemv_parallel(ffn_gate_w.1, ffn_gate_w.0, n_embd, n_ff, &post_normed)
+            .expect("gemv ffn_gate");
+        let ffn_up_out =
+            gemv_parallel(ffn_up_w.1, ffn_up_w.0, n_embd, n_ff, &post_normed).expect("gemv ffn_up");
+        let mut ffn_act = vec![0.0f32; n_ff];
+        for i in 0..n_ff {
+            let g = ffn_gate_out[i];
+            let u = ffn_up_out[i];
+            let s = 1.0f32 / (1.0f32 + (-g).exp());
+            ffn_act[i] = g * s * u;
+        }
+        gemv_parallel(ffn_down_w.1, ffn_down_w.0, n_ff, n_embd, &ffn_act).expect("gemv ffn_down")
+    };
+
+    // 15. Final residual
+    let mut output = vec![0.0f32; n_embd];
+    for i in 0..n_embd {
+        output[i] = residual1[i] + ffn_out[i];
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,7 +3153,11 @@ mod tests {
 
     fn assert_close(got: f32, expect: f32) {
         let tol = 1e-2 * expect.abs().max(1.0);
-        assert!((got - expect).abs() <= tol, "got {got} expected {expect} (diff {})", (got - expect).abs());
+        assert!(
+            (got - expect).abs() <= tol,
+            "got {got} expected {expect} (diff {})",
+            (got - expect).abs()
+        );
     }
 
     #[test]
@@ -2075,7 +3175,9 @@ mod tests {
         // Deterministic pseudo-random blocks with varied scale patterns.
         let mut state = seed;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         let mut raw = Vec::new();
@@ -2105,7 +3207,8 @@ mod tests {
                     for _ in 0..128 {
                         b.push((next() & 0xFF) as u8);
                     }
-                    let vals = crate::model::quant::dequantize(GGmlType::Q4_K, &b, QK_K as u64).unwrap();
+                    let vals =
+                        crate::model::quant::dequantize(GGmlType::Q4_K, &b, QK_K as u64).unwrap();
                     (b, vals)
                 }
                 "Q5_K" => {
@@ -2132,7 +3235,8 @@ mod tests {
                     for _ in 0..128 {
                         b.push((next() & 0xFF) as u8);
                     }
-                    let vals = crate::model::quant::dequantize(GGmlType::Q5_K, &b, QK_K as u64).unwrap();
+                    let vals =
+                        crate::model::quant::dequantize(GGmlType::Q5_K, &b, QK_K as u64).unwrap();
                     (b, vals)
                 }
                 "Q6_K" => {
@@ -2148,7 +3252,8 @@ mod tests {
                         b.push((next() % 64) as u8);
                     }
                     b.extend_from_slice(&le16(1.0 / (d + 1) as f32));
-                    let vals = crate::model::quant::dequantize(GGmlType::Q6_K, &b, QK_K as u64).unwrap();
+                    let vals =
+                        crate::model::quant::dequantize(GGmlType::Q6_K, &b, QK_K as u64).unwrap();
                     (b, vals)
                 }
                 _ => unreachable!(),
@@ -2182,7 +3287,9 @@ mod tests {
     #[test]
     fn vec_dot_q6_k_matches_naive() {
         let (wq, _) = k_blocks("Q6_K", 9);
-        let x: Vec<f32> = (0..QK_K * 2).map(|i| ((i * 7) % 61) as f32 * 0.1 - 3.0).collect();
+        let x: Vec<f32> = (0..QK_K * 2)
+            .map(|i| ((i * 7) % 61) as f32 * 0.1 - 3.0)
+            .collect();
         let xq = quantize_row_q8_k(&x);
         let got = vec_dot_q6_k_q8_k(x.len(), &wq, &xq);
         let expect = naive_quantized_dot(GGmlType::Q6_K, &wq, GGmlType::Q8_K, &xq, x.len());
@@ -2206,16 +3313,25 @@ mod tests {
         let n_out = 3;
         let mut w = Vec::new();
         for r in 0..n_out {
-            let row: Vec<f32> = (0..n_in).map(|i| (r as f32 + 1.0) * (i as f32 * 0.01).cos()).collect();
+            let row: Vec<f32> = (0..n_in)
+                .map(|i| (r as f32 + 1.0) * (i as f32 * 0.01).cos())
+                .collect();
             w.extend_from_slice(&quantize_row_q8_0(&row));
         }
         let x: Vec<f32> = (0..n_in).map(|i| (i as f32 * 0.02).sin()).collect();
         let out = gemv(GGmlType::Q8_0, &w, n_in, n_out, &x).unwrap();
         assert_eq!(out.len(), n_out);
-        let row_bytes = crate::model::quant::tensor_size(GGmlType::Q8_0, n_in as u64).unwrap() as usize;
+        let row_bytes =
+            crate::model::quant::tensor_size(GGmlType::Q8_0, n_in as u64).unwrap() as usize;
         let xq = quantize_row_q8_0(&x);
         for (r, v) in out.iter().enumerate() {
-            let expect = naive_quantized_dot(GGmlType::Q8_0, &w[r * row_bytes..(r + 1) * row_bytes], GGmlType::Q8_0, &xq, n_in);
+            let expect = naive_quantized_dot(
+                GGmlType::Q8_0,
+                &w[r * row_bytes..(r + 1) * row_bytes],
+                GGmlType::Q8_0,
+                &xq,
+                n_in,
+            );
             assert_close(*v, expect);
         }
     }
@@ -2228,12 +3344,16 @@ mod tests {
         // craft n_out rows of Q8_0 weights
         let mut state = 7u64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         let mut w = Vec::new();
         for _ in 0..n_out {
-            let row: Vec<f32> = (0..n_in).map(|_| ((next() as f32) - 1000.0) * 0.001).collect();
+            let row: Vec<f32> = (0..n_in)
+                .map(|_| ((next() as f32) - 1000.0) * 0.001)
+                .collect();
             w.extend_from_slice(&quantize_row_q8_0(&row));
         }
         let mut x = Vec::new();
@@ -2244,7 +3364,8 @@ mod tests {
         }
         let out = gemm(GGmlType::Q8_0, &w, n_in, n_out, n_batch, &x).unwrap();
         assert_eq!(out.len(), n_out * n_batch);
-        let row_bytes = crate::model::quant::tensor_size(GGmlType::Q8_0, n_in as u64).unwrap() as usize;
+        let row_bytes =
+            crate::model::quant::tensor_size(GGmlType::Q8_0, n_in as u64).unwrap() as usize;
         for b in 0..n_batch {
             let xb = &x[b * n_in..(b + 1) * n_in];
             let xq = quantize_row_q8_0(xb);
@@ -2344,9 +3465,15 @@ mod tests {
         let n_kv = 3;
         let scale = 1.0 / (hd as f32).sqrt();
 
-        let q: Vec<f32> = (0..n_q * n_heads * hd).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|i| (i as f32 * 0.5 + 1.0).cos()).collect();
-        let v: Vec<f32> = (0..n_kv * n_kv_heads * hd).map(|i| (i as f32 * 0.2 + 2.0).sin()).collect();
+        let q: Vec<f32> = (0..n_q * n_heads * hd)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_kv * n_kv_heads * hd)
+            .map(|i| (i as f32 * 0.5 + 1.0).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_kv * n_kv_heads * hd)
+            .map(|i| (i as f32 * 0.2 + 2.0).sin())
+            .collect();
 
         let out = attention_forward(&q, &k, &v, n_heads, n_kv_heads, hd, n_q, n_kv, scale, false);
 
@@ -2401,9 +3528,8 @@ mod tests {
             let g: Vec<f32> = vec![-0.1, -0.3];
             let beta: Vec<f32> = vec![0.5, 0.8];
 
-            let out = delta_net_autoregressive(
-                &q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps,
-            );
+            let out =
+                delta_net_autoregressive(&q, &k, &v, &g, &beta, &mut state, s_k, s_v, n_heads, eps);
             out_all.push(out);
         }
 
@@ -2534,7 +3660,10 @@ mod tests {
         // so x = [1]*32 + [0]*32 gives pairs (1,0).
         let mut x = [0.0f32; 64];
         x[..32].fill(1.0);
-        let cfg = RopeConfig { freq_base: 1.0, ..Default::default() }; // theta_scale = 1
+        let cfg = RopeConfig {
+            freq_base: 1.0,
+            ..Default::default()
+        }; // theta_scale = 1
         let out = rope_multi_imrope(&x, [1, 2, 3, 0], 64, [11, 11, 10, 0], 0, &cfg);
         let theta = [1.0f32, 2.0, 3.0];
         for ic in 0..7 {
@@ -2544,8 +3673,18 @@ mod tests {
                 _ => theta[2],
             };
             let (c, s) = (expected_theta.cos(), expected_theta.sin());
-            assert!((out[ic] - c).abs() < 1e-5, "ic {ic}: got {} expected {}", out[ic], c);
-            assert!((out[ic + 32] - s).abs() < 1e-5, "ic {ic}: got {} expected {}", out[ic + 32], s);
+            assert!(
+                (out[ic] - c).abs() < 1e-5,
+                "ic {ic}: got {} expected {}",
+                out[ic],
+                c
+            );
+            assert!(
+                (out[ic + 32] - s).abs() < 1e-5,
+                "ic {ic}: got {} expected {}",
+                out[ic + 32],
+                s
+            );
         }
     }
 
@@ -2560,8 +3699,8 @@ mod tests {
         let up = [2.0f32, 3.0, 4.0];
         let out = swiglu(&gate, &up);
         // silu(g) = g * sigmoid(g)
-        let s1 = 1.0f32 * 1.0 / (1.0 + (-1.0f32).exp());  // silu(1)
-        let s0 = 0.0f32 * 0.5f32;                           // silu(0) = 0
+        let s1 = 1.0f32 * 1.0 / (1.0 + (-1.0f32).exp()); // silu(1)
+        let s0 = 0.0f32 * 0.5f32; // silu(0) = 0
         let sm1 = -1.0f32 / (1.0 + (1.0f32).exp()); // silu(-1)
         assert!((out[0] - s1 * 2.0).abs() < 1e-6);
         assert!((out[1] - s0 * 3.0).abs() < 1e-6);
@@ -2578,14 +3717,19 @@ mod tests {
         for i in 0..64 {
             let s = 1.0f32 / (1.0 + (-gate[i]).exp());
             let expect = gate[i] * s * up[i];
-            assert!((out[i] - expect).abs() < 1e-6, "swiglu[{i}]: got {} expected {}", out[i], expect);
+            assert!(
+                (out[i] - expect).abs() < 1e-6,
+                "swiglu[{i}]: got {} expected {}",
+                out[i],
+                expect
+            );
         }
     }
 
     #[test]
     fn rms_norm_per_head_known() {
         // 2 heads, head_size=4
-        let x = [1.0f32, -2.0, 3.0, -4.0,   2.0, 0.0, -1.0, 3.0];
+        let x = [1.0f32, -2.0, 3.0, -4.0, 2.0, 0.0, -1.0, 3.0];
         let w = [1.0f32, 1.0, 1.0, 1.0];
         let out = rms_norm_per_head(&x, &w, 4, 1e-6);
         // Head 0: sum_sq = 1+4+9+16=30, mean=7.5, scale=1/sqrt(7.5+eps)
@@ -2659,23 +3803,38 @@ mod tests {
         let channels = 2;
         let kernel_size = 3;
         let seq_len = 4;
-        let input: Vec<f32> = (0..channels * seq_len).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input: Vec<f32> = (0..channels * seq_len)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
         // input: ch0=[0.1, 0.2, 0.3, 0.4], ch1=[0.5, 0.6, 0.7, 0.8]
-        let kernel: Vec<f32> = (0..channels * kernel_size).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let kernel: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 1.0) * 0.05)
+            .collect();
         // kernel: ch0=[0.05, 0.10, 0.15], ch1=[0.20, 0.25, 0.30]
         let state_in = vec![0.0f32; channels * (kernel_size - 1)];
 
-        let (out, state_out) = conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
+        let (out, state_out) =
+            conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
 
         // ch0, t=0: acc = 0*0.05 + 0*0.10 + 0.1*0.15 = 0.015, silu(0.015) ≈ 0.015 * 0.50375
         let acc00 = 0.1f32 * 0.15f32;
         let expected00 = acc00 / (1.0f32 + (-acc00).exp());
-        assert!((out[0] - expected00).abs() < 1e-5, "out[0]: got {} expected {}", out[0], expected00);
+        assert!(
+            (out[0] - expected00).abs() < 1e-5,
+            "out[0]: got {} expected {}",
+            out[0],
+            expected00
+        );
 
         // ch0, t=1: acc = 0*0.05 + 0.1*0.10 + 0.2*0.15 = 0.04
         let acc01 = 0.1f32 * 0.10f32 + 0.2f32 * 0.15f32;
         let expected01 = acc01 / (1.0f32 + (-acc01).exp());
-        assert!((out[1] - expected01).abs() < 1e-5, "out[1]: got {} expected {}", out[1], expected01);
+        assert!(
+            (out[1] - expected01).abs() < 1e-5,
+            "out[1]: got {} expected {}",
+            out[1],
+            expected01
+        );
 
         // State update: ch0 state = [input[2], input[3]] = [0.3, 0.4]
         assert!((state_out[0] - 0.3).abs() < 1e-6);
@@ -2695,7 +3854,8 @@ mod tests {
         let kernel = [1.0f32, 1.0, 1.0]; // simple sum kernel
         let state_in = [0.3f32, 0.4]; // causal history
 
-        let (out, state_out) = conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
+        let (out, state_out) =
+            conv1d_silu(&input, &kernel, &state_in, channels, seq_len, kernel_size);
 
         // t=0: acc = 0.3*1 + 0.4*1 + 0.1*1 = 0.8, silu(0.8) = 0.8 / (1 + e^-0.8)
         let acc0 = 0.8f32;
@@ -2748,8 +3908,17 @@ mod tests {
             }
         }
 
-        let out = moe_ffn(&input, &router_w, &gate_up_w, &down_w,
-                           n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+        let out = moe_ffn(
+            &input,
+            &router_w,
+            &gate_up_w,
+            &down_w,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+            n_tokens,
+        );
         assert_eq!(out.len(), n_tokens * n_embd);
 
         // Output should be non-zero (the FFN produced something)
@@ -2772,8 +3941,17 @@ mod tests {
         let gate_up_w: Vec<f32> = (0..n_expert * 2 * n_ff * n_embd).map(rng).collect();
         let down_w: Vec<f32> = (0..n_expert * n_embd * n_ff).map(rng).collect();
 
-        let out = moe_ffn(&input, &router_w, &gate_up_w, &down_w,
-                           n_embd, n_ff, n_expert, n_expert_used, n_tokens);
+        let out = moe_ffn(
+            &input,
+            &router_w,
+            &gate_up_w,
+            &down_w,
+            n_embd,
+            n_ff,
+            n_expert,
+            n_expert_used,
+            n_tokens,
+        );
 
         // Independent numpy-style reference
         let mut expected = vec![0.0f32; n_tokens * n_embd];
@@ -2830,7 +4008,12 @@ mod tests {
         for i in 0..out.len() {
             let denom = expected[i].abs().max(1e-6);
             let rel = (out[i] - expected[i]).abs() / denom;
-            assert!(rel < 1e-5, "moe_ffn[{i}]: rust={} expected={} rel={rel}", out[i], expected[i]);
+            assert!(
+                rel < 1e-5,
+                "moe_ffn[{i}]: rust={} expected={} rel={rel}",
+                out[i],
+                expected[i]
+            );
         }
     }
 
@@ -2853,7 +4036,10 @@ mod tests {
         let norm_w = vec![1.0f32; n_embd];
         // Weight tying: output_weight = embd_weight
         let next = lm_head_argmax(&tok, &norm_w, &embd, n_embd, n_vocab, eps);
-        assert!((next as usize) < n_vocab, "next_token {next} out of vocab range");
+        assert!(
+            (next as usize) < n_vocab,
+            "next_token {next} out of vocab range"
+        );
         // With weight tying, the dot product is proportional to ||tok||^2 for the
         // matching row and cross-terms for others.  Just verify it returns a valid id.
         // Token 15's embedding row has the largest values, so it wins the argmax.
@@ -2904,31 +4090,75 @@ mod tests {
 
         let layer_refs = vec![
             FullAttnLayerWeights {
-                attn_norm_w: &norm_w, wq: &wq0, wk: &wk0, wv: &wv0, wo: &wo0,
-                q_norm_w: &norm_w, k_norm_w: &norm_w,
-                post_norm_w: &norm_w, ffn_gate_w: &fg0, ffn_up_w: &fu0, ffn_down_w: &fd0,
-                moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
-                shexp_gate_w: &[], shexp_up_w: &[], shexp_down_w: &[], shexp_gate_inp_w: &[], n_ff_shexp: 0,
+                attn_norm_w: &norm_w,
+                wq: &wq0,
+                wk: &wk0,
+                wv: &wv0,
+                wo: &wo0,
+                q_norm_w: &norm_w,
+                k_norm_w: &norm_w,
+                post_norm_w: &norm_w,
+                ffn_gate_w: &fg0,
+                ffn_up_w: &fu0,
+                ffn_down_w: &fd0,
+                moe_router_w: &[],
+                moe_gate_up_w: &[],
+                moe_down_w: &[],
+                n_expert: 0,
+                n_expert_used: 0,
+                shexp_gate_w: &[],
+                shexp_up_w: &[],
+                shexp_down_w: &[],
+                shexp_gate_inp_w: &[],
+                n_ff_shexp: 0,
             },
             FullAttnLayerWeights {
-                attn_norm_w: &norm_w, wq: &wq1, wk: &wk1, wv: &wv1, wo: &wo1,
-                q_norm_w: &norm_w, k_norm_w: &norm_w,
-                post_norm_w: &norm_w, ffn_gate_w: &fg1, ffn_up_w: &fu1, ffn_down_w: &fd1,
-                moe_router_w: &[], moe_gate_up_w: &[], moe_down_w: &[], n_expert: 0, n_expert_used: 0,
-                shexp_gate_w: &[], shexp_up_w: &[], shexp_down_w: &[], shexp_gate_inp_w: &[], n_ff_shexp: 0,
+                attn_norm_w: &norm_w,
+                wq: &wq1,
+                wk: &wk1,
+                wv: &wv1,
+                wo: &wo1,
+                q_norm_w: &norm_w,
+                k_norm_w: &norm_w,
+                post_norm_w: &norm_w,
+                ffn_gate_w: &fg1,
+                ffn_up_w: &fu1,
+                ffn_down_w: &fd1,
+                moe_router_w: &[],
+                moe_gate_up_w: &[],
+                moe_down_w: &[],
+                n_expert: 0,
+                n_expert_used: 0,
+                shexp_gate_w: &[],
+                shexp_up_w: &[],
+                shexp_down_w: &[],
+                shexp_gate_inp_w: &[],
+                n_ff_shexp: 0,
             },
         ];
 
         let (hidden, next_token) = forward_pass_full_attn(
             5, // token id
             &layer_refs,
-            &embd, &norm_w, &embd, // weight tying
-            n_embd, n_heads, n_kv_heads, head_size, n_ff, n_vocab,
-            eps, &rope_cfg, rope_sections,
+            &embd,
+            &norm_w,
+            &embd, // weight tying
+            n_embd,
+            n_heads,
+            n_kv_heads,
+            head_size,
+            n_ff,
+            n_vocab,
+            eps,
+            &rope_cfg,
+            rope_sections,
         );
 
         assert_eq!(hidden.len(), n_embd);
-        assert!((next_token as usize) < n_vocab, "next_token {next_token} out of vocab range");
+        assert!(
+            (next_token as usize) < n_vocab,
+            "next_token {next_token} out of vocab range"
+        );
     }
 
     #[test]
@@ -2941,7 +4171,7 @@ mod tests {
         let n_heads_v = 16;
         let conv_kernel_size = 4;
         let conv_dim = s_k * n_heads_k * 2 + s_v * n_heads_v; // Q+K+V
-        let ba_dim = n_heads_v * 2;
+        let ba_dim = s_v * n_heads_v;
         let eps = 1e-6;
 
         let rng = |i: usize| (i as f32 * 0.13 + 1.7).sin() * 0.3;
@@ -2952,7 +4182,9 @@ mod tests {
         let conv_kernel_w: Vec<f32> = (0..conv_dim * conv_kernel_size).map(rng).collect();
         let alpha_bias: Vec<f32> = (0..n_heads_v).map(rng).collect();
         let ssm_a: Vec<f32> = (0..n_heads_v).map(|i| -(i as f32 * 0.1)).collect();
-        let ssm_norm_w: Vec<f32> = (0..s_v * n_heads_v).map(|_| 1.0f32).collect();
+        let ssm_norm_w: Vec<f32> = (0..s_v).map(|_| 1.0f32).collect();
+        let ssm_beta_w: Vec<f32> = (0..n_heads_v * n_embd).map(rng).collect();
+        let ssm_alpha_w: Vec<f32> = (0..n_heads_v * n_embd).map(rng).collect();
         let ssm_out: Vec<f32> = (0..n_embd * s_v * n_heads_v).map(rng).collect();
         let ffn_gate: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
         let ffn_up: Vec<f32> = (0..n_ff * n_embd).map(rng).collect();
@@ -2966,6 +4198,8 @@ mod tests {
             alpha_bias: &alpha_bias,
             ssm_a: &ssm_a,
             ssm_norm_w: &ssm_norm_w,
+            ssm_beta_w: &ssm_beta_w,
+            ssm_alpha_w: &ssm_alpha_w,
             ssm_out: &ssm_out,
             post_norm_w: &norm_w,
             ffn_gate_w: &ffn_gate,
@@ -2988,10 +4222,21 @@ mod tests {
         let mut ssm_state = vec![0.0f32; s_v * s_v * n_heads_v];
 
         let out = delta_net_layer_forward(
-            &input, &layer, &mut conv_state, &mut ssm_state,
-            n_embd, n_ff, conv_dim, conv_kernel_size, ba_dim,
-            s_k, s_v, n_heads_k, n_heads_v, eps,
-        );
+            &input,
+            &layer,
+            &mut conv_state,
+            &mut ssm_state,
+            n_embd,
+            n_ff,
+            conv_dim,
+            conv_kernel_size,
+            ba_dim,
+            s_k,
+            s_v,
+            n_heads_k,
+        n_heads_v,
+        eps,
+    );
 
         assert_eq!(out.len(), n_embd);
         let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();

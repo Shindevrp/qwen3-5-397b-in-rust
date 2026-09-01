@@ -10,13 +10,14 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwen3_5_397b_in_rust::chat::{render_chat, ChatRenderOptions, Message, Role};
+use qwen3_5_397b_in_rust::chat::{ChatRenderOptions, Message, Role, render_chat};
 use qwen3_5_397b_in_rust::model::loader::ModelLoader;
+use qwen3_5_397b_in_rust::model::memory::MemoryStats;
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, generate_token_batch, generate_token_logits, generate_token_logits_batch,
-    prefill, prefill_batch, GenerationState, ModelWeights,
+    GenerationState, ModelWeights, generate_token, generate_token_batch, generate_token_logits,
+    generate_token_logits_batch, prefill, prefill_batch,
 };
-use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
+use qwen3_5_397b_in_rust::model::sampler::{SamplerConfig, sample};
 use qwen3_5_397b_in_rust::tokenizer::QwenTokenizer;
 use qwen3_5_397b_in_rust::tokenizer::StreamingDecoder;
 
@@ -31,6 +32,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("  --top-p P          Top-p nucleus sampling, 1.0=disabled (default: 0.9)");
         eprintln!("  --repeat-penalty R Repetition penalty (default: 1.0)");
         eprintln!("  --argmax           Use greedy decoding (no sampling)");
+        eprintln!("  --kv-q8            Store KV cache as Q8_0 (~3.8x less memory)");
+        eprintln!("  --memory-bounded   Enable memory-bounded inference mode");
         eprintln!("Chat mode:");
         eprintln!("  --chat             Interactive multi-turn chat (Qwen3.5 template)");
         eprintln!("  --system TEXT      System prompt (chat mode)");
@@ -51,6 +54,8 @@ fn main() -> anyhow::Result<()> {
     let mut system_prompt: Option<String> = None;
     let mut enable_thinking = true;
     let mut batch_file: Option<PathBuf> = None;
+    let mut kv_q8 = false;
+    let mut memory_bounded = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -87,6 +92,12 @@ fn main() -> anyhow::Result<()> {
             "--argmax" => {
                 use_argmax = true;
             }
+            "--kv-q8" => {
+                kv_q8 = true;
+            }
+            "--memory-bounded" => {
+                memory_bounded = true;
+            }
             "--chat" => {
                 chat_mode = true;
             }
@@ -121,6 +132,7 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("Loading weights ...");
     let model = ModelWeights::load(&loader).map_err(|e| anyhow::anyhow!("{e}"))?;
+    MemoryStats::log("after-model-load");
 
     // End-of-turn ids: <|im_end|> ends an assistant turn in chat mode;
     // <|endoftext|> is the generic EOS fallback.
@@ -148,6 +160,8 @@ fn main() -> anyhow::Result<()> {
             &cfg,
             n_predict,
             use_argmax,
+            kv_q8,
+            memory_bounded,
             &stop_ids,
         );
     }
@@ -159,6 +173,8 @@ fn main() -> anyhow::Result<()> {
             &cfg,
             n_predict,
             use_argmax,
+            kv_q8,
+            memory_bounded,
             system_prompt,
             enable_thinking,
             &stop_ids,
@@ -167,7 +183,17 @@ fn main() -> anyhow::Result<()> {
         if prompt.is_empty() {
             prompt = "Hello, world!".to_string();
         }
-        run_completion(&model, &tokenizer, &prompt, &cfg, n_predict, use_argmax, &stop_ids)
+        run_completion(
+            &model,
+            &tokenizer,
+            &prompt,
+            &cfg,
+            n_predict,
+            use_argmax,
+            kv_q8,
+            memory_bounded,
+            &stop_ids,
+        )
     }
 }
 
@@ -185,8 +211,11 @@ fn encode_with_truncation(
         let rendered = render_chat(&msgs, opts).map_err(|e| anyhow::anyhow!("{e}"))?;
         let tokens = tokenizer.encode(&rendered, false)?;
         // Keep at least the (optional) system message + last user message.
-        let system_count =
-            if !msgs.is_empty() && msgs[0].role == Role::System { 1 } else { 0 };
+        let system_count = if !msgs.is_empty() && msgs[0].role == Role::System {
+            1
+        } else {
+            0
+        };
         let droppable = msgs.len() - system_count - 1;
         if tokens.len() + reserve <= max_ctx || droppable == 0 {
             return Ok((msgs, tokens));
@@ -208,6 +237,8 @@ fn chat_loop(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
+    memory_bounded: bool,
     system_prompt: Option<String>,
     enable_thinking: bool,
     stop_ids: &[u32],
@@ -251,7 +282,10 @@ fn chat_loop(
 
         history.push(Message::user(input.to_string()));
 
-        let opts = ChatRenderOptions { add_generation_prompt: true, enable_thinking };
+        let opts = ChatRenderOptions {
+            add_generation_prompt: true,
+            enable_thinking,
+        };
         let (history_fit, tokens) =
             encode_with_truncation(&history, &opts, tokenizer, max_ctx, n_predict)?;
         history = history_fit;
@@ -259,8 +293,19 @@ fn chat_loop(
         eprintln!("[prompt: {} tokens]", tokens.len());
 
         // Fresh state each turn: re-prefill the whole conversation.
-        let mut state = GenerationState::new(model);
+        let mut state = if memory_bounded {
+            GenerationState::new_memory_bounded_kv_q8(model)
+        } else if kv_q8 {
+            GenerationState::new_kv_q8(model)
+        } else {
+            GenerationState::new(model)
+        };
         prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
+        // Phase 24: dequantize MoE experts up front (parallel) so decode
+        // never pays first-touch dequantization cost.
+        if !memory_bounded {
+            state.warm_moe_cache(model);
+        }
 
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
@@ -270,10 +315,12 @@ fn chat_loop(
 
         for _step in 0..n_predict {
             let token = if use_argmax {
-                let (_hidden, next) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+                let (_hidden, next) = generate_token(&mut state, last_token_id, model)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 next
             } else {
-                let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+                let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 sample(&logits, cfg, &sample_history)
             };
 
@@ -311,25 +358,50 @@ fn run_completion(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
+    memory_bounded: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     eprintln!("Prompt: {prompt}");
     let tokens = tokenizer.encode(prompt, false)?;
-    eprintln!("Input tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
+    eprintln!(
+        "Input tokens ({}): {:?}",
+        tokens.len(),
+        &tokens[..tokens.len().min(20)]
+    );
 
-    let mut state = GenerationState::new(model);
+    let mut state = if memory_bounded {
+        GenerationState::new_memory_bounded_kv_q8(model)
+    } else if kv_q8 {
+        GenerationState::new_kv_q8(model)
+    } else {
+        GenerationState::new(model)
+    };
 
     eprintln!("Prefilling {} tokens ...", tokens.len());
     prefill(&mut state, &tokens, model).map_err(|e| anyhow::anyhow!(e))?;
+    MemoryStats::log("after-prefill");
+    // Phase 24: dequantize MoE experts up front (parallel) so decode
+    // never pays first-touch dequantization cost.
+    if !memory_bounded {
+        state.warm_moe_cache(model);
+    }
+    MemoryStats::log("after-warmup");
 
     if use_argmax {
         let mut last_token_id = *tokens.last().unwrap();
         let mut gen_tokens = Vec::new();
         let mut stream = StreamingDecoder::new(tokenizer);
         let mut stdout = std::io::stdout();
+        let mut first = true;
 
         for _step in 0..n_predict {
-            let (_hidden, next_token) = generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            let (_hidden, next_token) =
+                generate_token(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            if first {
+                MemoryStats::log("after-first-decode");
+                first = false;
+            }
             gen_tokens.push(next_token);
             last_token_id = next_token;
 
@@ -354,8 +426,14 @@ fn run_completion(
             cfg.temperature, cfg.top_k, cfg.top_p, cfg.repeat_penalty
         );
 
+        let mut first = true;
         for _step in 0..n_predict {
-            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model).map_err(|e| anyhow::anyhow!(e))?;
+            let (_hidden, logits) = generate_token_logits(&mut state, last_token_id, model)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if first {
+                MemoryStats::log("after-first-decode");
+                first = false;
+            }
 
             // Apply repetition penalty with prompt + generated so far
             let token = sample(&logits, cfg, &history);
@@ -383,6 +461,7 @@ fn run_completion(
 ///
 /// Sequences that hit a stop token leave the batch immediately (lockstep
 /// steps shrink as sequences finish). Output is printed once per sequence.
+#[allow(clippy::too_many_arguments)]
 fn run_batch(
     model: &ModelWeights,
     tokenizer: &QwenTokenizer,
@@ -390,6 +469,8 @@ fn run_batch(
     cfg: &SamplerConfig,
     n_predict: usize,
     use_argmax: bool,
+    kv_q8: bool,
+    memory_bounded: bool,
     stop_ids: &[u32],
 ) -> anyhow::Result<()> {
     let max_ctx = model.cfg.context_length as usize;
@@ -414,17 +495,30 @@ fn run_batch(
 
     // One state per sequence; prefill all of them in parallel.
     let t0 = Instant::now();
-    let mut states: Vec<GenerationState> =
-        (0..n_total).map(|_| GenerationState::new(model)).collect();
+    let mut states: Vec<GenerationState> = (0..n_total)
+        .map(|_| {
+            if memory_bounded {
+                GenerationState::new_memory_bounded_kv_q8(model)
+            } else if kv_q8 {
+                GenerationState::new_kv_q8(model)
+            } else {
+                GenerationState::new(model)
+            }
+        })
+        .collect();
     let prompt_refs: Vec<&[u32]> = token_prompts.iter().map(|v| v.as_slice()).collect();
     prefill_batch(&mut states, &prompt_refs, model).map_err(|e| anyhow::anyhow!(e))?;
+    // Phase 24: parallel warm-up of every sequence's MoE weight cache.
+    if !memory_bounded {
+        use rayon::prelude::*;
+        states.par_iter_mut().for_each(|s| s.warm_moe_cache(model));
+    }
     let prefill_ms = t0.elapsed().as_millis();
     eprintln!("[batch] prefilled {n_total} sequences in {prefill_ms} ms");
 
     // Parallel slot arrays; `order[j]` is the original sequence index of slot j.
     let mut order: Vec<usize> = (0..n_total).collect();
-    let mut last_tokens: Vec<u32> =
-        token_prompts.iter().map(|v| *v.last().unwrap()).collect();
+    let mut last_tokens: Vec<u32> = token_prompts.iter().map(|v| *v.last().unwrap()).collect();
     let mut histories: Vec<Vec<u32>> = token_prompts.clone();
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); n_total];
 
@@ -483,7 +577,11 @@ fn run_batch(
         n_total,
         total_tokens,
         decode_ms,
-        if secs > 0.0 { total_tokens as f64 / secs } else { f64::INFINITY }
+        if secs > 0.0 {
+            total_tokens as f64 / secs
+        } else {
+            f64::INFINITY
+        }
     );
 
     Ok(())

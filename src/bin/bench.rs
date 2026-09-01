@@ -11,17 +11,25 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use qwen3_5_397b_in_rust::gguf::GGmlType;
-use qwen3_5_397b_in_rust::model::kernels::{gemv, quantize_row_q8_0, rms_norm, rope_multi_imrope, swiglu, RopeConfig};
+use qwen3_5_397b_in_rust::model::kernels::{
+    RopeConfig, gemv, quantize_row_q8_0, rms_norm, rope_multi_imrope, swiglu,
+};
 use qwen3_5_397b_in_rust::model::simd;
 
 struct Lcg(u64);
 impl Lcg {
     fn next_u8(&mut self) -> u8 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u8
     }
     fn next_f32(&mut self, scale: f32) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0 * scale
     }
 }
@@ -91,7 +99,8 @@ fn usage_e2e() {
          \x20 --preset NAME     tiny | medium (default) | large\n\
          \x20 --steps N         decode steps per timing run (default 128)\n\
          \x20 --batches LIST    comma-separated batch sizes (default 1,2,4,8)\n\
-         \x20 --scale N         multiplier for iteration counts"
+         \x20 --scale N         multiplier for iteration counts\n\
+         \x20 --json            print machine-readable latency summary"
     );
 }
 
@@ -100,10 +109,9 @@ fn usage_e2e() {
 fn e2e_main(args: &[String]) {
     use qwen3_5_397b_in_rust::model::loader::ModelLoader;
     use qwen3_5_397b_in_rust::model::pipeline::{
-        generate_token, generate_token_batch, prefill, prefill_batch, GenerationState,
-        ModelWeights,
+        GenerationState, ModelWeights, generate_token, generate_token_batch, prefill, prefill_batch,
     };
-    use qwen3_5_397b_in_rust::model::synth::{write_temp, SynthConfig};
+    use qwen3_5_397b_in_rust::model::synth::{SynthConfig, write_temp};
     use std::time::Instant;
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -139,6 +147,9 @@ fn e2e_main(args: &[String]) {
                 i += 1;
                 scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
             }
+            "--json" => {
+                // Flag consumed directly in the latency section below.
+            }
             p if !p.starts_with("--") => model_path = Some(p.to_string()),
             other => {
                 eprintln!("unknown option {other}");
@@ -171,8 +182,8 @@ fn e2e_main(args: &[String]) {
             m
         }
         None => {
-            let cfg = SynthConfig::preset(&preset)
-                .unwrap_or_else(|| panic!("unknown preset {preset}"));
+            let cfg =
+                SynthConfig::preset(&preset).unwrap_or_else(|| panic!("unknown preset {preset}"));
             let t0 = Instant::now();
             let tmp = write_temp(&cfg).expect("build synthetic gguf");
             println!(
@@ -213,7 +224,10 @@ fn e2e_main(args: &[String]) {
     println!(
         "weights: {:.1} MiB   kv-cache: {} B/token/seq (f32 K+V)\n",
         weight_bytes as f64 / (1024.0 * 1024.0),
-        2 * c.attention_head_count_kv as usize * c.attention_key_length as usize * 4 * n_attn_layers
+        2 * c.attention_head_count_kv as usize
+            * c.attention_key_length as usize
+            * 4
+            * n_attn_layers
     );
 
     // ---- prefill throughput ----
@@ -243,6 +257,7 @@ fn e2e_main(args: &[String]) {
     let prompt: Vec<u32> = (0..prompt_len).map(|t| (t % n_vocab) as u32).collect();
     let mut state = GenerationState::new(&model);
     prefill(&mut state, &prompt, &model).expect("prefill");
+    let ttft_ms = state.last_timing.total_us as f64 / 1e3;
     let mut last = *prompt.last().unwrap();
 
     // warmup
@@ -251,15 +266,49 @@ fn e2e_main(args: &[String]) {
         last = next;
     }
     let t0 = Instant::now();
+    let mut stage_sums = [0u64; 5]; // embed, delta_net, full_attn, lm_head, total
     for _ in 0..steps {
         let (_h, next) = generate_token(&mut state, last, &model).expect("generate");
         last = next;
+        let t = &state.last_timing;
+        stage_sums[0] += t.embed_us;
+        stage_sums[1] += t.delta_net_us;
+        stage_sums[2] += t.full_attn_us;
+        stage_sums[3] += t.lm_head_us;
+        stage_sums[4] += t.total_us;
     }
     let decode_ms = t0.elapsed().as_secs_f64() * 1e3;
     println!(
         "{steps} steps in {decode_ms:.0} ms -> {:.1} tok/s",
         steps as f64 / decode_ms * 1e3
     );
+
+    // ---- Phase 29: latency breakdown + JSON summary ----
+    let itl_us = decode_ms * 1e3 / steps.max(1) as f64;
+    println!("\nlatency breakdown (avg per decode step):");
+    println!("{:>12} {:>10}", "stage", "us");
+    for (name, us) in [
+        ("embed", stage_sums[0]),
+        ("delta_net", stage_sums[1]),
+        ("full_attn", stage_sums[2]),
+        ("lm_head", stage_sums[3]),
+        ("total", stage_sums[4]),
+    ] {
+        println!("{name:>12} {:>10.1}", us as f64 / steps.max(1) as f64);
+    }
+    println!("TTFT (prefill of {prompt_len}): {ttft_ms:.1} ms | ITL: {itl_us:.1} us");
+
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{{\n  \"ttft_ms\": {ttft_ms:.2},\n  \"itl_us\": {itl_us:.2},\n  \"decode_tokps\": {:.2},\n  \"steps\": {steps},\n  \"stages_us\": {{\"embed\": {}, \"delta_net\": {}, \"full_attn\": {}, \"lm_head\": {}, \"total\": {}}}\n}}",
+            steps as f64 / decode_ms * 1e3,
+            stage_sums[0] / steps.max(1) as u64,
+            stage_sums[1] / steps.max(1) as u64,
+            stage_sums[2] / steps.max(1) as u64,
+            stage_sums[3] / steps.max(1) as u64,
+            stage_sums[4] / steps.max(1) as u64,
+        );
+    }
 
     // ---- batch scaling ----
     println!("\nbatch decode (lockstep, aggregate throughput):");
@@ -272,7 +321,11 @@ fn e2e_main(args: &[String]) {
     for &b in &batches {
         assert!(b_prompt_len + steps <= n_ctx, "batch run exceeds ctx");
         let prompts: Vec<Vec<u32>> = (0..b)
-            .map(|s| (0..b_prompt_len).map(|t| ((s * 31 + t) % n_vocab) as u32).collect())
+            .map(|s| {
+                (0..b_prompt_len)
+                    .map(|t| ((s * 31 + t) % n_vocab) as u32)
+                    .collect()
+            })
             .collect();
         let mut states: Vec<GenerationState> =
             (0..b).map(|_| GenerationState::new(&model)).collect();
@@ -296,16 +349,15 @@ fn e2e_main(args: &[String]) {
         }
         let speedup = agg_tps / base_tps;
         let eff = speedup / b as f64;
-        println!("{b:>7} {total_tokens:>10} {agg_tps:>12.0} {:>8.2}x {:>8.1}", speedup, eff);
+        println!(
+            "{b:>7} {total_tokens:>10} {agg_tps:>12.0} {:>8.2}x {:>8.1}",
+            speedup, eff
+        );
     }
 
     // ---- memory footprint ----
     fn state_bytes(state: &GenerationState) -> usize {
-        let kv: usize = state
-            .kv_caches
-            .iter()
-            .map(|c| (c.k.len() + c.v.len()) * 4)
-            .sum();
+        let kv: usize = state.kv_caches.iter().map(|c| c.allocated_bytes()).sum();
         let conv: usize = state.conv_states.iter().map(|v| v.len() * 4).sum();
         let ssm: usize = state.ssm_states.iter().map(|v| v.len() * 4).sum();
         kv + conv + ssm
@@ -316,10 +368,15 @@ fn e2e_main(args: &[String]) {
     println!(
         "  fresh:      {:>8.2} MiB (kv capacity {} tokens/layer)",
         state_bytes(&empty) as f64 / (1024.0 * 1024.0),
-        empty.kv_caches.first().map(|c| c.k.len()).unwrap_or(0)
-            / (c.attention_head_count_kv as usize * c.attention_key_length as usize).max(1)
+        empty
+            .kv_caches
+            .first()
+            .map(|c| c.capacity_tokens())
+            .unwrap_or(0)
     );
-    let filled_prompt: Vec<u32> = (0..1024.min(n_ctx / 2)).map(|t| (t % n_vocab) as u32).collect();
+    let filled_prompt: Vec<u32> = (0..1024.min(n_ctx / 2))
+        .map(|t| (t % n_vocab) as u32)
+        .collect();
     let mut filled = GenerationState::new(&model);
     prefill(&mut filled, &filled_prompt, &model).expect("prefill");
     println!(
@@ -371,7 +428,9 @@ fn kernel_main(scale: usize) {
         let w = match ty {
             GGmlType::Q8_0 => (0..n_out)
                 .flat_map(|r| {
-                    let row: Vec<f32> = (0..n_in).map(|i| ((r * 31 + i) % 97) as f32 * 0.01 - 0.5).collect();
+                    let row: Vec<f32> = (0..n_in)
+                        .map(|i| ((r * 31 + i) % 97) as f32 * 0.01 - 0.5)
+                        .collect();
                     quantize_row_q8_0(&row)
                 })
                 .collect(),
@@ -420,7 +479,9 @@ fn kernel_main(scale: usize) {
             iters: 20000 * scale,
             run: {
                 let (v, w) = (v.clone(), w.clone());
-                Box::new(move || { black_box(rms_norm(&v, &w, 1e-6)); })
+                Box::new(move || {
+                    black_box(rms_norm(&v, &w, 1e-6));
+                })
             },
         });
         cases.push(Case {
@@ -428,7 +489,9 @@ fn kernel_main(scale: usize) {
             iters: 20000 * scale,
             run: {
                 let (v, up) = (v.clone(), up.clone());
-                Box::new(move || { black_box(swiglu(&v, &up)); })
+                Box::new(move || {
+                    black_box(swiglu(&v, &up));
+                })
             },
         });
 
@@ -480,11 +543,7 @@ fn kernel_main(scale: usize) {
         };
         println!(
             "{:<26} {:>12.1} {:>12.1} {:>8.1}x {:>10.1}",
-            case.name,
-            t_scalar,
-            t_simd,
-            speedup,
-            mrows
+            case.name, t_scalar, t_simd, speedup, mrows
         );
     }
 

@@ -37,15 +37,24 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into() }
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into() }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
     }
 }
 
@@ -63,7 +72,10 @@ pub struct ChatRenderOptions {
 
 impl Default for ChatRenderOptions {
     fn default() -> Self {
-        Self { add_generation_prompt: true, enable_thinking: true }
+        Self {
+            add_generation_prompt: true,
+            enable_thinking: true,
+        }
     }
 }
 
@@ -196,7 +208,10 @@ mod tests {
         let msgs = vec![Message::user("Hi")];
         let out = render_chat(
             &msgs,
-            &ChatRenderOptions { add_generation_prompt: true, enable_thinking: false },
+            &ChatRenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: false,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -253,7 +268,10 @@ mod tests {
         ];
         let out = render_chat(
             &msgs,
-            &ChatRenderOptions { add_generation_prompt: false, enable_thinking: true },
+            &ChatRenderOptions {
+                add_generation_prompt: false,
+                enable_thinking: true,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -267,13 +285,13 @@ mod tests {
 
     #[test]
     fn assistant_without_think_block() {
-        let msgs = vec![
-            Message::user("Q"),
-            Message::assistant("Plain answer"),
-        ];
+        let msgs = vec![Message::user("Q"), Message::assistant("Plain answer")];
         let out = render_chat(
             &msgs,
-            &ChatRenderOptions { add_generation_prompt: false, enable_thinking: true },
+            &ChatRenderOptions {
+                add_generation_prompt: false,
+                enable_thinking: true,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -294,10 +312,7 @@ mod tests {
 
     #[test]
     fn error_on_system_not_first() {
-        let msgs = vec![
-            Message::user("Q"),
-            Message::system("late system"),
-        ];
+        let msgs = vec![Message::user("Q"), Message::system("late system")];
         let err = render_chat(&msgs, &ChatRenderOptions::default()).unwrap_err();
         assert_eq!(err, "System message must be at the beginning.");
     }

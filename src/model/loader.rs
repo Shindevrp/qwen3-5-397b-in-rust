@@ -61,7 +61,13 @@ pub enum LoaderError {
         "tensor \"{name}\" data out of bounds: needs {expected} bytes at offset {off}, \
          but shard {shard} only has {len} bytes available"
     )]
-    OutOfBounds { name: String, expected: u64, off: u64, shard: usize, len: usize },
+    OutOfBounds {
+        name: String,
+        expected: u64,
+        off: u64,
+        shard: usize,
+        len: usize,
+    },
 }
 
 impl ModelLoader {
@@ -70,8 +76,10 @@ impl ModelLoader {
     pub fn open<P: AsRef<Path>>(first_path: P) -> Result<Self, LoaderError> {
         let first_path = first_path.as_ref();
 
-        let probe = Gguf::open(first_path)
-            .map_err(|source| LoaderError::ShardOpen { path: first_path.to_path_buf(), source })?;
+        let probe = Gguf::open(first_path).map_err(|source| LoaderError::ShardOpen {
+            path: first_path.to_path_buf(),
+            source,
+        })?;
 
         // How many shards does this model claim to have?
         let split_count = probe
@@ -98,10 +106,8 @@ impl ModelLoader {
                 .and_then(|s| s.to_str())
                 .unwrap_or("gguf");
             for i in 1..=split_count {
-                paths.push(
-                    first_path
-                        .with_file_name(format!("{stem_base}-{i:05}-of-{n:05}.{ext}")),
-                );
+                paths
+                    .push(first_path.with_file_name(format!("{stem_base}-{i:05}-of-{n:05}.{ext}")));
             }
         } else {
             paths.push(first_path.to_path_buf());
@@ -109,14 +115,20 @@ impl ModelLoader {
 
         let mut shards = Vec::with_capacity(paths.len());
         for path in &paths {
-            let gguf = Gguf::open(path)
-                .map_err(|source| LoaderError::ShardOpen { path: path.clone(), source })?;
+            let gguf = Gguf::open(path).map_err(|source| LoaderError::ShardOpen {
+                path: path.clone(),
+                source,
+            })?;
             let split_no = gguf
                 .metadata
                 .get("split.no")
                 .and_then(|v| v.as_u32().ok())
                 .unwrap_or(0) as u16;
-            shards.push(Shard { path: path.clone(), split_no, gguf });
+            shards.push(Shard {
+                path: path.clone(),
+                split_no,
+                gguf,
+            });
         }
 
         // The config lives in the shard that declares the architecture.
@@ -125,7 +137,10 @@ impl ModelLoader {
             .find(|s| s.gguf.metadata.get_str("general.architecture").is_ok())
             .ok_or(LoaderError::NoConfigShard)?;
         let cfg = Qwen3_5Config::from_metadata(&cfg_shard.gguf.metadata).map_err(|source| {
-            LoaderError::ShardOpen { path: cfg_shard.path.clone(), source }
+            LoaderError::ShardOpen {
+                path: cfg_shard.path.clone(),
+                source,
+            }
         })?;
 
         let mut by_name: HashMap<String, (usize, TensorMeta)> = HashMap::new();
@@ -150,7 +165,11 @@ impl ModelLoader {
             }
         }
 
-        Ok(Self { cfg, shards, by_name })
+        Ok(Self {
+            cfg,
+            shards,
+            by_name,
+        })
     }
 
     pub fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
@@ -171,10 +190,16 @@ impl ModelLoader {
         let (si, meta) = self
             .by_name
             .get(name)
-            .ok_or_else(|| LoaderError::TensorNotFound { name: name.to_string() })?;
+            .ok_or_else(|| LoaderError::TensorNotFound {
+                name: name.to_string(),
+            })?;
         let shard = &self.shards[*si];
-        let expected = quant::tensor_size(meta.ggml_type, meta.n_elements())
-            .map_err(|source| LoaderError::Quant { name: name.to_string(), source })?;
+        let expected = quant::tensor_size(meta.ggml_type, meta.n_elements()).map_err(|source| {
+            LoaderError::Quant {
+                name: name.to_string(),
+                source,
+            }
+        })?;
         let start = shard.gguf.data_offset + meta.offset as usize;
         let slice = shard.gguf.data_slice(meta);
         let got = (slice.len() as u64).min((shard.gguf.len() as u64).saturating_sub(start as u64));
@@ -195,10 +220,16 @@ impl ModelLoader {
         let (_, meta) = self
             .by_name
             .get(name)
-            .ok_or_else(|| LoaderError::TensorNotFound { name: name.to_string() })?;
+            .ok_or_else(|| LoaderError::TensorNotFound {
+                name: name.to_string(),
+            })?;
         let data = self.data_slice(name)?;
-        quant::dequantize(meta.ggml_type, data, meta.n_elements())
-            .map_err(|source| LoaderError::Quant { name: name.to_string(), source })
+        quant::dequantize(meta.ggml_type, data, meta.n_elements()).map_err(|source| {
+            LoaderError::Quant {
+                name: name.to_string(),
+                source,
+            }
+        })
     }
 
     /// Load a named tensor as raw quantized bytes — zero-copy mmap reference.
@@ -206,10 +237,16 @@ impl ModelLoader {
         let (si, meta) = self
             .by_name
             .get(name)
-            .ok_or_else(|| LoaderError::TensorNotFound { name: name.to_string() })?;
+            .ok_or_else(|| LoaderError::TensorNotFound {
+                name: name.to_string(),
+            })?;
         let shard = &self.shards[*si];
-        let expected = quant::tensor_size(meta.ggml_type, meta.n_elements())
-            .map_err(|source| LoaderError::Quant { name: name.to_string(), source })?;
+        let expected = quant::tensor_size(meta.ggml_type, meta.n_elements()).map_err(|source| {
+            LoaderError::Quant {
+                name: name.to_string(),
+                source,
+            }
+        })?;
         let start = shard.gguf.data_offset + meta.offset as usize;
         let mmap = shard.gguf.mmap_arc();
         Ok(quant::RawTensor::from_mmap(
@@ -225,9 +262,7 @@ impl ModelLoader {
 /// Does this tensor's relative data range fit inside its shard file?
 fn fits(shard: &Shard, meta: &TensorMeta) -> bool {
     quant::tensor_size(meta.ggml_type, meta.n_elements())
-        .map(|size| {
-            shard.gguf.data_offset as u64 + meta.offset + size <= shard.gguf.len() as u64
-        })
+        .map(|size| shard.gguf.data_offset as u64 + meta.offset + size <= shard.gguf.len() as u64)
         .unwrap_or(false)
 }
 

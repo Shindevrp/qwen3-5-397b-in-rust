@@ -2,10 +2,11 @@
 //! pipeline (see `src/model/synth.rs` for the model factory).
 
 use qwen3_5_397b_in_rust::model::pipeline::{
-    generate_token, generate_token_batch, prefill, prefill_batch, GenerationState, ModelWeights,
+    GenerationState, ModelWeights, generate_token, generate_token_batch, prefill, prefill_batch,
+    prefill_chunked,
 };
-use qwen3_5_397b_in_rust::model::sampler::{sample, SamplerConfig};
-use qwen3_5_397b_in_rust::model::synth::{build_gguf, SynthConfig};
+use qwen3_5_397b_in_rust::model::sampler::{SamplerConfig, sample};
+use qwen3_5_397b_in_rust::model::synth::{SynthConfig, build_gguf};
 
 use std::io::Write;
 
@@ -125,16 +126,17 @@ fn e2e_batch_matches_sequential() {
     }
 
     // Batch: prefill + lockstep greedy decode.
-    let mut states: Vec<GenerationState> =
-        prompts.iter().map(|_| GenerationState::new(&model)).collect();
+    let mut states: Vec<GenerationState> = prompts
+        .iter()
+        .map(|_| GenerationState::new(&model))
+        .collect();
     let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
     prefill_batch(&mut states, &refs, &model).expect("prefill_batch");
 
     let mut last_tokens: Vec<u32> = prompts.iter().map(|v| *v.last().unwrap()).collect();
     let mut batched: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
     for _step in 0..8 {
-        let next =
-            generate_token_batch(&mut states, &last_tokens, &model).expect("generate_batch");
+        let next = generate_token_batch(&mut states, &last_tokens, &model).expect("generate_batch");
         for (j, &t) in next.iter().enumerate() {
             batched[j].push(t);
         }
@@ -157,9 +159,33 @@ fn e2e_batch_overflow_is_an_error() {
     let (_tmp, model) = load_synth(&cfg);
 
     let prompts: Vec<Vec<u32>> = vec![vec![0, 1], vec![2, 3, 4, 5, 6, 7, 8, 9, 10]];
-    let mut states: Vec<GenerationState> =
-        prompts.iter().map(|_| GenerationState::new(&model)).collect();
+    let mut states: Vec<GenerationState> = prompts
+        .iter()
+        .map(|_| GenerationState::new(&model))
+        .collect();
     let refs: Vec<&[u32]> = prompts.iter().map(|v| v.as_slice()).collect();
     let err = prefill_batch(&mut states, &refs, &model).unwrap_err();
     assert!(err.contains("context overflow"), "{err}");
+}
+
+#[test]
+fn e2e_prefill_chunked_then_generate() {
+    let cfg = SynthConfig::tiny();
+    let (_tmp, model) = load_synth(&cfg);
+
+    let prompt_tokens: Vec<u32> = vec![0, 1, 2, 3, 4, 5];
+    let mut state = GenerationState::new(&model);
+
+    // Chunked prefill with chunk_size=2
+    prefill_chunked(&mut state, &prompt_tokens, &model, 2).expect("prefill_chunked");
+    assert_eq!(state.pos, 6);
+
+    // Generate a few tokens to verify state is usable
+    let mut last_token = 5u32;
+    for _ in 0..3 {
+        let (_hidden, next_token) =
+            generate_token(&mut state, last_token, &model).expect("generate after chunked prefill");
+        last_token = next_token;
+    }
+    assert_eq!(state.pos, 9);
 }

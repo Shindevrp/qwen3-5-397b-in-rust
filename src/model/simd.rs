@@ -35,9 +35,7 @@ pub fn force_scalar(v: bool) {
 
 fn env_disabled() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| {
-        std::env::var("QWEN_NO_SIMD").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
+    *ENV.get_or_init(|| std::env::var("QWEN_NO_SIMD").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 /// True when the accelerated path may be taken on this machine.
@@ -142,11 +140,7 @@ pub mod x86 {
         let (ap, bp) = (a.as_ptr(), b.as_ptr());
         let mut acc = _mm256_setzero_ps();
         for i in (0..n8).step_by(8) {
-            acc = _mm256_fmadd_ps(
-                _mm256_loadu_ps(ap.add(i)),
-                _mm256_loadu_ps(bp.add(i)),
-                acc,
-            );
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i)), _mm256_loadu_ps(bp.add(i)), acc);
         }
         let mut sum = hsum_ps(acc);
         for i in n8..n {
@@ -194,7 +188,10 @@ pub mod x86 {
             let av = _mm_loadu_si128(a.as_ptr().add(g * 16) as *const __m128i);
             let qv = _mm_loadu_si128(q8.as_ptr().add(g * 16) as *const __m128i);
             let prod = _mm256_madd_epi16(_mm256_cvtepi8_epi16(av), _mm256_cvtepi8_epi16(qv));
-            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(prod, _mm256_set1_epi32(scale as i32)));
+            acc = _mm256_add_epi32(
+                acc,
+                _mm256_mullo_epi32(prod, _mm256_set1_epi32(scale as i32)),
+            );
         }
         acc
     }
@@ -216,10 +213,7 @@ pub mod x86 {
         scales[4..8].copy_from_slice(&utmp[1].to_le_bytes());
         mins[0..4].copy_from_slice(&utmp[2].to_le_bytes());
         mins[4..8].copy_from_slice(&utmp[3].to_le_bytes());
-        (
-            scales.map(|v| v as i8),
-            mins.map(|v| v as i8),
-        )
+        (scales.map(|v| v as i8), mins.map(|v| v as i8))
     }
 
     fn unpack_q4_k(xb: &[u8], a: &mut [i8; QK_K]) {
@@ -255,7 +249,8 @@ pub mod x86 {
             let h = &qh[j * 32..(j + 1) * 32];
             for l in 0..32 {
                 a[j * 128 + l] = (((q[l] & 0x0F) | ((h[l] & 0x03) << 4)) as i8) - 32;
-                a[j * 128 + 32 + l] = (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
+                a[j * 128 + 32 + l] =
+                    (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 64 + l] = (((q[l] >> 4) | (((h[l] >> 4) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 96 + l] = (((q[l + 32] >> 4) | (((h[l] >> 6) & 0x03) << 4)) as i8) - 32;
             }
@@ -491,7 +486,10 @@ pub mod x86 {
             let vc = _mm256_loadu_ps(cos.as_ptr().add(i));
             let vs = _mm256_loadu_ps(sin.as_ptr().add(i));
             _mm256_storeu_ps(op.add(i), _mm256_fnmadd_ps(vb, vs, _mm256_mul_ps(va, vc)));
-            _mm256_storeu_ps(op.add(n + i), _mm256_fmadd_ps(va, vs, _mm256_mul_ps(vb, vc)));
+            _mm256_storeu_ps(
+                op.add(n + i),
+                _mm256_fmadd_ps(va, vs, _mm256_mul_ps(vb, vc)),
+            );
         }
         for i in n8..n {
             let a = *xp.add(i);
@@ -621,7 +619,8 @@ pub mod arm {
             let h = &qh[j * 32..(j + 1) * 32];
             for l in 0..32 {
                 a[j * 128 + l] = (((q[l] & 0x0F) | ((h[l] & 0x03) << 4)) as i8) - 32;
-                a[j * 128 + 32 + l] = (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
+                a[j * 128 + 32 + l] =
+                    (((q[l + 32] & 0x0F) | (((h[l] >> 2) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 64 + l] = (((q[l] >> 4) | (((h[l] >> 4) & 0x03) << 4)) as i8) - 32;
                 a[j * 128 + 96 + l] = (((q[l + 32] >> 4) | (((h[l] >> 6) & 0x03) << 4)) as i8) - 32;
             }
@@ -942,9 +941,13 @@ mod tests {
         }
         let mut got = x.clone();
         #[cfg(target_arch = "x86_64")]
-        unsafe { x86::rotate_halves(&x, &cos, &sin, &mut got, n_offset) };
+        unsafe {
+            x86::rotate_halves(&x, &cos, &sin, &mut got, n_offset)
+        };
         #[cfg(target_arch = "aarch64")]
-        unsafe { arm::rotate_halves(&x, &cos, &sin, &mut got, n_offset) };
+        unsafe {
+            arm::rotate_halves(&x, &cos, &sin, &mut got, n_offset)
+        };
         for (&g, &e) in got.iter().zip(&expect) {
             close(g, e, 1e-5);
         }
@@ -952,7 +955,7 @@ mod tests {
 
     /// Build one synthetic K-quant weight block plus its Q8_K activation.
     fn synth_k_block(kind: &str, seed: u64) -> (Vec<u8>, Vec<u8>) {
-        use crate::model::kernels::{quantize_row_q8_k, quantize_row_q8_0};
+        use crate::model::kernels::{quantize_row_q8_0, quantize_row_q8_k};
         let mut rng = Lcg(seed);
         match kind {
             "q8_0" => {
@@ -1064,12 +1067,14 @@ mod tests {
                 } else {
                     dequant_q8k(&act_row)
                 };
-                let expect: f32 =
-                    wq.iter().zip(&aq).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() as f32;
+                let expect: f32 = wq
+                    .iter()
+                    .zip(&aq)
+                    .map(|(&a, &b)| a as f64 * b as f64)
+                    .sum::<f64>() as f32;
                 assert_eq!(w_row.len(), row_bytes * (nn / n));
                 close(got, expect, 1e-2);
             }
         }
     }
 }
-

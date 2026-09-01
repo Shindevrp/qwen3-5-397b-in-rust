@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 
 // ---------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4)
@@ -261,7 +261,10 @@ pub fn list_gguf_files(repo: &str, token: Option<&str>) -> anyhow::Result<Vec<St
     if let Some(h) = auth_header(token) {
         req = req.set("Authorization", &h);
     }
-    let body = req.call().context("Hub API request failed")?.into_string()?;
+    let body = req
+        .call()
+        .context("Hub API request failed")?
+        .into_string()?;
     let mut files: Vec<String> = scan_rfilenames(&body)
         .into_iter()
         .filter(|f| f.to_ascii_lowercase().ends_with(".gguf"))
@@ -306,32 +309,30 @@ pub fn download_file(
 
     // Issue a (possibly resuming) GET; returns total size, bytes already on
     // disk, and the response whose body streams the remainder.
-    let issue =
-        |resume_from: u64| -> anyhow::Result<(u64, u64, ureq::Response)> {
-            let mut req = agent.get(url);
-            if let Some(h) = auth_header(token) {
-                req = req.set("Authorization", &h);
-            }
-            if resume_from > 0 {
-                req = req.set("Range", &format!("bytes={resume_from}-"));
-            }
-            let resp = req.call().map_err(|e| anyhow!("{e}"))?;
-            let status = resp.status();
-            if resume_from > 0 && status != 206 {
-                bail!("{RANGE_REJECTED} (status {status})");
-            }
-            let total = resp
-                .header("Content-Length")
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|len| len + resume_from)
-                .unwrap_or(0);
-            Ok((total, if status == 206 { resume_from } else { 0 }, resp))
-        };
+    let issue = |resume_from: u64| -> anyhow::Result<(u64, u64, ureq::Response)> {
+        let mut req = agent.get(url);
+        if let Some(h) = auth_header(token) {
+            req = req.set("Authorization", &h);
+        }
+        if resume_from > 0 {
+            req = req.set("Range", &format!("bytes={resume_from}-"));
+        }
+        let resp = req.call().map_err(|e| anyhow!("{e}"))?;
+        let status = resp.status();
+        if resume_from > 0 && status != 206 {
+            bail!("{RANGE_REJECTED} (status {status})");
+        }
+        let total = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|len| len + resume_from)
+            .unwrap_or(0);
+        Ok((total, if status == 206 { resume_from } else { 0 }, resp))
+    };
 
     let existing = part_len(&part_path).unwrap_or(0);
     if let Some(parent) = part_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let (total, mut done, resp) = match existing {
         0 => issue(0)?,
@@ -378,8 +379,7 @@ pub fn download_file(
     }
     file.flush()?;
     file.into_inner()?.sync_all()?;
-    std::fs::rename(&part_path, dest)
-        .with_context(|| format!("finalize {}", dest.display()))?;
+    std::fs::rename(&part_path, dest).with_context(|| format!("finalize {}", dest.display()))?;
     progress(done, total);
 
     let _ = started;
@@ -393,7 +393,10 @@ fn part_path_for(dest: &Path) -> std::path::PathBuf {
 }
 
 fn part_len(part: &Path) -> Option<u64> {
-    std::fs::metadata(part).ok().map(|m| m.len()).filter(|&n| n > 0)
+    std::fs::metadata(part)
+        .ok()
+        .map(|m| m.len())
+        .filter(|&n| n > 0)
 }
 
 #[cfg(test)]
